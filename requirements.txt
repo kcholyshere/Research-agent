@@ -1,0 +1,12 @@
+# google-adk deliberately unpinned until the first verified install - pin it
+# (and anything it drags in that we import directly) immediately afterwards.
+# Everything below carried over from Finrag's pinned, known-working set.
+google-adk
+google-genai==2.10.0
+python-dotenv==1.2.2
+faiss-cpu==1.14.3
+numpy==2.5.0
+langchain-core==1.4.8
+langchain-community==0.4.2
+langchain-classic==1.0.8
+langchain-text-splitters==1.1.2
