@@ -17,7 +17,7 @@ from langchain_core.documents import Document
 from src import config
 from src.embedding.embedder import GeminiEmbeddings
 
-INDEX_NAME = "ifc_annual_report_2024"
+INDEX_NAME = "knowledge_base"
 
 # HNSW gives FAISS the same O(log n) graph-search profile as Qdrant's default
 # index, instead of the flat/brute-force O(n) scan `FAISS.from_documents` builds.
