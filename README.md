@@ -1,4 +1,4 @@
-# ResearchAgent
+# Research-agent
 
 An autonomous research agent built incrementally on the Agent Development Kit (ADK): phase 1 is a core RAG agent - a Plan-Execute-Synthesize flow over a private knowledge base, with the Document Search Tool built on the retrieval stack reused from the Finrag project (as the practice mandates).
 
