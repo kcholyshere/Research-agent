@@ -107,3 +107,8 @@ data/processed/eval_runs/
 # Agent working docs (requirements notes, decision log) - not for version control
 /agent_docs/
 /references/
+
+# Agent skills installed as environment-specific symlinks (streamlit skills,
+# langfuse/skills, etc.) - not portable across machines, don't commit
+.claude/skills/
+.agents/skills/
