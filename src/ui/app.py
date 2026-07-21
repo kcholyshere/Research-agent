@@ -60,6 +60,10 @@ for turn in st.session_state["history"]:
         st.markdown(turn["content"])
 
 if prompt := st.chat_input("Ask a question about the knowledge base"):
+    # Escape literal "$" - financial answers are full of dollar amounts, and
+    # st.markdown treats a pair of "$" as a LaTeX math span, mangling anything
+    # between two unrelated dollar figures into garbled italic notation.
+    prompt = prompt.replace("$", "\\$")
     st.session_state["history"].append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
@@ -72,5 +76,6 @@ if prompt := st.chat_input("Ask a question about the knowledge base"):
                 # Vertex errors, an empty/missing FAISS index, etc. should read as a
                 # message in the chat, not crash the page.
                 answer = f"Error: {exc}"
+        answer = answer.replace("$", "\\$")
         st.markdown(answer)
     st.session_state["history"].append({"role": "assistant", "content": answer})
