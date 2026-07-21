@@ -13,12 +13,16 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 GCP_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
 GCP_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
 
-# Models (per phase 1 requirements: Gemini 2.0 Flash via Vertex AI)
-GEMINI_MODEL = "gemini-2.0-flash"
+# Models (phase 1 requirements specify Gemini 2.0 Flash; retired from
+# gd-gcp-internship-ds's Vertex AI catalogue by the time of verification -
+# see ADR-0004 for the substitution)
+GEMINI_MODEL = "gemini-3.5-flash"
 EMBEDDING_MODEL = "gemini-embedding-001"
 
-# Knowledge base source documents (phase 1: private knowledge base, TBD)
+# Knowledge base source documents (phase 1 corpus: IFC's 2024 annual report,
+# see ADR-0001 - same file Finrag used, dropped as-is into data/raw/)
 RAW_DATA_DIR = PROJECT_ROOT / "data" / "raw"
+INTERIM_DIR = PROJECT_ROOT / "data" / "interim"
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 
 # Chunking (carried over from Finrag's tuned values)
