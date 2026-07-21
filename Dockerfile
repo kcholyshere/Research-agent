@@ -1,11 +1,15 @@
 FROM python:3.13-slim
 
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen
 
 COPY src/ src/
+
+ENV PATH="/app/.venv/bin:$PATH"
 
 # ADK's dev UI by default; the optional Streamlit UI (src/ui/app.py) is an
 # alternative entrypoint - swap the CMD below or run both containers. Verify
