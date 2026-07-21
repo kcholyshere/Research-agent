@@ -8,12 +8,25 @@ Adapted from Finrag's dataset.py (single-embed pattern, audit A16 there).
 import os
 
 # faiss-cpu and torch (pulled in by docling for PDF parsing, ADR-0001) each
-# bundle their own OpenMP runtime on macOS - loading both in one process
-# aborts with "OMP: Error #15: Initializing libomp.dylib, but found libomp.
-# dylib already initialized" unless the duplicate-load check is disabled.
-# This is the only entrypoint that imports both libraries in one process (the
-# agent never imports torch at runtime), so the workaround is scoped here.
+# bundle their own copy of libomp.dylib on macOS (confirmed distinct binaries
+# under .venv/lib/python*/site-packages/{torch/lib,faiss/.dylibs}). Loading
+# both in one process aborts with "OMP: Error #15: Initializing libomp.dylib,
+# but found libomp.dylib already initialized" unless the duplicate-load check
+# is disabled - but disabling that check only silences the abort message; it
+# does not stop the two runtimes from each spinning up their own worker
+# thread pool. If either one actually goes parallel (FAISS's HNSW index build
+# does, by default using all cores), the two pools corrupt each other's
+# thread-suspend/barrier state and the process SIGSEGVs inside libomp
+# (confirmed via a macOS crash report: EXC_BAD_ACCESS in
+# __kmp_suspend_initialize_thread / __kmp_fork_barrier) - silent, no Python
+# traceback, since it's a native crash below the interpreter. Forcing both
+# runtimes to a single thread means neither ever enters a parallel region, so
+# there is no worker pool to corrupt; two OpenMP runtimes can then coexist
+# (just not concurrently execute) in one process. This is the only entrypoint
+# that imports both libraries in one process (the agent never imports torch
+# at runtime), so both workarounds are scoped here rather than set globally.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 from src import config
 from src.ingestion.chunk import chunk_files, chunk_pdf, save_chunks

@@ -29,5 +29,11 @@ gcloud auth application-default login
 # drop corpus files (*.txt, *.md, *.pdf) into data/raw/, then:
 uv run python -m src.dataset
 uv run adk web src             # ADK's own dev UI, or: uv run adk run src/research_agent
-uv run streamlit run src/ui/app.py   # the optional chat UI
+uv run python -m streamlit run src/ui/app.py   # the optional chat UI
 ```
+
+Use `python -m streamlit`, not the `streamlit` console-script shim - the shim's shebang
+hard-codes the venv's absolute path at `uv sync` time, so it breaks if the project
+directory is ever renamed/moved without recreating `.venv` (hit this after the
+`ResearchAgent` -> `Research-agent` rename). `python -m` resolves through the
+interpreter instead, so it's rename-proof.

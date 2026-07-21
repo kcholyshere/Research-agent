@@ -4,7 +4,8 @@ the plan/execute/synthesize loop and the Document Search Tool itself live in
 research_agent/agent.py and tools/document_search.py; this file only wires a
 chat box to the ADK Runner.
 
-Run with: streamlit run src/ui/app.py
+Run with: uv run python -m streamlit run src/ui/app.py
+(python -m, not the `streamlit` shim binary - see README's Setup section for why)
 """
 
 import asyncio
