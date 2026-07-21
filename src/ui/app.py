@@ -13,12 +13,15 @@ import asyncio
 import streamlit as st
 from google.adk.runners import InMemoryRunner
 from google.genai import types as genai_types
+from langfuse import get_client, propagate_attributes
 
 from src import config
-from src.research_agent.agent import root_agent
+from src.research_agent.agent import root_agent  # instruments ADK on import, see agent.py
 
 APP_NAME = "research_agent"
 USER_ID = "streamlit-user"
+
+langfuse_client = get_client()
 
 
 @st.cache_resource
@@ -29,9 +32,16 @@ def _runner() -> InMemoryRunner:
 async def _run_turn(runner: InMemoryRunner, session_id: str, message: str) -> str:
     content = genai_types.Content(role="user", parts=[genai_types.Part(text=message)])
     final_text = "(no response)"
-    async for event in runner.run_async(user_id=USER_ID, session_id=session_id, new_message=content):
-        if event.is_final_response() and event.content and event.content.parts:
-            final_text = "".join(part.text or "" for part in event.content.parts)
+    # session_id/user_id group this turn's spans into Langfuse's Sessions/Users
+    # views - each chat_input submission is one ADK run, so one Langfuse trace.
+    with propagate_attributes(session_id=session_id, user_id=USER_ID, tags=["research_agent"]):
+        async for event in runner.run_async(user_id=USER_ID, session_id=session_id, new_message=content):
+            if event.is_final_response() and event.content and event.content.parts:
+                final_text = "".join(part.text or "" for part in event.content.parts)
+    # Streamlit is a long-lived server, not a short script, but flushing after
+    # each turn keeps traces visible promptly rather than waiting on the SDK's
+    # background batch export - worth the small per-turn cost here.
+    langfuse_client.flush()
     return final_text
 
 

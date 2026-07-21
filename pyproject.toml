@@ -16,4 +16,6 @@ dependencies = [
     "streamlit>=1.51.0,<2",
     "docling>=2.108.0,<3",
     "docling-core>=2.85.0,<3",
+    "langfuse>=4.14.1",
+    "openinference-instrumentation-google-adk>=0.1.17",
 ]
