@@ -19,29 +19,23 @@ from src.embedding.embedder import GeminiEmbeddings
 
 INDEX_NAME = "knowledge_base"
 
-# HNSW gives FAISS the same O(log n) graph-search profile as Qdrant's default
-# index, instead of the flat/brute-force O(n) scan `FAISS.from_documents` builds.
+# HNSW gives FAISS an O(log n) graph-search profile, instead of the flat/
+# brute-force O(n) scan `FAISS.from_documents` builds by default.
 HNSW_M = 32
 HNSW_EF_CONSTRUCTION = 200
 HNSW_EF_SEARCH = 128
 
-# FAISS's IndexHNSWFlat scores L2 distance, Qdrant's collection scores cosine -
-# the two rankings only agree while every vector is unit-norm (L2 on unit
-# vectors is a monotonic function of cosine similarity). Nothing upstream
-# enforces that, so a future embedding model or config change that returns
-# unnormalised vectors would silently desync FAISS ranking from Qdrant's
-# without either side erroring.
+# FAISS's IndexHNSWFlat scores L2 distance, not cosine similarity - the
+# ranking only matches cosine similarity while every vector is unit-norm (L2
+# on unit vectors is a monotonic function of cosine similarity). Nothing
+# upstream enforces that, so a future embedding model or config change that
+# returns unnormalised vectors would silently produce a wrong ranking instead
+# of erroring, hence this check.
 UNIT_NORM_ATOL = 1e-3
 
 
 def build_index(chunks: list[Document], vectors: list[list[float]]) -> FAISS:
-    """Build the HNSW index from chunks and their precomputed embedding vectors.
-
-    Vectors are computed once by the caller (dataset.py) and shared with the
-    Qdrant build (A16) - embedding all ~852 chunks is the single most
-    expensive/costly step in a rebuild, so doing it twice (once per store) was
-    pure waste and a drift path between the two indexes.
-    """
+    """Build the HNSW index from chunks and their precomputed embedding vectors."""
     if len(vectors) != len(chunks):
         raise ValueError(f"Got {len(vectors)} vectors for {len(chunks)} chunks")
 
@@ -49,10 +43,10 @@ def build_index(chunks: list[Document], vectors: list[list[float]]) -> FAISS:
     if not np.allclose(norms, 1.0, atol=UNIT_NORM_ATOL):
         raise ValueError(
             "Embedding vectors are not unit-norm (max deviation "
-            f"{np.max(np.abs(norms - 1.0)):.4f}). FAISS's L2 index and Qdrant's "
-            "cosine index only rank identically when vectors are unit-norm - "
-            "an unnormalised embedding model would silently desync the two "
-            "stores' rankings instead of erroring, hence this check."
+            f"{np.max(np.abs(norms - 1.0)):.4f}). FAISS's L2 index only ranks "
+            "identically to cosine similarity when vectors are unit-norm - "
+            "an unnormalised embedding model would silently produce a wrong "
+            "ranking instead of erroring, hence this check."
         )
 
     embeddings = GeminiEmbeddings()  # kept on the store for query-time embed_query
