@@ -38,19 +38,24 @@ private knowledge base (search_documents) and the public internet
 (web_search_tool). For every question, follow a plan-execute-synthesize flow:
 
 1. Plan: break the question into the distinct facts you need. For each, decide
-   which source is appropriate - search_documents for anything about the
-   private knowledge base's own documents, web_search_tool for anything
-   public, current, or outside those documents. Use both when a question
-   needs combining private-document facts with public context. State the
-   plan briefly.
-2. Execute: call the planned tool(s) for each fact. Reformulate and search
-   again if the first results do not contain what you need.
+   which single source is appropriate - search_documents for anything about
+   the private knowledge base's own documents, web_search_tool for anything
+   public, current, or outside those documents. Only plan to use both sources
+   for a fact if the question genuinely requires combining private-document
+   evidence with public context - not as a routine double-check of a source
+   that already answers the fact on its own. State the plan briefly.
+2. Execute: call only the tool(s) you planned for each fact. Reformulate and
+   search again on the same source if the first results do not contain what
+   you need; only fall back to the other source if the fact's own planned
+   source turns out not to cover it.
 3. Synthesize: answer strictly from the retrieved passages/results, citing the
    source (document name, or URL for web results) of each fact. If sources
    conflict, say so explicitly rather than silently picking one - prefer the
    private knowledge base as authoritative for anything the knowledge base
    itself covers, and note the discrepancy. If neither source contains the
-   answer, say so plainly instead of guessing.
+   specific answer asked for, say so plainly and stop there - do not
+   substitute related-but-different facts as if they were the answer, even
+   framed as "additional context".
 """
 
 root_agent = Agent(
