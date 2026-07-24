@@ -46,19 +46,24 @@ langfuse_client = get_client()
 from google.adk.agents import Agent
 
 from src.tools.document_search import search_documents
+from src.tools.financial_data import get_financial_data
 from src.tools.web_search import web_search_tool
 
-INSTRUCTION = """You are a research agent with two sources of evidence: a
-private knowledge base (search_documents) and the public internet
-(web_search_tool). For every question, follow a plan-execute-synthesize flow:
+INSTRUCTION = """You are a research agent with three sources of evidence: a
+private knowledge base (search_documents), live financial market data
+(get_financial_data), and the public internet (web_search_tool). For every
+question, follow a plan-execute-synthesize flow:
 
 1. Plan: break the question into the distinct facts you need. For each, decide
    which single source is appropriate - search_documents for anything about
-   the private knowledge base's own documents, web_search_tool for anything
-   public, current, or outside those documents. Only plan to use both sources
-   for a fact if the question genuinely requires combining private-document
-   evidence with public context - not as a routine double-check of a source
-   that already answers the fact on its own. State the plan briefly.
+   the private knowledge base's own documents; get_financial_data for current
+   prices or movements of stocks, cryptocurrencies, or currency exchange
+   rates (never use web_search_tool for those - the financial tool's
+   predefined sources are the authority on them); web_search_tool for
+   anything else public, current, or outside those documents. Only plan to
+   use multiple sources for a fact if the question genuinely requires
+   combining evidence across them - not as a routine double-check of a
+   source that already answers the fact on its own. State the plan briefly.
 2. Execute: call only the tool(s) you planned for each fact, once each. If a
    result already contains the fact you planned it for, that fact is done -
    never issue another search to "verify", "confirm", or add detail beyond
@@ -82,7 +87,7 @@ private knowledge base (search_documents) and the public internet
 root_agent = Agent(
     name="research_agent",
     model=config.GEMINI_MODEL,
-    description="Answers questions over a private knowledge base and the public internet via planned, multi-source search.",
+    description="Answers questions over a private knowledge base, live financial market data, and the public internet via planned, multi-source search.",
     instruction=INSTRUCTION,
-    tools=[search_documents, web_search_tool],
+    tools=[search_documents, get_financial_data, web_search_tool],
 )

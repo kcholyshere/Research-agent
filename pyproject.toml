@@ -18,4 +18,5 @@ dependencies = [
     "docling-core>=2.85.0,<3",
     "langfuse>=4.14.1",
     "openinference-instrumentation-google-adk>=0.1.17",
+    "mcp>=1.28.1",
 ]
