@@ -15,8 +15,17 @@ if we need more control over the search provider or result format later.
 from google.adk.agents import Agent
 from google.adk.tools import google_search
 from google.adk.tools.agent_tool import AgentTool
+from google.genai import types
 
 from src import config
+
+# Same runaway-repetition safety net as root_agent (src/research_agent/agent.py)
+# - a Gemini decoding loop can in principle hit any agent using this model, so
+# it's applied here too rather than assumed to be root_agent-specific.
+_GENERATE_CONTENT_CONFIG = types.GenerateContentConfig(
+    max_output_tokens=4096,
+    frequency_penalty=0.4,
+)
 
 _web_search_agent = Agent(
     name="web_search_agent",
@@ -24,8 +33,9 @@ _web_search_agent = Agent(
     description="Searches the public internet for information via Google Search.",
     instruction="""Answer the given query using Google Search. Report back the
 relevant facts you find, each attributed to its source URL, so the calling
-agent can cite it.""",
+agent can cite it. State each fact once; never repeat a sentence or phrase.""",
     tools=[google_search],
+    generate_content_config=_GENERATE_CONTENT_CONFIG,
 )
 
 web_search_tool = AgentTool(agent=_web_search_agent)

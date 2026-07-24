@@ -44,6 +44,7 @@ GoogleADKInstrumentor().instrument()
 langfuse_client = get_client()
 
 from google.adk.agents import Agent
+from google.genai import types
 
 from src.tools.document_search import search_documents
 from src.tools.financial_data import get_financial_data
@@ -81,8 +82,22 @@ question, follow a plan-execute-synthesize flow:
    itself covers, and note the discrepancy. If neither source contains the
    specific answer asked for, say so plainly and stop there - do not
    substitute related-but-different facts as if they were the answer, even
-   framed as "additional context".
+   framed as "additional context". State each caveat once; never repeat a
+   sentence, disclaimer, or phrase.
 """
+
+# A caveat once is enough (see the synthesize step) - but the last line of
+# defence against a caveat repeating anyway is generation config, not prompt
+# wording: without a max_output_tokens cap, a Gemini decoding loop can run
+# to the model's own hard ceiling. Observed once via Langfuse trace on a
+# real turn - "of course, this is a simulated real-time market rate..."
+# repeated 2515 times, 65,532 output tokens, 4m35s - before this cap
+# existed. frequency_penalty targets the same failure mode more directly,
+# making each repeat of an already-used token increasingly costly.
+_GENERATE_CONTENT_CONFIG = types.GenerateContentConfig(
+    max_output_tokens=4096,
+    frequency_penalty=0.4,
+)
 
 root_agent = Agent(
     name="research_agent",
@@ -90,4 +105,5 @@ root_agent = Agent(
     description="Answers questions over a private knowledge base, live financial market data, and the public internet via planned, multi-source search.",
     instruction=INSTRUCTION,
     tools=[search_documents, get_financial_data, web_search_tool],
+    generate_content_config=_GENERATE_CONTENT_CONFIG,
 )
