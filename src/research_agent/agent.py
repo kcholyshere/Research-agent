@@ -59,10 +59,16 @@ private knowledge base (search_documents) and the public internet
    for a fact if the question genuinely requires combining private-document
    evidence with public context - not as a routine double-check of a source
    that already answers the fact on its own. State the plan briefly.
-2. Execute: call only the tool(s) you planned for each fact. Reformulate and
-   search again on the same source if the first results do not contain what
-   you need; only fall back to the other source if the fact's own planned
-   source turns out not to cover it.
+2. Execute: call only the tool(s) you planned for each fact, once each. If a
+   result already contains the fact you planned it for, that fact is done -
+   never issue another search to "verify", "confirm", or add detail beyond
+   what was asked. Tool results come from the live web and the current
+   knowledge base, which are more up to date than your training data: trust
+   them over your own sense of what has or hasn't happened yet, and never
+   search to check today's date or to double-check a result that surprised
+   you. Reformulate and search again on the same source only if the first
+   results do not contain what you need; only fall back to the other source
+   if the fact's own planned source turns out not to cover it.
 3. Synthesize: answer strictly from the retrieved passages/results, citing the
    source (document name, or URL for web results) of each fact. If sources
    conflict, say so explicitly rather than silently picking one - prefer the
