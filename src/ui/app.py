@@ -9,6 +9,8 @@ Run with: uv run python -m streamlit run src/ui/app.py
 """
 
 import asyncio
+import threading
+import time
 
 import streamlit as st
 from google.adk.runners import InMemoryRunner
@@ -79,13 +81,26 @@ if prompt := st.chat_input("Ask a question about the knowledge base"):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("Planning and searching..."):
+        # Run the turn on a background thread so the status label can keep
+        # ticking up ("Thinking for x.x seconds...") while asyncio.run blocks.
+        turn_result: dict[str, str] = {}
+
+        def _run_turn_sync() -> None:
             try:
-                answer = asyncio.run(_run_turn(runner, session_id, prompt))
+                turn_result["answer"] = asyncio.run(_run_turn(runner, session_id, prompt))
             except Exception as exc:
                 # Vertex errors, an empty/missing FAISS index, etc. should read as a
                 # message in the chat, not crash the page.
-                answer = f"Error: {exc}"
-        answer = answer.replace("$", "\\$")
+                turn_result["answer"] = f"Error: {exc}"
+
+        start_time = time.monotonic()
+        turn_thread = threading.Thread(target=_run_turn_sync, daemon=True)
+        turn_thread.start()
+        with st.status("Thinking...", state="running") as status:
+            while turn_thread.is_alive():
+                status.update(label=f"Thinking for {time.monotonic() - start_time:.1f} seconds...")
+                turn_thread.join(timeout=0.2)
+            status.update(label=f"Thought for {time.monotonic() - start_time:.1f} seconds", state="complete")
+        answer = turn_result["answer"].replace("$", "\\$")
         st.markdown(answer)
     st.session_state["history"].append({"role": "assistant", "content": answer})
