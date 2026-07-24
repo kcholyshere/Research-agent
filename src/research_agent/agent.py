@@ -18,7 +18,22 @@ to get `root_agent` - one instrumentation call covers all three. It must run
 before any Agent is constructed (including web_search.py's module-level
 sub-agent), and after `src.config` has loaded `.env`, hence the import order
 below.
+
+Repo-root sys.path bootstrap: ADK's CLI loader (`adk run`/`adk web`) inserts
+only the agent's *parent* directory (`src`) onto sys.path, not the repo root,
+so a bare `from src import config` fails under that entrypoint even though it
+works under `python -m` and Streamlit (both of which put the repo root on
+sys.path via cwd). Fixing it up here, from this file's own location, makes
+`from src import config` work under every entrypoint without relying on the
+caller to invoke things a particular way.
 """
+
+import sys
+from pathlib import Path
+
+_repo_root = str(Path(__file__).resolve().parents[2])
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
 
 from src import config  # noqa: F401 - import first: triggers .env load via dotenv
 
