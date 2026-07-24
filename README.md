@@ -4,6 +4,8 @@ An autonomous research agent built incrementally on the Agent Development Kit (A
 
 Status: phase 1, verified against the real GCP project (`gd-gcp-internship-ds`, `gemini-3.5-flash`). Corpus: `ifc-annual-report-2024-financials.pdf` - see `agent_docs/TODOS.md` for the live checklist and `agent_docs/phase_1_requirements.md` for the requirements.
 
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for a diagram of how the pieces fit together.
+
 ## Layout
 
 ```
