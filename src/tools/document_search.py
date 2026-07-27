@@ -22,6 +22,19 @@ def _index():
 def search_documents(query: str) -> list[dict]:
     """Search the private knowledge base for passages relevant to the query.
 
+    The knowledge base holds one corpus: the International Finance Corporation
+    (IFC) 2024 Annual Report financial statements - management's discussion and
+    analysis, the consolidated financial statements, and their accompanying
+    notes, covering IFC's FY2024 income, assets, investment portfolio, capital
+    and accounting policies.
+
+    Use this only for questions about IFC's own financial reporting. It contains
+    nothing about any other organisation, and nothing about current events,
+    market prices, sport or general knowledge. For an unrelated query it returns
+    its nearest passages anyway rather than an error, so calling it to confirm
+    that the knowledge base does not cover a subject tells you nothing - decide
+    from this description instead.
+
     Args:
         query: A natural-language question or search phrase.
 
