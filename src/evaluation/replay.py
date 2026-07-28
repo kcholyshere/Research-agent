@@ -46,16 +46,16 @@ often enough to cost real time, and it very nearly did here too):
    restore the original bound method afterwards - unlike the plain
    functions, there is no fresh wrapper to chase.
 
-   One more thing the probe turned up, worth flagging rather than quietly
-   working around: `AgentTool.__init__` names the tool after the wrapped
-   sub-agent (`super().__init__(name=agent.name, ...)`), so the tool the LLM
-   actually calls is named "web_search_agent", not "web_search_tool" - the
-   Python variable name in src/tools/web_search.py. `schema.py`'s
-   `TOOL_TO_ROUTE` dict keys on "web_search_tool", which will never match a
-   real event's `call.name`. That is a latent bug in a file this module is
-   told not to touch; this module keys its own fixtures on the name ADK
-   actually uses (`tool.name`, i.e. "web_search_agent"), which is correct
-   for its own purpose regardless of that mismatch elsewhere.
+   One more thing the probe turned up, which was a real bug elsewhere:
+   `AgentTool.__init__` names the tool after the wrapped sub-agent
+   (`super().__init__(name=agent.name, ...)`), so the tool the LLM actually
+   calls is named "web_search_agent", not "web_search_tool" - the Python
+   variable name in src/tools/web_search.py. `schema.py`'s `TOOL_TO_ROUTE`
+   originally keyed on the variable name, which would never have matched a
+   real event's `call.name`: every web question would have reported zero
+   routes used and failed its routing assertion for a naming reason while
+   looking like a genuine routing defect. Fixed there; this module keys its
+   own fixtures on `tool.name`, the name ADK actually uses.
 
 3. Invocation is async throughout in this version - `FunctionTool.run_async`
    calls `_invoke_callable`, which awaits the target if
@@ -91,26 +91,55 @@ wholesale reformat of the file. Record mode loads whatever is already on
 disk and appends to it (rather than starting fresh each run), so recording
 one new question's fixtures does not clobber every other question's.
 
-Lookup key: `(tool name, normalised arguments)`, where normalisation is
-`json.dumps(args, sort_keys=True)` - recursive by construction, so nested
-dict argument values are order-independent too, not just the top level.
-Distinct arguments to the same tool therefore get distinct entries and
-replay correctly, per call, within one turn. Calls that recorded the exact
-same (tool, arguments) key more than once - e.g. two different record
-sessions, or a genuinely repeated call within one turn - are served back in
-the order they were recorded (a FIFO queue per key), so a second identical
-call does not just keep replaying the first call's answer forever.
+Argument normalisation for the lookup key is `json.dumps(args,
+sort_keys=True)` - recursive by construction, so nested dict argument values
+are order-independent too, not just the top level. Every recorded entry is a
+single-use slot: once served it is marked consumed, so a repeated call gets
+the next recorded response rather than replaying the first one forever, and
+recorded order is preserved throughout.
 
-## Miss handling
+## Lookup: exact first, then same-tool - and why the fallback is not cheating
 
-A replay lookup that finds nothing is never silently papered over and never
-falls through to a live call - both would let a real behavioural change (the
-agent starting to call a tool with different arguments than the fixture
-expects) masquerade as a pass. A miss is recorded in
-`FixtureSession.misses` as a human-readable description, and the call
-returns a clearly-marked sentinel payload so the rest of the turn - and
-whatever routing data it produces - still completes and is still worth
-capturing.
+The first version of this module keyed lookups on `(tool, exact arguments)`
+with no fallback, on the reasoning that a nearest-match would let a
+behavioural change masquerade as a pass. Measurement killed that design: the
+planner does not repeat its own tool arguments across runs. Recording a KB
+turn produced three `search_documents` calls with queries like "Net income
+fiscal year ending June 30 2024 consolidated financial statements"; replaying
+the identical question produced semantically identical but textually
+different queries, so every single lookup missed, the answer lost the figure
+it had found during recording, and the turn degenerated into a search storm
+(10 calls in one measured run, 44 in another).
+
+The distinction that design missed is that *calling a different tool* and
+*phrasing the same query differently* are completely different events, and
+only the first is a behavioural change worth failing on. So lookup is now:
+
+1. Exact `(tool, normalised arguments)` match, consumed in recorded order.
+2. Failing that, any not-yet-consumed response recorded for the SAME tool in
+   this fixture. Counted in `FixtureSession.inexact_matches`, so a run that
+   leaned on the fallback is visible rather than silently equivalent to one
+   that did not.
+3. Failing that, a real miss (see below).
+
+This keeps the anti-masking property the original ban was protecting: a
+fixture is scoped to one question, so every response in it is evidence
+gathered for that question, and serving one of them to a differently-phrased
+query still pins the world. A call to a tool with NO fixture entries at all -
+which is what a genuine routing regression looks like - still misses loudly.
+
+## Miss handling: abort the turn
+
+A real miss ends the turn immediately by raising `FixtureMissError`, rather
+than returning a sentinel and letting the turn continue. Continuing was
+measured and it is strictly worse: once a tool stops returning real evidence
+the answer is already lost, and the agent responds by thrashing - the 44-call
+run above was a single turn reformulating one question across thirty-odd web
+searches. That burns minutes per run and injects a fake redundancy spike into
+exactly the metric this tier exists to measure. Aborting keeps whatever was
+captured up to the miss and marks the run fixture-incomplete, which is an
+honest "this run tells you nothing" rather than a plausible-looking bad
+number.
 """
 
 from __future__ import annotations
@@ -118,7 +147,6 @@ from __future__ import annotations
 import functools
 import inspect
 import json
-from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -132,7 +160,14 @@ from src.evaluation.schema import CONTROL_TOOLS
 
 FixtureMode = Literal["live", "record", "replay"]
 
-_MISS_TAG = "REPLAY_FIXTURE_MISS"
+class FixtureMissError(RuntimeError):
+    """Raised in replay mode when a call has no fixture behind it at all.
+
+    Deliberately a distinct exception type rather than a bare RuntimeError so
+    the runner can tell "this run is fixture-incomplete and tells you nothing"
+    apart from "the agent genuinely errored", which are different findings
+    that would otherwise be indistinguishable in a results file.
+    """
 
 
 @dataclass
@@ -152,6 +187,11 @@ class FixtureSession:
     mode: FixtureMode
     misses: list[str] = field(default_factory=list)
     calls_recorded: int = 0
+    # Calls served by the same-tool fallback rather than an exact argument
+    # match. Not a failure - it is the normal case, since the planner rewords
+    # its queries between runs - but it is recorded so a run that leaned on
+    # the fallback is never silently indistinguishable from one that did not.
+    inexact_matches: list[str] = field(default_factory=list)
 
 
 def _normalise_args(args: dict[str, Any]) -> str:
@@ -175,33 +215,6 @@ def _load_fixture_file(path: Path) -> list[dict[str, Any]]:
     return json.loads(raw)
 
 
-def _function_miss_sentinel(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
-    # A dict, matching the shape every plain-function tool here already
-    # returns (search_documents: list[dict], get_financial_data: dict) well
-    # enough that it serialises the same way into the model's context - the
-    # LLM reads it as data either way, and the explicit tag is what stops a
-    # miss from reading like an empty-but-real result.
-    return {
-        "_replay_status": _MISS_TAG,
-        "detail": (
-            f"No recorded fixture for {tool_name} with args {args!r}. Replay "
-            "never calls the real tool, so this call has no real evidence "
-            "behind it - see FixtureSession.misses."
-        ),
-    }
-
-
-def _agent_tool_miss_sentinel(tool_name: str, args: dict[str, Any]) -> str:
-    # A plain string, matching what AgentTool.run_async returns for real
-    # (the wrapped sub-agent's merged final text) - so a miss looks like
-    # unusual prose to the calling agent rather than an unexpected type.
-    return (
-        f"[{_MISS_TAG}] No recorded fixture for {tool_name} with args "
-        f"{args!r}. Replay never calls the real sub-agent, so this call has "
-        "no real evidence behind it - see FixtureSession.misses."
-    )
-
-
 class _FixtureStore:
     """Backs every patched tool for one `tool_fixtures` session.
 
@@ -217,21 +230,30 @@ class _FixtureStore:
         self._entries: list[dict[str, Any]] = _load_fixture_file(path)
 
         # Built once at entry, not per-call: replay must never touch disk or
-        # re-derive state mid-turn, and a dict-of-deques gives O(1) lookup
-        # plus first-recorded-first-replayed order for repeated identical
-        # calls.
-        self._replay_index: dict[tuple[str, str], deque[Any]] = {}
+        # re-derive state mid-turn. A flat list of consumable slots rather
+        # than a dict-of-deques, because lookup now has to fall back from an
+        # exact argument match to any unconsumed response from the same tool
+        # (see the module docstring), and that second pass needs to scan
+        # entries by tool while respecting what the first pass already took.
+        # Recorded order is preserved, so repeated identical calls are still
+        # served first-recorded-first-replayed.
+        self._slots: list[dict[str, Any]] = []
         if mode == "replay":
-            for entry in self._entries:
-                key = (entry["tool"], _normalise_args(entry["args"]))
-                self._replay_index.setdefault(key, deque()).append(entry["response"])
+            self._slots = [
+                {
+                    "tool": entry["tool"],
+                    "arg_key": _normalise_args(entry["args"]),
+                    "response": entry["response"],
+                    "consumed": False,
+                }
+                for entry in self._entries
+            ]
 
     async def handle(
         self,
         tool_name: str,
         args: dict[str, Any],
         real_call: Callable[[], Any],
-        miss_sentinel: Any,
     ) -> Any:
         if self._mode == "record":
             response = await real_call()
@@ -242,12 +264,44 @@ class _FixtureStore:
 
         # Replay: real_call is never invoked, by construction - this branch
         # is the entire guarantee that replay makes no network or model call.
-        key = (tool_name, _normalise_args(args))
-        queue = self._replay_index.get(key)
-        if queue:
-            return queue.popleft()
+        arg_key = _normalise_args(args)
+
+        exact = self._take(lambda slot: slot["tool"] == tool_name and slot["arg_key"] == arg_key)
+        if exact is not None:
+            return exact
+
+        # Same-tool fallback. The planner rewords its queries between runs, so
+        # this is the common path, not the exceptional one - see the module
+        # docstring for why that is not the nearest-match cheat it resembles.
+        fallback = self._take(lambda slot: slot["tool"] == tool_name)
+        if fallback is not None:
+            self._session.inexact_matches.append(f"{tool_name} args={args!r}")
+            return fallback
+
+        # Nothing recorded for this tool at all, which is what a genuine
+        # routing change looks like. Abort rather than return a sentinel: a
+        # turn that continues past this point produces a wrong answer and a
+        # search storm, contaminating the redundancy metric with a failure
+        # that is an artefact of the fixture rather than of the agent.
         self._session.misses.append(f"{tool_name} args={args!r}")
-        return miss_sentinel
+        raise FixtureMissError(
+            f"No fixture recorded for tool {tool_name!r} (args {args!r}). "
+            "This run is fixture-incomplete - re-record it before trusting "
+            "any metric derived from it."
+        )
+
+    def _take(self, predicate: Callable[[dict[str, Any]], bool]) -> Any | None:
+        """Consume and return the first unconsumed slot matching `predicate`.
+
+        Returns None when nothing matches. A recorded response of `None` would
+        be ambiguous here, but no tool in this project returns one - they
+        return a list of passages, a dict, or the sub-agent's text.
+        """
+        for slot in self._slots:
+            if not slot["consumed"] and predicate(slot):
+                slot["consumed"] = True
+                return slot["response"]
+        return None
 
     def _flush(self) -> None:
         # Rewritten whole-file per call rather than batched at exit: a run
@@ -296,9 +350,7 @@ def _make_function_wrapper(
         async def real_call() -> Any:
             return await original(**kwargs) if is_async else original(**kwargs)
 
-        return await store.handle(
-            tool_name, kwargs, real_call, _function_miss_sentinel(tool_name, kwargs)
-        )
+        return await store.handle(tool_name, kwargs, real_call)
 
     return wrapper
 
@@ -318,9 +370,7 @@ def _make_agent_tool_wrapper(
         async def real_call() -> Any:
             return await original_run_async(args=args, tool_context=tool_context)
 
-        return await store.handle(
-            tool_name, args, real_call, _agent_tool_miss_sentinel(tool_name, args)
-        )
+        return await store.handle(tool_name, args, real_call)
 
     return wrapper
 

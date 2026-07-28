@@ -60,7 +60,16 @@ class RouteTarget(str, Enum):
 # runner and the metrics need it and neither should own it.
 TOOL_TO_ROUTE: dict[str, RouteTarget] = {
     "search_documents": RouteTarget.KNOWLEDGE_BASE,
-    "web_search_tool": RouteTarget.WEB,
+    # "web_search_agent", NOT "web_search_tool". The Python name in
+    # src/tools/web_search.py is the AgentTool variable; ADK's AgentTool
+    # names itself after the sub-agent it wraps (`super().__init__(name=
+    # agent.name)`), so the name appearing in a real event's `call.name` is
+    # the sub-agent's. Verified against the installed google-adk 2.5.0, after
+    # the first version of this dict guessed the variable name and would have
+    # silently reported zero routes used for every web question - the routing
+    # assertion would have failed on a naming mismatch while looking like a
+    # genuine routing defect.
+    "web_search_agent": RouteTarget.WEB,
     "get_financial_data": RouteTarget.FINANCIAL,
 }
 
