@@ -1,0 +1,442 @@
+"""Tier 1 evaluation runner - drives the question set through one or more
+critique-budget arms and writes per-cycle RunRecords (see schema.py).
+
+## How the per-cycle boundary was determined
+
+Read src/research_agent/critique.py's module docstring first: `research_agent`
+and `critique_agent` are the two sub-agents a LoopAgent cycles through, and
+`critique_agent` has a `before_agent_callback` (`_skip_critique_llm_call`)
+that can short-circuit its own LLM call entirely. That gave a hypothesis for
+where cycle boundaries fall, but not their exact event shape - so it was
+checked against real event streams (scripts under
+/private/tmp/.../scratchpad/probe_events*.py, not kept in the repo) before
+writing `_split_into_cycles` below. Three findings from that probing:
+
+1. Every event in a turn carries `event.author` set to whichever sub-agent
+   produced it (`research_agent`, `critique_agent`, or the LoopAgent itself,
+   `research_loop`) - so author is a reliable phase marker with no need to
+   infer it from content.
+2. Both `LoopAgent.before_agent_callback` (`reset_turn_state`) and
+   `critique_agent`'s own `before_agent_callback` mutate session state before
+   their agent's real work happens. When they do, ADK emits a *separate*
+   event carrying that state delta with `event.content is None`, ahead of
+   whatever the agent's real model turn produces - confirmed by directly
+   driving `critique_agent` with a synthetic incomplete draft, which reliably
+   produced exactly two events: a `content is None` opener, then one real
+   final-response event carrying the follow-up text. `research_agent` has no
+   `before_agent_callback`, and never showed this opener event, which is
+   consistent with the mechanism rather than coincidental. Filtering on
+   `event.content is not None` (not just `is_final_response()`) is therefore
+   required - an unfiltered final-response check treats the vacuous opener as
+   real content and, for `critique_agent`, would close a cycle one event too
+   early with an empty outcome.
+3. The three critique outcomes are distinguishable without touching session
+   state at all, from the event stream alone:
+   - "skipped": `_skip_critique_llm_call` returns Content directly, so ADK
+     emits exactly one event for the whole `critique_agent` block, with real
+     text starting "Skipping critique:". No opener event precedes it, because
+     the skip path never writes `critique_iterations_used` (see finding 2).
+   - "exit": the block includes a `get_function_calls()`/`get_function_responses()`
+     entry named "exit_loop"; the closing event has `escalate=True`,
+     `skip_summarization=True` (per `exit_loop`'s own docstring) and text
+     that is the tool's JSON return value, not a real follow-up.
+   - "continue": no exit_loop call anywhere in the block; the closing event's
+     text is the follow-up question(s) `critique_agent`'s output_key would
+     write to `critique_followups`.
+
+A live end-to-end run that actually continues past one cycle was not
+observed in verification - this agent's critique prompt makes termination the
+default outcome by design, and every live probe (including a purpose-built
+multi-part comparison question) exited after one cycle. The "continue" event
+shape above was confirmed by invoking `critique_agent` directly against a
+deliberately incomplete synthetic draft, not by a full multi-cycle `root_agent`
+turn - see this module's own report back to the user for that gap. The
+splitting logic here does not special-case "budget 0" or "budget 1" - it is
+driven entirely by event authorship and content, so it does not need to,
+which is also part of why it survived not seeing a live multi-cycle run.
+
+## Other traps this module has to honour (see references/evaluation_
+brainstorm.md's "Traps found the hard way" for the measurements behind each)
+
+- Fresh session per run, including repetitions - a reused session lets a
+  later rep see an earlier rep's answer and short-circuit the work.
+- Arms interleaved (A, B, A, B) across reps, mirroring ab_harness.compare's
+  loop nesting (rep outer, arm middle, question inner) rather than running
+  all reps of one arm before the next - that nesting is what shares
+  live-world drift across arms instead of dumping it all on one.
+- Sequential only - concurrent arms would contend for the same Vertex quota
+  and inflate exactly the latency being measured.
+- A per-run timeout, because nothing in this stack bounds a turn's duration
+  on its own (one early harness run sat 85 minutes on a call that never
+  returned).
+- A FixtureMissError aborts a run, not the whole sweep: caught per run, the
+  run is tagged fixture-incomplete (RunRecord.fixture_incomplete) and the
+  loop moves on to the next run. That flag excludes it from aggregation
+  entirely, since a turn truncated on a missing fixture describes the
+  fixture rather than the agent.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import datetime as dt
+import time
+from pathlib import Path
+
+import yaml
+from google.adk.runners import InMemoryRunner
+from google.genai import types
+
+from src import config
+from src.evaluation.metrics import print_summary, summarise
+from src.evaluation.replay import FixtureMissError, FixtureMode, tool_fixtures
+from src.evaluation.schema import CycleRecord, EvalQuestion, EvalRun, RunRecord
+from src.research_agent.agent import langfuse_client, research_agent, root_agent
+from src.research_agent.critique import CRITIQUE_AGENT_NAME
+
+APP_NAME = "eval_runner"
+USER_ID = "eval-runner"
+
+DEFAULT_QUESTION_FILE = config.PROJECT_ROOT / "data" / "eval" / "questions.yaml"
+DEFAULT_FIXTURES_DIR = config.PROJECT_ROOT / "data" / "eval" / "fixtures"
+DEFAULT_OUTPUT_DIR = config.PROJECT_ROOT / "data" / "processed" / "eval_runs"
+
+# Generous relative to a single-cycle turn (10-45s observed) because a
+# critique budget above 0 can multiply that by the iteration count, and the
+# premise-refuting known defect alone burns ~100s on its own. Still finite -
+# see the module docstring's timeout trap for why this must never be None.
+DEFAULT_TIMEOUT_S = 300.0
+
+
+# ---------------------------------------------------------------------------
+# Question loading
+# ---------------------------------------------------------------------------
+
+
+def load_questions(
+    path: Path,
+    question_ids: set[str] | None = None,
+    tags: set[str] | None = None,
+) -> list[EvalQuestion]:
+    """Load and filter the question set.
+
+    Filters are AND'd when both are given - `--questions` pins an exact set,
+    `--tags` narrows by category; a caller combining both presumably means
+    both, and it costs nothing to honour that literally.
+    """
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    questions = [EvalQuestion.from_dict(q) for q in raw["questions"]]
+    if question_ids is not None:
+        questions = [q for q in questions if q.id in question_ids]
+    if tags is not None:
+        questions = [q for q in questions if tags.intersection(q.tags)]
+    return questions
+
+
+# ---------------------------------------------------------------------------
+# Event stream -> per-cycle records
+# ---------------------------------------------------------------------------
+
+
+def _event_text(event) -> str:
+    if not event.content or not event.content.parts:
+        return ""
+    return "".join(part.text or "" for part in event.content.parts if part.text)
+
+
+def _split_into_cycles(events: list) -> list[CycleRecord]:
+    """Reconstruct CycleRecords from a turn's raw event stream.
+
+    See this module's docstring for how the boundary and the three critique
+    outcomes ("exit" | "continue" | "skipped") were determined empirically.
+    Deliberately tolerant of a stream that ends mid-cycle (a FixtureMissError
+    or timeout can cut it off after research_agent but before critique_agent
+    has run) - the partial cycle is still appended rather than dropped, since
+    whatever tool calls and draft text were captured are real data the caller
+    is told to keep.
+    """
+    cycles: list[CycleRecord] = []
+    current: CycleRecord | None = None
+    exit_seen = False
+
+    for event in events:
+        if event.author == research_agent.name:
+            if current is None:
+                current = CycleRecord(index=len(cycles))
+                exit_seen = False
+            current.tools_called.extend(call.name for call in event.get_function_calls())
+            if event.content is not None and event.is_final_response():
+                text = _event_text(event)
+                if text:
+                    current.draft = text
+
+        elif event.author == CRITIQUE_AGENT_NAME:
+            if current is None:
+                # Not seen in practice (critique_agent always follows a
+                # research_agent cycle within a LoopAgent pass) but a run cut
+                # short by a fixture miss or timeout is exactly the kind of
+                # abnormal stream this should not crash on.
+                current = CycleRecord(index=len(cycles))
+                exit_seen = False
+
+            called_or_returned = [c.name for c in event.get_function_calls()]
+            called_or_returned += [r.name for r in event.get_function_responses()]
+            if "exit_loop" in called_or_returned:
+                exit_seen = True
+
+            if event.content is not None and event.is_final_response():
+                text = _event_text(event)
+                if text.startswith("Skipping critique:"):
+                    current.critique_outcome = "skipped"
+                elif exit_seen:
+                    current.critique_outcome = "exit"
+                else:
+                    current.critique_outcome = "continue"
+                    current.critique_followups = text
+                cycles.append(current)
+                current = None
+
+        # Any other author (today, only the LoopAgent's own before_agent_
+        # callback bookkeeping event) carries no per-cycle signal and is
+        # skipped - see finding 2 in the module docstring.
+
+    if current is not None:
+        cycles.append(current)
+    return cycles
+
+
+# ---------------------------------------------------------------------------
+# Single run
+# ---------------------------------------------------------------------------
+
+
+async def run_once(
+    question: EvalQuestion,
+    arm: str,
+    budget: int,
+    rep: int,
+    mode: FixtureMode,
+    fixtures_dir: Path,
+    timeout_s: float,
+) -> RunRecord:
+    """One question, once, against one arm, in its own fresh session.
+
+    Mirrors ab_harness.run_once's shape (fresh session, author-matched answer
+    extraction, wait_for timeout) but persists the full per-cycle structure
+    rather than just latency and a flat tool list - RunRecord is a superset
+    built for exactly that, per schema.py's own docstring.
+    """
+    record = RunRecord(question_id=question.id, question=question.question, arm=arm, rep=rep, mode=mode)
+    events: list = []
+    fixture_path = fixtures_dir / f"{question.id}.json"
+
+    async def _inner() -> None:
+        runner = InMemoryRunner(agent=root_agent, app_name=APP_NAME)
+        session = await runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
+        content = types.Content(role="user", parts=[types.Part(text=question.question)])
+        async for event in runner.run_async(
+            user_id=USER_ID,
+            session_id=session.id,
+            new_message=content,
+            state_delta={"critique_budget": budget},
+        ):
+            events.append(event)
+            # Cheap and non-blocking by construction (a contextvar read, no
+            # network call) - but only obtainable while OTEL's span context
+            # is still active, which is only true *during* iteration; a
+            # measured probe found it reliably returns None once run_async's
+            # generator has been fully exhausted. Captured once, opportunistically.
+            if record.trace_id is None:
+                try:
+                    record.trace_id = langfuse_client.get_current_trace_id()
+                except Exception:
+                    pass  # never let trace-id capture affect a run's outcome
+
+    started = time.monotonic()
+    with tool_fixtures(root_agent, mode, fixture_path) as fixture_session:
+        try:
+            await asyncio.wait_for(_inner(), timeout=timeout_s)
+            record.latency_s = time.monotonic() - started
+        except asyncio.TimeoutError:
+            record.timed_out = True
+            record.latency_s = None
+        except FixtureMissError as exc:
+            # Abort this run only, not the sweep - keep whatever was captured
+            # up to the miss (see _split_into_cycles's tolerance for a
+            # mid-cycle cutoff) and mark it fixture-incomplete so it is
+            # excluded from aggregation rather than scored as a failure.
+            record.error = str(exc)
+            record.fixture_incomplete = True
+            record.latency_s = time.monotonic() - started
+        except Exception as exc:  # noqa: BLE001 - one bad run must not kill a 30-60 min sweep
+            record.error = f"error: {exc!r}"
+            record.latency_s = time.monotonic() - started
+
+        if mode != "live" and (fixture_session.misses or fixture_session.inexact_matches):
+            print(
+                f"    [fixtures] misses={len(fixture_session.misses)} "
+                f"inexact_matches={len(fixture_session.inexact_matches)}",
+                flush=True,
+            )
+
+    record.cycles = _split_into_cycles(events)
+
+    # answer = the last non-empty final response authored by research_agent,
+    # never "the last final response of any author" (that picks up whichever
+    # sub-agent happened to speak last - the critique agent's "Skipping
+    # critique: ..." bookkeeping or exit_loop's raw JSON) and never
+    # session.state["draft_answer"] (can hold planning narration). This has
+    # been got wrong three separate times in this project already.
+    for event in events:
+        if event.author == research_agent.name and event.content is not None and event.is_final_response():
+            text = _event_text(event)
+            if text:
+                record.answer = text
+
+    return record
+
+
+# ---------------------------------------------------------------------------
+# Sweep
+# ---------------------------------------------------------------------------
+
+
+async def run_sweep(
+    questions: list[EvalQuestion],
+    budgets: list[int],
+    reps: int,
+    mode: FixtureMode,
+    fixtures_dir: Path,
+    timeout_s: float,
+) -> list[RunRecord]:
+    """Every question through every arm, interleaved, `reps` times each.
+
+    Loop nesting matches ab_harness.compare deliberately (rep outer, arm
+    middle, question inner) - that is the nesting the interleaving trap was
+    actually fixed against, so reproducing it here rather than inventing a
+    different interleaving (e.g. question outer) keeps the same drift-sharing
+    guarantee this project already paid to learn.
+    """
+    arms = {f"budget{b}": b for b in budgets}
+    results: list[RunRecord] = []
+    total = reps * len(arms) * len(questions)
+    done = 0
+    for rep in range(1, reps + 1):
+        for arm, budget in arms.items():
+            for question in questions:
+                done += 1
+                print(
+                    f"[{done}/{total}] rep={rep} arm={arm} question={question.id!r}...",
+                    end=" ",
+                    flush=True,
+                )
+                record = await run_once(question, arm, budget, rep, mode, fixtures_dir, timeout_s)
+                results.append(record)
+                if record.timed_out:
+                    status = "TIMEOUT"
+                elif record.error:
+                    status = f"ERROR: {record.error[:80]}"
+                else:
+                    status = f"{record.latency_s:.1f}s cycles={record.cycle_count} tools={record.tools_called}"
+                print(status, flush=True)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def _parse_int_list(raw: str) -> list[int]:
+    return [int(x.strip()) for x in raw.split(",") if x.strip()]
+
+
+def _parse_str_set(raw: str | None) -> set[str] | None:
+    if raw is None:
+        return None
+    return {x.strip() for x in raw.split(",") if x.strip()}
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Tier 1 trace-level evaluation runner.")
+    parser.add_argument("--question-file", type=Path, default=DEFAULT_QUESTION_FILE)
+    parser.add_argument(
+        "--questions", type=str, default=None, help="Comma-separated question ids to run (smoke mode)."
+    )
+    parser.add_argument("--tags", type=str, default=None, help="Comma-separated tags to filter by (smoke mode).")
+    parser.add_argument("--reps", type=int, default=5)
+    parser.add_argument("--mode", choices=["live", "record", "replay"], default="live")
+    parser.add_argument(
+        "--budgets", type=str, default="0,1", help="Comma-separated critique budgets, one arm per value."
+    )
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S, dest="timeout_s")
+    parser.add_argument("--fixtures-dir", type=Path, default=DEFAULT_FIXTURES_DIR)
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--no-summary", action="store_true", help="Skip printing the metrics.py rollup after the sweep."
+    )
+    return parser
+
+
+async def main_async(argv: list[str] | None = None) -> EvalRun:
+    args = build_arg_parser().parse_args(argv)
+
+    question_ids = _parse_str_set(args.questions)
+    tags = _parse_str_set(args.tags)
+    budgets = _parse_int_list(args.budgets)
+
+    questions = load_questions(args.question_file, question_ids, tags)
+    if not questions:
+        raise SystemExit("No questions matched --questions/--tags filters - nothing to run.")
+
+    print(
+        f"Running {len(questions)} question(s) x {len(budgets)} arm(s) x {args.reps} rep(s) "
+        f"= {len(questions) * len(budgets) * args.reps} runs, mode={args.mode}",
+        flush=True,
+    )
+
+    started_at = dt.datetime.now(dt.timezone.utc)
+    records = await run_sweep(
+        questions=questions,
+        budgets=budgets,
+        reps=args.reps,
+        mode=args.mode,
+        fixtures_dir=args.fixtures_dir,
+        timeout_s=args.timeout_s,
+    )
+    finished_at = dt.datetime.now(dt.timezone.utc)
+
+    settings = {
+        "question_file": str(args.question_file),
+        "question_ids_filter": sorted(question_ids) if question_ids else None,
+        "tags_filter": sorted(tags) if tags else None,
+        "reps": args.reps,
+        "mode": args.mode,
+        "budgets": budgets,
+        "timeout_s": args.timeout_s,
+        "fixtures_dir": str(args.fixtures_dir),
+        "started_at": started_at.isoformat(),
+        "finished_at": finished_at.isoformat(),
+    }
+    eval_run = EvalRun(settings=settings, records=records)
+
+    timestamp = started_at.strftime("%Y%m%dT%H%M%SZ")
+    budgets_tag = "-".join(str(b) for b in budgets)
+    output_path = args.output_dir / f"{timestamp}_{args.mode}_reps{args.reps}_budgets{budgets_tag}.json"
+    eval_run.to_json(output_path)
+    print(f"\nWrote {len(records)} run record(s) to {output_path}", flush=True)
+
+    if not args.no_summary:
+        summaries = summarise(records, questions)
+        print_summary(summaries)
+
+    return eval_run
+
+
+def main() -> None:
+    asyncio.run(main_async())
+
+
+if __name__ == "__main__":
+    main()

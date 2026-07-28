@@ -189,6 +189,14 @@ class RunRecord:
     timed_out: bool = False
     error: str | None = None
 
+    # Set when a replay run aborted on a fixture miss. A dedicated field
+    # rather than a prefix convention on `error`, because this flag decides
+    # whether the run is admitted to metric aggregation at all - a
+    # fixture-incomplete run tells you nothing and must be excluded - and a
+    # string prefix shared across modules is the kind of coupling that
+    # silently stops working the moment someone reworks an error message.
+    fixture_incomplete: bool = False
+
     cycles: list[CycleRecord] = field(default_factory=list)
     answer: str = ""
     trace_id: str | None = None
