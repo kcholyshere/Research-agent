@@ -11,10 +11,6 @@ Plain functions passed via `tools=` are auto-wrapped as function tools, with
 their docstrings as tool descriptions; `web_search_tool` is an `AgentTool`
 wrapping a sub-agent (see src/tools/web_search.py for why).
 
-NOTE: written against the ADK docs (https://google.github.io/adk-docs/) before
-the dependency was installed - treat as a skeleton to verify against the real
-API on first `adk run`, not as tested code.
-
 Observability: Langfuse tracing is wired in here, not per-entrypoint, since
 every entrypoint (`adk run`, `adk web`, the Streamlit UI) imports this module
 to get `root_agent` - one instrumentation call covers all three. It must run
