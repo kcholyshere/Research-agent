@@ -50,8 +50,32 @@ LATENCY_TARGET_S = 15.0
 # than a URL (see research_agent's synthesize instruction step 3), so a
 # document-shaped reference counts as a real citation too.
 _URL_RE = re.compile(r"https?://[^\s)\]]+")
-_DOC_REFERENCE_RE = re.compile(r"[\w\-./]+\.pdf\b", re.IGNORECASE)
 _BROKEN_CITATION_RE = re.compile(r"\(Google Search\)", re.IGNORECASE)
+
+# A filename was the original test for a document citation, and it was wrong:
+# the agent never emits one. Measured on the first baseline, a KB answer
+# citing "According to the IFC's 2024 Annual Report ... (Source: IFC Annual
+# Report 2024 Financials, Consolidated Statements of Operations, page 64)"
+# scored as "no citation of any kind", which made the citation assertion fail
+# on essentially every question and buried the real defect in false
+# positives. The corpus is a PDF on disk, but the agent cites it the way a
+# person would, by name and page.
+#
+# So a document citation is now an attribution MARKER ("source:", "according
+# to", "per") near a document NOUN ("annual report", "statement", "page 64").
+# Both halves are required: the marker alone matches conversational filler
+# ("according to the data"), and the noun alone matches an answer that merely
+# mentions a report without attributing anything to it.
+_DOC_FILENAME_RE = re.compile(r"[\w\-./]+\.(?:pdf|docx?|csv|json)\b", re.IGNORECASE)
+_ATTRIBUTION_MARKER_RE = re.compile(
+    r"\b(?:source|sources|according to|as (?:reported|stated) (?:in|by)|per|cited in|from the)\b",
+    re.IGNORECASE,
+)
+_DOCUMENT_NOUN_RE = re.compile(
+    r"\b(?:annual report|financial statements?|consolidated statements?|"
+    r"balance sheet|filing|prospectus|report|financials|page\s+\d+|p\.\s*\d+)\b",
+    re.IGNORECASE,
+)
 
 # Decline heuristics. Phrases the synthesize instruction's "say so plainly
 # and stop" is expected to produce when neither source covers the question.
@@ -197,8 +221,17 @@ def check_citation(question: EvalQuestion, record: RunRecord) -> AssertionResult
     if not question.expects_citation:
         return None
     answer = record.answer
-    has_url = bool(_URL_RE.search(answer))
-    has_doc_reference = bool(_DOC_REFERENCE_RE.search(answer))
+
+    # Strip the known-broken placeholder before looking for a real citation,
+    # so an answer whose ONLY attribution is "(Source: Google Search)" cannot
+    # satisfy the marker test on the word "Source" and pass.
+    answer_without_placeholder = _BROKEN_CITATION_RE.sub(" ", answer)
+
+    has_url = bool(_URL_RE.search(answer_without_placeholder))
+    has_doc_reference = bool(_DOC_FILENAME_RE.search(answer_without_placeholder)) or (
+        bool(_ATTRIBUTION_MARKER_RE.search(answer_without_placeholder))
+        and bool(_DOCUMENT_NOUN_RE.search(answer_without_placeholder))
+    )
     if has_url or has_doc_reference:
         kind = "url" if has_url else "document reference"
         return AssertionResult(key="citation", passed=True, detail=f"real citation present ({kind})")
@@ -481,7 +514,22 @@ def print_summary(summaries: dict[str, ArmSummary]) -> None:
             print("  latency by cycle count (median / IQR, seconds):", flush=True)
             for cycle_count in sorted(s.latency_by_cycle):
                 seg = s.latency_by_cycle[cycle_count]
-                target = "" if seg.meets_target is None else (" [OK <=15s]" if seg.meets_target else " [OVER 15s]")
+                # Label the SUBSET the verdict is actually about. The median
+                # printed on this line covers every run in the cycle segment,
+                # but meets_target is computed only over its single-tool runs,
+                # because that is the only population the 15s target was
+                # agreed over. Without saying so, the line reads
+                # "median=18.1s [OK <=15s]", which looks like a broken
+                # comparison rather than two different populations.
+                target = (
+                    ""
+                    if seg.meets_target is None
+                    else (
+                        " [single-tool subset OK <=15s]"
+                        if seg.meets_target
+                        else " [single-tool subset OVER 15s]"
+                    )
+                )
                 print(
                     f"    cycles={cycle_count} n={seg.n} median={seg.median_s:.1f}s "
                     f"iqr={seg.iqr_s:.1f}s min={seg.min_s:.1f}s max={seg.max_s:.1f}s{target}",
