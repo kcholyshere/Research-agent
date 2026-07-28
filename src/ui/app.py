@@ -18,7 +18,7 @@ from google.genai import types as genai_types
 from langfuse import get_client, propagate_attributes
 
 from src import config
-from src.research_agent.agent import root_agent  # instruments ADK on import, see agent.py
+from src.research_agent.agent import research_agent, root_agent  # instruments ADK on import, see agent.py
 
 APP_NAME = "research_agent"
 USER_ID = "streamlit-user"
@@ -31,14 +31,37 @@ def _runner() -> InMemoryRunner:
     return InMemoryRunner(agent=root_agent, app_name=APP_NAME)
 
 
-async def _run_turn(runner: InMemoryRunner, session_id: str, message: str) -> str:
+async def _run_turn(runner: InMemoryRunner, session_id: str, message: str, critique_budget: int) -> str:
     content = genai_types.Content(role="user", parts=[genai_types.Part(text=message)])
     final_text = "(no response)"
     # session_id/user_id group this turn's spans into Langfuse's Sessions/Users
     # views - each chat_input submission is one ADK run, so one Langfuse trace.
     with propagate_attributes(session_id=session_id, user_id=USER_ID, tags=["research_agent"]):
-        async for event in runner.run_async(user_id=USER_ID, session_id=session_id, new_message=content):
-            if event.is_final_response() and event.content and event.content.parts:
+        # critique_budget is the per-request soft cap the critique agent honours
+        # (ADR-0010) - 0 short-circuits to a single research cycle with no
+        # critique pass, matching pre-phase-4 behaviour.
+        async for event in runner.run_async(
+            user_id=USER_ID,
+            session_id=session_id,
+            new_message=content,
+            state_delta={"critique_budget": critique_budget},
+        ):
+            # Match on the author, not just is_final_response(): since phase 4
+            # (ADR-0010) the turn runs two agents, and ADK marks a final
+            # response per participating agent rather than once per turn. The
+            # critique agent's own last word is internal bookkeeping -
+            # "Skipping critique: ..." or exit_loop's JSON status - so taking
+            # the last final response of any author showed the user that
+            # instead of the answer, on every single turn. Session state's
+            # "draft_answer" is not a safe substitute either: it sometimes
+            # holds the research agent's planning narration rather than its
+            # answer. The research agent's own final response is the answer.
+            if (
+                event.author == research_agent.name
+                and event.is_final_response()
+                and event.content
+                and event.content.parts
+            ):
                 final_text = "".join(part.text or "" for part in event.content.parts)
     # Streamlit is a long-lived server, not a short script, but flushing after
     # each turn keeps traces visible promptly rather than waiting on the SDK's
@@ -60,6 +83,25 @@ st.caption(
     "Plan-execute-synthesize over a private knowledge base "
     f"(Document Search Tool, corpus: {config.RAW_DATA_DIR})"
 )
+
+# One expander for advanced, infrequently-touched per-request settings - a
+# planned thinking-budget slider (ADR-0010) lands alongside critique_budget
+# here later, so this stays a shared home for controls rather than a
+# one-off widget bolted on next to the chat box.
+with st.expander("Advanced configuration", expanded=False):
+    critique_budget = st.slider(
+        "Critique iterations",
+        min_value=0,
+        max_value=config.MAX_CRITIQUE_ITERATIONS,
+        value=config.DEFAULT_CRITIQUE_BUDGET,
+        help=(
+            "How many times the agent critiques and refines its own answer "
+            "before replying. 0 skips the critique pass entirely - fastest, "
+            "and matches the agent's pre-phase-4 behaviour. Higher values let "
+            "the agent spot gaps in its own answer and follow up, at the "
+            "cost of extra latency per iteration."
+        ),
+    )
 
 runner = _runner()
 session_id = asyncio.run(_ensure_session(runner))
@@ -87,7 +129,7 @@ if prompt := st.chat_input("Ask a question about the knowledge base"):
 
         def _run_turn_sync() -> None:
             try:
-                turn_result["answer"] = asyncio.run(_run_turn(runner, session_id, prompt))
+                turn_result["answer"] = asyncio.run(_run_turn(runner, session_id, prompt, critique_budget))
             except Exception as exc:
                 # Vertex errors, an empty/missing FAISS index, etc. should read as a
                 # message in the chat, not crash the page.

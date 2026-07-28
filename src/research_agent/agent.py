@@ -1,12 +1,15 @@
-"""The core research agent: a Plan-Execute-Synthesize flow over two tools -
-the private-knowledge-base Document Search Tool (phase 1) and the public-
-internet Web Search Tool (phase 2).
+"""The core research agent: a Plan-Execute-Synthesize flow over three tools -
+the private-knowledge-base Document Search Tool (phase 1), the Financial Data
+Tool (phase 3), and the public-internet Web Search Tool (phase 2) - wrapped
+in a phase 4 critique/refinement loop.
 
 ADK conventions: this module exposes `root_agent`, which `adk run src/research_agent`
-and `adk web src` discover by name. Plain functions passed via `tools=` are
-auto-wrapped as function tools, with their docstrings as tool descriptions;
-`web_search_tool` is an `AgentTool` wrapping a sub-agent (see
-src/tools/web_search.py for why).
+and `adk web src` discover by name. That symbol is now the `LoopAgent`
+(see ADR-0010), not the single-shot planner directly - `research_agent`
+below is the renamed former `root_agent`, one sub-agent of the loop.
+Plain functions passed via `tools=` are auto-wrapped as function tools, with
+their docstrings as tool descriptions; `web_search_tool` is an `AgentTool`
+wrapping a sub-agent (see src/tools/web_search.py for why).
 
 NOTE: written against the ADK docs (https://google.github.io/adk-docs/) before
 the dependency was installed - treat as a skeleton to verify against the real
@@ -16,8 +19,8 @@ Observability: Langfuse tracing is wired in here, not per-entrypoint, since
 every entrypoint (`adk run`, `adk web`, the Streamlit UI) imports this module
 to get `root_agent` - one instrumentation call covers all three. It must run
 before any Agent is constructed (including web_search.py's module-level
-sub-agent), and after `src.config` has loaded `.env`, hence the import order
-below.
+sub-agent, and critique.py's module-level `critique_agent`), and after
+`src.config` has loaded `.env`, hence the import order below.
 
 Repo-root sys.path bootstrap: ADK's CLI loader (`adk run`/`adk web`) inserts
 only the agent's *parent* directory (`src`) onto sys.path, not the repo root,
@@ -43,18 +46,29 @@ from langfuse import get_client
 GoogleADKInstrumentor().instrument()
 langfuse_client = get_client()
 
-from google.adk.agents import Agent
+from google.adk.agents import Agent, LoopAgent
 from google.genai import types
 
 from src.tools.document_search import search_documents
 from src.tools.financial_data import get_financial_data
 from src.tools.web_search import web_search_tool
 
+# Imported after instrument() (see the observability note above) - this
+# module's own import constructs critique_agent = Agent(...) at load time.
+from src.research_agent.critique import critique_agent, reset_turn_state
+
 INSTRUCTION = """You are a research agent with three sources of evidence: a
 private knowledge base (search_documents), live financial market data
 (get_financial_data), and the public internet (web_search_tool). For every
 question, follow a plan-execute-synthesize flow:
 
+0. Refinement check: {critique_followups?} holds specific follow-up
+   sub-questions a prior critique pass raised against your last draft for
+   this same turn (empty if this is the first pass, which is the common
+   case). If it is non-empty, treat each one as an additional fact to plan
+   and execute for, on top of - not instead of - the original question,
+   and produce a new complete draft that folds the answer to each follow-up
+   into the previous draft rather than just appending to it.
 1. Plan: break the question into the distinct facts you need. For each, decide
    which single source is appropriate - search_documents for anything about
    the private knowledge base's own documents; get_financial_data for current
@@ -99,11 +113,47 @@ _GENERATE_CONTENT_CONFIG = types.GenerateContentConfig(
     frequency_penalty=0.4,
 )
 
-root_agent = Agent(
+# Renamed from root_agent (see ADR-0010): this is now one sub-agent of the
+# critique loop below, not the module's discovered entrypoint. output_key
+# writes its final answer to session state as "draft_answer" - the only
+# thing critique_agent is allowed to see of this cycle's work (see
+# src/research_agent/critique.py's module docstring for why).
+research_agent = Agent(
     name="research_agent",
     model=config.GEMINI_MODEL,
     description="Answers questions over a private knowledge base, live financial market data, and the public internet via planned, multi-source search.",
     instruction=INSTRUCTION,
     tools=[search_documents, get_financial_data, web_search_tool],
     generate_content_config=_GENERATE_CONTENT_CONFIG,
+    output_key="draft_answer",
+)
+
+# The phase 4 critique/refinement loop (ADR-0010). LoopAgent is deprecated in
+# google-adk 2.5.0 in favour of Workflow, but Workflow cannot yet be used as
+# an LlmAgent sub-agent, which today's composition (research_agent and
+# critique_agent are both LlmAgents) requires - so LoopAgent is the
+# deliberate choice, not an oversight; revisit when that Workflow limitation
+# lifts. max_iterations is the hard, code-level ceiling (ADR-0010's "two-tier
+# iteration bound") - no request can raise it. The per-request soft budget
+# that most turns actually stop on lives in session state
+# ("critique_budget"), read by critique_agent's before_agent_callback, not
+# here.
+#
+# root_agent is now this LoopAgent, not research_agent directly - `adk run`/
+# `adk web` discover the agent to run by that exact module-level name, so it
+# has to stay attached to whichever object is the actual entrypoint.
+#
+# before_agent_callback=reset_turn_state resets the loop's per-turn state
+# (how much of the budget this turn has spent so far, the original
+# question, any leftover follow-ups) exactly once, before the first cycle -
+# see critique.py's reset_turn_state docstring. Without it, a session that
+# spans multiple user turns (both scripts/verify_agent.py and the Streamlit
+# UI reuse one session that way) would leak one turn's critique bookkeeping
+# into the next, unrelated turn.
+root_agent = LoopAgent(
+    name="research_loop",
+    description="Runs the research agent, critiques its draft, and either ends the turn or feeds follow-up questions back for another research cycle.",
+    sub_agents=[research_agent, critique_agent],
+    max_iterations=config.MAX_CRITIQUE_ITERATIONS,
+    before_agent_callback=reset_turn_state,
 )

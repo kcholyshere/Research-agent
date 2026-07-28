@@ -34,3 +34,17 @@ FAISS_INDEX_DIR = PROJECT_ROOT / "models" / "faiss"
 
 # Retrieval
 TOP_K = 4
+
+# Phase 4 critique loop (ADR-0010): two separate bounds, on purpose. This one
+# is the hard ceiling - it lives in code, not a request field, so no request
+# can ever raise it. 3 gives enough headroom to demonstrate more than one
+# refinement cycle without letting worst-case latency multiply unboundedly -
+# ADR-0009 already had to add a config-level cap once, for the same reason a
+# prompt alone can't bound a worst case.
+MAX_CRITIQUE_ITERATIONS = 3
+
+# The soft, per-request default (see agent_docs/decisions.md ADR-0010): one
+# critique pass is enough to demonstrate the requirement while keeping
+# typical latency close to the pre-phase-4 baseline. A request-supplied
+# budget of 0 reproduces that baseline exactly - no critique LLM call at all.
+DEFAULT_CRITIQUE_BUDGET = 1
