@@ -101,7 +101,12 @@ data/interim/page_images/
 data/interim/colpali_embeddings/
 data/processed/*.jsonl
 
-# Eval run outputs - regenerate via `python -m src.evaluation.run_eval`
+# Raw eval run outputs - regenerate via `python -m src.evaluation.run_eval`.
+# Deliberately split from the rest of the eval assets: the question set and the
+# replay fixtures under data/eval/ ARE tracked, because they are the deliverable
+# and a fixture change must be reviewable in a diff. Individual run outputs are
+# regenerable measurement noise and would churn the repo, so a run only enters
+# version control when it is promoted by hand into data/eval/baselines/.
 data/processed/eval_runs/
 
 # Agent working docs (requirements notes, decision log) - not for version control

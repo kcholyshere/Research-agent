@@ -1,0 +1,330 @@
+# Tier 1 evaluation question set - trace-level behavioural eval.
+#
+# What this set is for: asserting on how the agent BEHAVES, not on how good its
+# prose is. Routing, redundancy, citation presence, decline behaviour, cycle
+# usage and latency. There is no LLM judge anywhere in this tier, deliberately -
+# every defect this project has found so far was an orchestration defect
+# (routing, redundancy, repetition, citation), all of which are visible in trace
+# structure alone, which is deterministic and costs nothing to assert on.
+#
+# Knowledge base: IFC's 2024 annual report financials, the single corpus in
+# data/raw/. KB ground-truth figures below are reused from Finrag's curated eval
+# set over the identical document, not invented here.
+#
+# Field meanings are documented on EvalQuestion in src/evaluation/schema.py.
+# Two that are easy to misread:
+#   - expected_routes is an assertion, not a hint. Consulting anything outside
+#     it is a routing failure.
+#   - max_tool_calls bounds redundancy separately, because calling the right
+#     tool five times is a different defect from calling the wrong tool once.
+#     It allows one reformulation on a miss; it does not allow re-verifying a
+#     fact the agent already has.
+#
+# volatile: true means the correct answer moves with the news or the market, so
+# content assertions run only in replay mode against a recorded fixture. Live
+# mode scores those questions on routing and latency alone. This is the whole
+# reason replay exists: identical code and an identical question gave 1 web
+# search and 45.5s one day, and 5 searches and ~100s the next, purely because
+# "yesterday" moved past the last real match.
+
+questions:
+
+  # --- Knowledge base only -------------------------------------------------
+  # The corpus is the authority here and the web must not be consulted. These
+  # are also the cheapest, most stable latency samples in the set.
+
+  - id: kb-net-income
+    question: What was IFC's Net Income for the fiscal year ending June 30, 2024?
+    expected_routes: [knowledge_base]
+    tags: [kb, single_tool, latency_target]
+    max_tool_calls: 2
+    must_contain: ["1,485"]
+    notes: >-
+      Finrag curated ground truth: $1,485 million. Also the question
+      scripts/verify_agent.py uses for its critique-budget comparison, so it is
+      the most-run question in the project and the natural latency reference.
+
+  - id: kb-total-assets-2023
+    question: What was the total value of IFC's assets as of June 30, 2023?
+    expected_routes: [knowledge_base]
+    tags: [kb, single_tool, latency_target]
+    max_tool_calls: 2
+    must_contain: ["110,547"]
+    notes: "Finrag curated ground truth: $110,547 million."
+
+  - id: kb-cur-definition
+    question: How is the Capital Utilization Ratio defined in IFC's financial reporting?
+    expected_routes: [knowledge_base]
+    tags: [kb, single_tool, definition]
+    max_tool_calls: 2
+    must_contain: ["Capital Required", "Capital Available"]
+    notes: >-
+      Definitional rather than numeric, so it exercises retrieval of prose
+      rather than a table row. Ground truth: Capital Required divided by
+      Capital Available.
+
+  - id: kb-ltf-projects
+    question: How many Long-Term Finance projects were supported by IFC's Own Account investments in FY24?
+    expected_routes: [knowledge_base]
+    tags: [kb, single_tool]
+    max_tool_calls: 2
+    must_contain: ["365"]
+    notes: "Finrag curated ground truth: 365 LTF projects."
+
+  - id: kb-charges-on-borrowings
+    question: What were IFC's total charges on borrowings for the fiscal year ended June 30, 2023?
+    expected_routes: [knowledge_base]
+    tags: [kb, single_tool, table]
+    max_tool_calls: 2
+    must_contain: ["2,598"]
+    notes: >-
+      A table-sourced figure. Finrag's own eval showed table content retrieving
+      markedly worse than text (hit rate 0.56 against 0.88), so this is the
+      question most likely to expose a retrieval miss rather than a routing one.
+
+  # --- Redundancy: public knowledge that must NOT touch the knowledge base ---
+  # The phase 2 verification found 4 of 7 cases calling both tools where one
+  # would do. Fixing the Document Search Tool's description (commit 390f940)
+  # addressed the known instance; these questions are what stops it returning.
+
+  - id: web-wbg-president
+    question: Who is the current President of the World Bank Group?
+    expected_routes: [web]
+    tags: [web, single_tool, redundancy_check, latency_target]
+    max_tool_calls: 2
+    known_defects:
+      citation: "attribution-broken - no web trace has yet produced a real URL"
+    notes: >-
+      The trap is that this sounds like it belongs to the IFC corpus and does
+      not. A search_documents call here is the exact redundancy defect this
+      question exists to catch, so expected_routes is web ALONE on purpose.
+
+  - id: web-ifc-parent
+    question: Which international organisation is the International Finance Corporation a member of, and what is its headquarters city?
+    expected_routes: [web]
+    tags: [web, single_tool, redundancy_check]
+    max_tool_calls: 2
+    known_defects:
+      citation: "attribution-broken - no web trace has yet produced a real URL"
+    notes: >-
+      Stable public fact (World Bank Group, Washington DC) chosen so this
+      question can carry content assertions in live mode, unlike the volatile
+      web cases below. Same redundancy trap as web-wbg-president.
+
+  # --- Web, volatile -------------------------------------------------------
+  # Routing and latency assertable live; content assertable only in replay.
+
+  - id: web-current-event
+    question: What was the most recent interest rate decision by the European Central Bank?
+    expected_routes: [web]
+    tags: [web, single_tool, volatile, latency_target]
+    max_tool_calls: 2
+    volatile: true
+    known_defects:
+      citation: "attribution-broken - no web trace has yet produced a real URL"
+    notes: >-
+      Deliberately NOT routed to get_financial_data: the financial tool's three
+      hardcoded Yahoo Finance URLs cover stocks, crypto and currencies, not
+      central bank policy. A get_financial_data call here is a routing failure
+      and a real one, since the boundary between "financial-sounding" and
+      "what the financial tool actually covers" is the subtlest routing call
+      the planner has to make.
+
+  - id: web-premise-refuting
+    question: In the LEC match between G2 and Vitality yesterday, who won?
+    expected_routes: [web]
+    tags: [web, volatile, premise_refuting, known_defect]
+    max_tool_calls: 2
+    volatile: true
+    known_defects:
+      redundancy: "premise-refuting-research-loop - ~5 searches and ~100s instead of concluding no match happened"
+      citation: "attribution-broken - no web trace has yet produced a real URL"
+    notes: >-
+      The known open defect, kept in the set precisely because it fails. When no
+      such match happened, the agent searches about five times and burns roughly
+      100s rather than concluding that it did not. Confirmed by A/B as
+      pre-existing and unrelated to phase 4. This is the single most expensive
+      question in the set - exclude it via --tags for a fast smoke run.
+
+  # --- Financial tool ------------------------------------------------------
+  # All three categories the tool covers, plus its coverage gap. Volatile by
+  # definition, so content assertions are replay-only.
+
+  - id: fin-crypto
+    question: What is the current price of Bitcoin?
+    expected_routes: [financial]
+    tags: [financial, single_tool, volatile, latency_target]
+    max_tool_calls: 1
+    volatile: true
+    notes: >-
+      max_tool_calls is 1, not 2: a single live-price lookup has no legitimate
+      reason to reformulate. This path also short-circuits the critique agent
+      entirely (critique.py skips its LLM call when the cycle's only tool was
+      get_financial_data), so this question doubles as the check that the
+      short-circuit still fires - it should always be single-cycle.
+
+  - id: fin-stock
+    question: How is Apple stock performing today?
+    expected_routes: [financial]
+    tags: [financial, single_tool, volatile]
+    max_tool_calls: 1
+    volatile: true
+    notes: >-
+      Stocks measured 13.3s in phase 3 against 8-9.9s for crypto and currency,
+      so this is the financial path most at risk of the 15s target. Extraction
+      is the real risk: the agent must pull one row out of a table of dozens.
+
+  - id: fin-currency
+    question: What is the current EUR to USD exchange rate?
+    expected_routes: [financial]
+    tags: [financial, single_tool, volatile, latency_target]
+    max_tool_calls: 1
+    volatile: true
+
+  - id: fin-coverage-gap
+    question: What is the current USD to PLN exchange rate?
+    expected_routes: [financial]
+    tags: [financial, volatile, graceful_failure]
+    max_tool_calls: 2
+    volatile: true
+    expects_decline: true
+    notes: >-
+      The Yahoo Finance currencies page genuinely lacks this pair, so the
+      correct behaviour is to consult the financial tool, find no coverage, and
+      say so - not to silently fall back to a web search and present a number
+      from somewhere else. max_tool_calls is 2 rather than 1 to allow the
+      lookup plus one legitimate retry, but web is NOT in expected_routes.
+      This is also the question whose runaway repetition loop produced 65,532
+      output tokens and 4m35s before ADR-0009 capped generation, so it is worth
+      watching its output length as well as its routing.
+
+  # --- Decline behaviour ---------------------------------------------------
+  # The KB does not contain the answer and the agent must say so plainly and
+  # stop, rather than padding with related-but-different facts.
+
+  - id: decline-headcount-by-country
+    question: What was IFC's headcount broken down by employee's home country in FY24?
+    expected_routes: [knowledge_base]
+    tags: [kb, decline]
+    max_tool_calls: 2
+    expects_decline: true
+    known_defects:
+      decline: "declines correctly but pads with tangentially related results rather than stopping there"
+    notes: >-
+      Reused from scripts/verify_agent.py, where the phase 1 check found the
+      agent correctly states the fact is unavailable and then pads the answer
+      with tangentially related web results rather than stopping. Not a
+      hallucination, but not the clean "say so plainly and stop" the
+      synthesizer instruction asks for either. Logged as a known defect on the
+      decline assertion only - its routing must still be able to break visibly.
+
+  - id: decline-future-figure
+    question: What was IFC's net income for the fiscal year ending June 30, 2027?
+    expected_routes: [knowledge_base]
+    tags: [kb, decline, unanswerable]
+    max_tool_calls: 2
+    expects_decline: true
+    must_not_contain: ["1,485"]
+    notes: >-
+      Unanswerable by construction - the corpus is the FY2024 report and FY2027
+      has not happened. must_not_contain guards the specific failure of
+      substituting the FY2024 figure as if it answered the question, which is
+      the plausible-looking wrong answer here.
+
+  # --- Multi-source: genuinely needs two sources ---------------------------
+  # The counterpart to the redundancy checks. Here two tools are correct, and
+  # consulting only one is the failure.
+
+  - id: multi-kb-and-web
+    question: What was IFC's net income in FY24 according to its annual report, and what has the World Bank Group publicly said about its capital position since then?
+    expected_routes: [knowledge_base, web]
+    tags: [multi_source, volatile]
+    max_tool_calls: 3
+    volatile: true
+    must_contain: ["1,485"]
+    known_defects:
+      citation: "attribution-broken - no web trace has yet produced a real URL"
+    notes: >-
+      Genuinely requires combining sources, so both routes are expected. The
+      KB half is stable and asserted; the web half is volatile, which is why
+      the question carries volatile: true despite being half-stable. Also the
+      clearest test of the synthesizer's instruction to prefer the knowledge
+      base as authoritative and flag conflicts explicitly.
+
+  - id: multi-kb-and-financial
+    question: IFC reported its FY24 net income in US dollars - what was it, and what is the current EUR to USD rate?
+    expected_routes: [knowledge_base, financial]
+    tags: [multi_source, volatile]
+    max_tool_calls: 3
+    volatile: true
+    must_contain: ["1,485"]
+    notes: >-
+      Artificial as a user question, but it is the only clean way to assert the
+      KB-plus-financial routing pair, which no other question in the set
+      covers. Also checks that the critique short-circuit does NOT fire here:
+      the cycle used more than get_financial_data, so a critique call is
+      legitimate.
+
+  # --- Critique loop behaviour --------------------------------------------
+  # Aimed at the phase 4 loop rather than at routing. Run these with arms at
+  # critique_budget 0 and 1 - budget 0 reproduces the pre-phase-4 single-cycle
+  # path exactly and is the intended baseline arm.
+
+  - id: loop-multipart
+    question: What is IFC's stated mission, what was its net income in FY24, and what were its total disbursements excluding guarantees in FY24?
+    expected_routes: [knowledge_base]
+    tags: [kb, multi_part, critique_loop]
+    max_tool_calls: 3
+    must_contain: ["1,485", "19.1"]
+    notes: >-
+      Three distinct facts in one question, all in the corpus. The critique
+      agent's only legitimate grounds to continue the loop is a distinct part of
+      the question the draft does not address at all, so a question with three
+      separable parts is the one most likely to produce a genuine second cycle.
+      Ground truth: mission is to end extreme poverty and boost shared
+      prosperity on a livable planet; net income $1,485m; disbursements $19.1bn.
+
+  - id: loop-single-fact
+    question: What was the revised subscription deadline for IFC's General Capital Increase following the April 2024 extension?
+    expected_routes: [knowledge_base]
+    tags: [kb, single_tool, critique_loop, wasted_cycle_check]
+    max_tool_calls: 2
+    must_contain: ["April 16, 2025"]
+    notes: >-
+      The inverse of loop-multipart: one narrow fact, fully answered in one
+      cycle, so a second cycle here is a wasted cycle by definition. This is the
+      primary probe for the failure mode the plan calls out first - a loop that
+      burns cycles restating the same answer. Compare cycle count across the
+      budget 0 and budget 1 arms; they should match.
+
+  # --- Phase 5 forward compatibility --------------------------------------
+  # Delegation cases, present from the outset as the plan requires so that
+  # adding the A2A News Agent does not force a dataset rewrite.
+
+  - id: delegate-news-topic
+    question: What is the latest news about the International Finance Corporation?
+    expected_routes: [web]
+    tags: [web, volatile, phase5_candidate]
+    max_tool_calls: 2
+    volatile: true
+    known_defects:
+      citation: "attribution-broken - no web trace has yet produced a real URL"
+    notes: >-
+      News-shaped and therefore the natural first delegation case. Today the
+      correct route is web, because no News Agent exists; when phase 5 lands,
+      expected_routes flips to [news_agent] and this question becomes the
+      routing assertion for that delegation. Recorded now rather than later so
+      the pre-delegation baseline is measured rather than reconstructed.
+
+  - id: delegate-news-general
+    question: What are the main headlines in development finance this week?
+    expected_routes: [web]
+    tags: [web, volatile, phase5_candidate]
+    max_tool_calls: 2
+    volatile: true
+    known_defects:
+      citation: "attribution-broken - no web trace has yet produced a real URL"
+    notes: >-
+      Second delegation case, broader than delegate-news-topic so the two
+      together cover both a named-entity news query and an open topical one.
+      Same phase 5 flip applies.

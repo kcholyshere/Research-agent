@@ -2919,6 +2919,7 @@ dependencies = [
     { name = "numpy" },
     { name = "openinference-instrumentation-google-adk" },
     { name = "python-dotenv" },
+    { name = "pyyaml" },
     { name = "streamlit" },
 ]
 
@@ -2938,6 +2939,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.5.0,<3" },
     { name = "openinference-instrumentation-google-adk", specifier = ">=0.1.17" },
     { name = "python-dotenv", specifier = ">=1.2.2,<2" },
+    { name = "pyyaml", specifier = ">=6.0.3,<7" },
     { name = "streamlit", specifier = ">=1.51.0,<2" },
 ]
 

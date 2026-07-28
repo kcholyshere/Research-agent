@@ -19,4 +19,8 @@ dependencies = [
     "langfuse>=4.14.1",
     "openinference-instrumentation-google-adk>=0.1.17",
     "mcp>=1.28.1",
+    # Declared explicitly rather than relied on transitively via google-adk:
+    # the evaluation question set is a YAML deliverable, so a future adk
+    # release dropping pyyaml would break the eval rather than just the build.
+    "pyyaml>=6.0.3,<7",
 ]
