@@ -61,11 +61,20 @@ _BROKEN_CITATION_RE = re.compile(r"\(Google Search\)", re.IGNORECASE)
 # positives. The corpus is a PDF on disk, but the agent cites it the way a
 # person would, by name and page.
 #
-# So a document citation is now an attribution MARKER ("source:", "according
-# to", "per") near a document NOUN ("annual report", "statement", "page 64").
-# Both halves are required: the marker alone matches conversational filler
-# ("according to the data"), and the noun alone matches an answer that merely
-# mentions a report without attributing anything to it.
+# So a document citation was an attribution MARKER ("source:", "according to",
+# "per") near a document NOUN ("annual report", "statement", "page 64"), both
+# halves required. Requiring the marker was measured wrong on the 2026-07-29
+# baseline, in the same way and for the same reason the filename test was: the
+# agent's actual house style is a bare parenthetical, "(IFC 2024 Annual Report
+# Financials, pages 5, 26, 110)", which carries the noun and the page and no
+# marker at all. That scored "no citation of any kind" roughly 40 times and
+# again buried the real defect under false positives.
+#
+# A citation is therefore now a document noun plus EITHER an attribution
+# marker, OR a page/section locator, OR enclosure in brackets. Each of the
+# three is independently an act of attribution; demanding a marker specifically
+# was encoding one house style as if it were the definition. The noun alone
+# still is not enough - that matches an answer merely mentioning a report.
 _DOC_FILENAME_RE = re.compile(r"[\w\-./]+\.(?:pdf|docx?|csv|json)\b", re.IGNORECASE)
 _ATTRIBUTION_MARKER_RE = re.compile(
     r"\b(?:source|sources|according to|as (?:reported|stated) (?:in|by)|per|cited in|from the)\b",
@@ -76,9 +85,32 @@ _DOCUMENT_NOUN_RE = re.compile(
     r"balance sheet|filing|prospectus|report|financials|page\s+\d+|p\.\s*\d+)\b",
     re.IGNORECASE,
 )
+# A page or section locator: "page 64", "pages 5, 26, 110", "p. 9", "Section III".
+# Note "pages" plural, which `page\s+\d+` above misses - that plural is exactly
+# what the most-cited real answers use.
+_LOCATOR_RE = re.compile(
+    r"\b(?:pages?\s+\d+|pp?\.\s*\d+|section\s+[\w.]+|table\s+\d+)\b", re.IGNORECASE
+)
+# A document noun inside brackets, e.g. "(IFC Annual Report 2024 Financials)".
+# Bracketing is itself the attribution act in this style, which is why no
+# marker word appears anywhere near it.
+_BRACKETED_DOC_RE = re.compile(
+    r"[(\[][^)\]]*\b(?:annual report|financial statements?|consolidated statements?|"
+    r"balance sheet|filing|prospectus|financials)\b[^)\]]*[)\]]",
+    re.IGNORECASE,
+)
 
 # Decline heuristics. Phrases the synthesize instruction's "say so plainly
 # and stop" is expected to produce when neither source covers the question.
+#
+# The second block was added from measurement, not imagination: on the
+# 2026-07-29 baseline, 19 of 37 decline "failures" were answers that declined
+# perfectly well in a form this list simply did not carry - "the IFC 2024
+# Annual Report financial statements do not report headcount by country", "is
+# not reported or publicly disclosed". The synthesize instruction asks the
+# agent to name the source it checked, and naming a source pulls the verb
+# towards "report"/"disclose"/"publish" rather than the source-less "not
+# available" this list was originally built from.
 _DECLINE_PHRASES = (
     "does not contain",
     "do not contain",
@@ -95,6 +127,21 @@ _DECLINE_PHRASES = (
     "not covered",
     "no data",
     "not found",
+    "does not report",
+    "do not report",
+    "not reported",
+    "does not disclose",
+    "do not disclose",
+    "does not publish",
+    "do not publish",
+    "does not include",
+    "do not include",
+    "do not cover",
+    "does not cover",
+    "does not break down",
+    "do not break down",
+    "is not publicly",
+    "are not publicly",
 )
 
 # Padding threshold for the decline check. decline-headcount-by-country's
@@ -228,9 +275,14 @@ def check_citation(question: EvalQuestion, record: RunRecord) -> AssertionResult
     answer_without_placeholder = _BROKEN_CITATION_RE.sub(" ", answer)
 
     has_url = bool(_URL_RE.search(answer_without_placeholder))
-    has_doc_reference = bool(_DOC_FILENAME_RE.search(answer_without_placeholder)) or (
+    has_doc_noun = bool(_DOCUMENT_NOUN_RE.search(answer_without_placeholder))
+    attributes = (
         bool(_ATTRIBUTION_MARKER_RE.search(answer_without_placeholder))
-        and bool(_DOCUMENT_NOUN_RE.search(answer_without_placeholder))
+        or bool(_LOCATOR_RE.search(answer_without_placeholder))
+        or bool(_BRACKETED_DOC_RE.search(answer_without_placeholder))
+    )
+    has_doc_reference = bool(_DOC_FILENAME_RE.search(answer_without_placeholder)) or (
+        has_doc_noun and attributes
     )
     if has_url or has_doc_reference:
         kind = "url" if has_url else "document reference"
