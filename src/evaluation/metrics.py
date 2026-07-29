@@ -376,17 +376,26 @@ def _iqr(values: list[float]) -> float:
     return q3 - q1
 
 
-def summarise_latency(records: Iterable[RunRecord]) -> dict[int, LatencySegment]:
+def summarise_latency(records: Iterable[RunRecord], contended: bool = False) -> dict[int, LatencySegment]:
     """Median/IQR latency segmented by cycle count, never a blended mean.
 
     Medians and spread only (never means): run-to-run spread on this stack is
     roughly 2x and the distribution has a long tail - two runaway traces once
     accounted for 86% of all output tokens the project had ever generated,
     which is exactly the kind of outlier a mean would let dominate silently.
+
+    `contended` selects which population to summarise, and the two are never
+    mixed: a run from run_sweep's concurrent phase shares the machine with
+    others, so its wall-clock measures contention as much as the agent.
+    Contended runs are segmented rather than dropped - `latency_target`
+    questions are all single-cycle by design, so discarding the contended set
+    would leave the multi-cycle segments (loop-multipart and friends) with no
+    latency data at all. `meets_target` stays None for them regardless: the
+    15s target was agreed over uncontended, single-tool turns only.
     """
     by_cycle: dict[int, list[RunRecord]] = {}
     for r in records:
-        if r.timed_out or r.latency_s is None:
+        if r.timed_out or r.latency_s is None or r.contended != contended:
             continue
         by_cycle.setdefault(r.cycle_count, []).append(r)
 
@@ -394,7 +403,7 @@ def summarise_latency(records: Iterable[RunRecord]) -> dict[int, LatencySegment]
     for cycle_count, recs in by_cycle.items():
         values = [r.latency_s for r in recs]
         meets_target: bool | None = None
-        if cycle_count == 1:
+        if cycle_count == 1 and not contended:
             single_tool_values = [r.latency_s for r in recs if len(r.tools_called) <= 1]
             if single_tool_values:
                 meets_target = statistics.median(single_tool_values) <= LATENCY_TARGET_S
@@ -422,6 +431,11 @@ class ArmSummary:
     n_fixture_incomplete: int
     n_timed_out: int
     n_errored: int
+    # Runs that died on a Vertex quota rejection. Broken out of n_errored
+    # because concurrency makes them expected rather than exceptional, and a
+    # sweep whose "errors" are all quota rejections is a sweep to re-run at a
+    # lower --concurrency, not a regression to investigate.
+    n_rate_limited: int
     # Hard pass/fail per the brief: routing and redundancy only. Citation,
     # decline, content and wasted_cycle are still tracked (in regressions/
     # known_failures below) but do not feed this rate, since none of them are
@@ -429,7 +443,18 @@ class ArmSummary:
     hard_pass_rate: float
     regressions: list[tuple[str, AssertionResult]]
     known_failures: list[tuple[str, AssertionResult]]
+    # Uncontended runs only - the population the 15s target is scoped to.
     latency_by_cycle: dict[int, LatencySegment]
+    # Runs from run_sweep's concurrent phase. Kept in a separate field rather
+    # than re-keying latency_by_cycle on (cycle_count, contended), which would
+    # have rippled through every existing reader for no gain.
+    latency_by_cycle_contended: dict[int, LatencySegment]
+    # How many runs actually reached the assertions. Carried as a field rather
+    # than derived by subtraction at print time: the excluded categories are
+    # not disjoint (a rate-limited run also has `error` set), so subtracting
+    # them from n_runs double-counts. That is exactly what it did before this
+    # became a field.
+    n_scored: int
 
 
 _HARD_ASSERTION_KEYS = frozenset({"routing", "redundancy"})
@@ -469,7 +494,13 @@ def summarise(records: list[RunRecord], questions: list[EvalQuestion]) -> dict[s
             if not is_fixture_incomplete(r) and not r.timed_out and r.error is None
         ]
         timed_out = [r for r in arm_records if r.timed_out and not is_fixture_incomplete(r)]
-        errored = [r for r in arm_records if r.error is not None and not r.timed_out]
+        # A quota rejection is already excluded from `usable` (it sets
+        # `error`), so this only splits the reporting: a rate-limited run says
+        # something about how the sweep was scheduled, an errored one says
+        # something about the agent, and conflating them would make a
+        # too-high --concurrency look like a code regression.
+        rate_limited = [r for r in arm_records if r.rate_limited]
+        errored = [r for r in arm_records if r.error is not None and not r.timed_out and not r.rate_limited]
 
         regressions: list[tuple[str, AssertionResult]] = []
         known_failures: list[tuple[str, AssertionResult]] = []
@@ -498,10 +529,13 @@ def summarise(records: list[RunRecord], questions: list[EvalQuestion]) -> dict[s
             n_fixture_incomplete=len(incomplete),
             n_timed_out=len(timed_out),
             n_errored=len(errored),
+            n_rate_limited=len(rate_limited),
             hard_pass_rate=(hard_passed / hard_total) if hard_total else 1.0,
             regressions=regressions,
             known_failures=known_failures,
-            latency_by_cycle=summarise_latency(usable),
+            latency_by_cycle=summarise_latency(usable, contended=False),
+            latency_by_cycle_contended=summarise_latency(usable, contended=True),
+            n_scored=len(usable),
         )
     return summaries
 
@@ -511,9 +545,10 @@ def print_summary(summaries: dict[str, ArmSummary]) -> None:
     for arm, s in summaries.items():
         print(f"\n=== arm: {arm} ===", flush=True)
         print(
-            f"  runs={s.n_runs} scored={s.n_runs - s.n_fixture_incomplete - s.n_timed_out - s.n_errored} "
+            f"  runs={s.n_runs} scored={s.n_scored} "
             f"fixture_incomplete={s.n_fixture_incomplete} timed_out={s.n_timed_out} "
-            f"errored={s.n_errored} hard_pass_rate={s.hard_pass_rate:.0%}",
+            f"errored={s.n_errored} rate_limited={s.n_rate_limited} "
+            f"hard_pass_rate={s.hard_pass_rate:.0%}",
             flush=True,
         )
         if s.regressions:
@@ -526,28 +561,45 @@ def print_summary(summaries: dict[str, ArmSummary]) -> None:
             print(f"  known defects still failing ({len(s.known_failures)}):", flush=True)
             for qid, a in s.known_failures:
                 print(f"    - [{a.key}] {qid}: {a.detail} (ref: {a.known_defect})", flush=True)
-        if s.latency_by_cycle:
-            print("  latency by cycle count (median / IQR, seconds):", flush=True)
-            for cycle_count in sorted(s.latency_by_cycle):
-                seg = s.latency_by_cycle[cycle_count]
-                # Label the SUBSET the verdict is actually about. The median
-                # printed on this line covers every run in the cycle segment,
-                # but meets_target is computed only over its single-tool runs,
-                # because that is the only population the 15s target was
-                # agreed over. Without saying so, the line reads
-                # "median=18.1s [OK <=15s]", which looks like a broken
-                # comparison rather than two different populations.
-                target = (
-                    ""
-                    if seg.meets_target is None
-                    else (
-                        " [single-tool subset OK <=15s]"
-                        if seg.meets_target
-                        else " [single-tool subset OVER 15s]"
-                    )
-                )
-                print(
-                    f"    cycles={cycle_count} n={seg.n} median={seg.median_s:.1f}s "
-                    f"iqr={seg.iqr_s:.1f}s min={seg.min_s:.1f}s max={seg.max_s:.1f}s{target}",
-                    flush=True,
-                )
+        _print_latency(
+            s.latency_by_cycle,
+            "latency by cycle count, measured alone (median / IQR, seconds)",
+        )
+        # Printed under its own heading, never merged with the block above.
+        # These runs shared the machine with up to --concurrency others, so
+        # the numbers are indicative of throughput and say nothing about how
+        # fast a turn is; presenting them in one table would invite exactly
+        # that misreading.
+        _print_latency(
+            s.latency_by_cycle_contended,
+            "latency by cycle count, measured under concurrency - NOT comparable "
+            "with the above or with the 15s target",
+        )
+
+
+def _print_latency(segments: dict[int, LatencySegment], heading: str) -> None:
+    if not segments:
+        return
+    print(f"  {heading}:", flush=True)
+    for cycle_count in sorted(segments):
+        seg = segments[cycle_count]
+        # Label the SUBSET the verdict is actually about. The median printed
+        # on this line covers every run in the cycle segment, but meets_target
+        # is computed only over its single-tool runs, because that is the only
+        # population the 15s target was agreed over. Without saying so, the
+        # line reads "median=18.1s [OK <=15s]", which looks like a broken
+        # comparison rather than two different populations.
+        target = (
+            ""
+            if seg.meets_target is None
+            else (
+                " [single-tool subset OK <=15s]"
+                if seg.meets_target
+                else " [single-tool subset OVER 15s]"
+            )
+        )
+        print(
+            f"    cycles={cycle_count} n={seg.n} median={seg.median_s:.1f}s "
+            f"iqr={seg.iqr_s:.1f}s min={seg.min_s:.1f}s max={seg.max_s:.1f}s{target}",
+            flush=True,
+        )

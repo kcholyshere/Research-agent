@@ -197,6 +197,25 @@ class RunRecord:
     # silently stops working the moment someone reworks an error message.
     fixture_incomplete: bool = False
 
+    # Set when this run shared the machine with other runs (the concurrent
+    # phase of a sweep - see run_eval.run_sweep). Its assertions are unaffected
+    # by contention, but its `latency_s` is not comparable with a run measured
+    # alone, so metrics.summarise_latency segments on this rather than blending
+    # the two populations. Runs in the sequential phase carry False, which is
+    # also what every pre-concurrency run file deserialises to.
+    contended: bool = False
+
+    # Set when the run died on a Vertex quota rejection rather than on
+    # anything the agent did. Concurrency makes these likely for the first
+    # time (N concurrent turns are more than N concurrent Vertex requests -
+    # research, critique and web_search_agent each call the model), and
+    # without a dedicated flag they land in `error` and read as a genuine
+    # regression. Same reasoning as `fixture_incomplete` directly above: a run
+    # that tells you nothing must be excluded from aggregation and counted
+    # separately, and a string prefix on `error` is the kind of cross-module
+    # coupling that stops working the moment someone rewords a message.
+    rate_limited: bool = False
+
     cycles: list[CycleRecord] = field(default_factory=list)
     answer: str = ""
     trace_id: str | None = None

@@ -120,6 +120,24 @@ DEFAULT_LANGFUSE_DESCRIPTION = (
 # see the module docstring's timeout trap for why this must never be None.
 DEFAULT_TIMEOUT_S = 300.0
 
+# Concurrent runs in the untimed phase (see run_sweep). 4 rather than higher
+# because one turn is more than one Vertex request - research_agent,
+# critique_agent and the web_search_agent sub-agent each call the model - so
+# the real concurrent request count is a multiple of this, and quota
+# rejections start costing more than the parallelism buys.
+DEFAULT_CONCURRENCY = 4
+
+# Substrings that identify a Vertex quota rejection in an exception's repr.
+# Matched on text because the google-genai client surfaces these as a generic
+# ClientError carrying the status in its message rather than as a distinct
+# exception type - checked against a real rejection, not the docs.
+_RATE_LIMIT_MARKERS = ("429", "RESOURCE_EXHAUSTED", "quota", "rate limit")
+
+
+def _looks_rate_limited(exc: BaseException) -> bool:
+    text = f"{exc!r}".lower()
+    return any(marker.lower() in text for marker in _RATE_LIMIT_MARKERS)
+
 
 # ---------------------------------------------------------------------------
 # Question loading
@@ -231,6 +249,7 @@ async def run_once(
     mode: FixtureMode,
     fixtures_dir: Path,
     timeout_s: float,
+    contended: bool = False,
 ) -> RunRecord:
     """One question, once, against one arm, in its own fresh session.
 
@@ -238,8 +257,19 @@ async def run_once(
     extraction, wait_for timeout) but persists the full per-cycle structure
     rather than just latency and a flat tool list - RunRecord is a superset
     built for exactly that, per schema.py's own docstring.
+
+    `contended` is recorded, not enforced: the caller decides whether this run
+    shares the machine with others (run_sweep's concurrent phase), and only it
+    can know. Recording it here keeps the flag with the latency it qualifies.
     """
-    record = RunRecord(question_id=question.id, question=question.question, arm=arm, rep=rep, mode=mode)
+    record = RunRecord(
+        question_id=question.id,
+        question=question.question,
+        arm=arm,
+        rep=rep,
+        mode=mode,
+        contended=contended,
+    )
     events: list = []
     fixture_path = fixtures_dir / f"{question.id}.json"
 
@@ -284,6 +314,11 @@ async def run_once(
         except Exception as exc:  # noqa: BLE001 - one bad run must not kill a 30-60 min sweep
             record.error = f"error: {exc!r}"
             record.latency_s = time.monotonic() - started
+            # A quota rejection is not a result about the agent, so flag it for
+            # exclusion rather than letting it score as a failure (see
+            # RunRecord.rate_limited). Deliberately after `error` is set, not
+            # instead of it - the message stays readable in the run file.
+            record.rate_limited = _looks_rate_limited(exc)
 
         if mode != "live" and (fixture_session.misses or fixture_session.inexact_matches):
             print(
@@ -314,15 +349,13 @@ async def run_once(
 # ---------------------------------------------------------------------------
 
 
-async def run_sweep(
-    questions: list[EvalQuestion],
-    budgets: list[int],
-    reps: int,
-    mode: FixtureMode,
-    fixtures_dir: Path,
-    timeout_s: float,
-) -> list[RunRecord]:
-    """Every question through every arm, interleaved, `reps` times each.
+LATENCY_TARGET_TAG = "latency_target"
+
+
+def _plan_runs(
+    questions: list[EvalQuestion], budgets: list[int], reps: int
+) -> list[tuple[int, str, int, EvalQuestion]]:
+    """Every (rep, arm, question) triple, in interleaved order.
 
     Loop nesting matches ab_harness.compare deliberately (rep outer, arm
     middle, question inner) - that is the nesting the interleaving trap was
@@ -331,27 +364,119 @@ async def run_sweep(
     guarantee this project already paid to learn.
     """
     arms = {f"budget{b}": b for b in budgets}
+    return [
+        (rep, arm, budget, question)
+        for rep in range(1, reps + 1)
+        for arm, budget in arms.items()
+        for question in questions
+    ]
+
+
+def _status(record: RunRecord) -> str:
+    if record.rate_limited:
+        return "RATE-LIMITED (not scored)"
+    if record.timed_out:
+        return "TIMEOUT"
+    if record.error:
+        return f"ERROR: {record.error[:80]}"
+    return f"{record.latency_s:.1f}s cycles={record.cycle_count} tools={record.tools_called}"
+
+
+async def run_sweep(
+    questions: list[EvalQuestion],
+    budgets: list[int],
+    reps: int,
+    mode: FixtureMode,
+    fixtures_dir: Path,
+    timeout_s: float,
+    concurrency: int = DEFAULT_CONCURRENCY,
+) -> list[RunRecord]:
+    """Every question through every arm, interleaved, `reps` times each.
+
+    Run in two phases, because latency and throughput want opposite things.
+
+    Phase 1 - questions tagged `latency_target` - is strictly sequential and
+    is drained to completion before phase 2 starts. That ordering is the whole
+    point: a timed run sharing the machine with a concurrent one is measuring
+    contention rather than the agent, and the 15s single-tool target
+    (metrics.LATENCY_TARGET_S) would become meaningless. Interleaving is
+    preserved within the phase, since that is where the cross-arm latency
+    comparison lives.
+
+    Phase 2 - everything else - runs `concurrency` at a time. These questions
+    are scored on routing, redundancy and content, none of which contention
+    affects, so their wall-clock is the only casualty and it is recorded as
+    `contended` rather than pretended away. Concurrency also subsumes what
+    interleaving was doing for this phase: arms run literally simultaneously,
+    so live-world drift cannot land on one arm rather than the other.
+
+    Concurrency is live-mode only. `replay.tool_fixtures` monkeypatches shared
+    module-level singletons in place (`research_agent.tools` entries and
+    `web_search_tool.run_async`) and holds the patch across the whole awaited
+    turn, so two concurrent fixture sessions would serve each other's
+    fixtures, and a run finishing first would restore the real tools underneath
+    one still in flight - silently defeating replay's no-live-call guarantee.
+    Record mode additionally races `_FixtureStore._flush`'s whole-file rewrite.
+    See ADR-0012; making that layer reentrant is deliberately out of scope.
+    """
+    plan = _plan_runs(questions, budgets, reps)
+    total = len(plan)
+
+    if mode != "live" and concurrency > 1:
+        print(
+            f"[concurrency] forced to 1 for mode={mode!r} - replay/record patch shared "
+            f"agent objects in place and are not safe to run concurrently (ADR-0012).",
+            flush=True,
+        )
+        concurrency = 1
+
+    timed = [item for item in plan if LATENCY_TARGET_TAG in item[3].tags]
+    untimed = [item for item in plan if LATENCY_TARGET_TAG not in item[3].tags]
     results: list[RunRecord] = []
-    total = reps * len(arms) * len(questions)
     done = 0
-    for rep in range(1, reps + 1):
-        for arm, budget in arms.items():
-            for question in questions:
-                done += 1
-                print(
-                    f"[{done}/{total}] rep={rep} arm={arm} question={question.id!r}...",
-                    end=" ",
-                    flush=True,
-                )
-                record = await run_once(question, arm, budget, rep, mode, fixtures_dir, timeout_s)
-                results.append(record)
-                if record.timed_out:
-                    status = "TIMEOUT"
-                elif record.error:
-                    status = f"ERROR: {record.error[:80]}"
-                else:
-                    status = f"{record.latency_s:.1f}s cycles={record.cycle_count} tools={record.tools_called}"
-                print(status, flush=True)
+
+    print(
+        f"Phase 1: {len(timed)} timed run(s), sequential. "
+        f"Phase 2: {len(untimed)} untimed run(s), {concurrency} at a time.",
+        flush=True,
+    )
+
+    for rep, arm, budget, question in timed:
+        done += 1
+        print(f"[{done}/{total}] timed rep={rep} arm={arm} question={question.id!r}...", end=" ", flush=True)
+        record = await run_once(question, arm, budget, rep, mode, fixtures_dir, timeout_s, contended=False)
+        results.append(record)
+        print(_status(record), flush=True)
+
+    if not untimed:
+        return results
+
+    semaphore = asyncio.Semaphore(concurrency)
+    contended = concurrency > 1
+
+    async def _guarded(item: tuple[int, str, int, EvalQuestion]) -> RunRecord:
+        rep, arm, budget, question = item
+        async with semaphore:
+            record = await run_once(
+                question, arm, budget, rep, mode, fixtures_dir, timeout_s, contended=contended
+            )
+        nonlocal done
+        done += 1
+        # One complete line per completion, never the sequential phase's
+        # "start ... finish" pair - concurrent runs would interleave the two
+        # halves and produce unreadable output.
+        print(
+            f"[{done}/{total}] rep={rep} arm={arm} question={question.id!r}: {_status(record)}",
+            flush=True,
+        )
+        return record
+
+    # gather wraps each coroutine in its own Task, which is required rather
+    # than incidental: langfuse's get_current_trace_id reads OTEL's active
+    # span from a contextvar, and contextvars are copied per Task. Driving
+    # these as bare coroutines on one Task would have them share a context and
+    # attribute every run's trace id to whichever ran last.
+    results.extend(await asyncio.gather(*(_guarded(item) for item in untimed)))
     return results
 
 
@@ -417,7 +542,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--questions", type=str, default=None, help="Comma-separated question ids to run (smoke mode)."
     )
     parser.add_argument("--tags", type=str, default=None, help="Comma-separated tags to filter by (smoke mode).")
-    parser.add_argument("--reps", type=int, default=5)
+    parser.add_argument("--reps", type=int, default=4)
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=DEFAULT_CONCURRENCY,
+        help="Untimed runs to execute at a time. latency_target questions always run sequentially "
+        "and complete before any concurrent run starts. Forced to 1 in record/replay mode.",
+    )
     parser.add_argument("--mode", choices=["live", "record", "replay"], default="live")
     parser.add_argument(
         "--budgets", type=str, default="0,1", help="Comma-separated critique budgets, one arm per value."
@@ -489,6 +621,7 @@ async def main_async(argv: list[str] | None = None) -> EvalRun:
         mode=args.mode,
         fixtures_dir=args.fixtures_dir,
         timeout_s=args.timeout_s,
+        concurrency=args.concurrency,
     )
     finished_at = dt.datetime.now(dt.timezone.utc)
 
@@ -500,6 +633,10 @@ async def main_async(argv: list[str] | None = None) -> EvalRun:
         "mode": args.mode,
         "budgets": budgets,
         "timeout_s": args.timeout_s,
+        # Recorded so a stored run is self-describing about how it was
+        # measured - latency from a concurrency>1 sweep is only comparable
+        # with another run's on the timed phase (see RunRecord.contended).
+        "concurrency": args.concurrency,
         "fixtures_dir": str(args.fixtures_dir),
         "started_at": started_at.isoformat(),
         "finished_at": finished_at.isoformat(),
