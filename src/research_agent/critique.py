@@ -64,6 +64,7 @@ from google.genai import types
 
 from src import config
 from src.research_agent import tool_budget
+from src.services import genai_client
 
 CRITIQUE_AGENT_NAME = "critique_agent"
 
@@ -254,6 +255,9 @@ pick one outcome.
 _GENERATE_CONTENT_CONFIG = types.GenerateContentConfig(
     max_output_tokens=4096,
     frequency_penalty=0.4,
+    # See genai_client.MODEL_CALL_TIMEOUT_MS: ADK's own client sets no
+    # timeout, so an unbounded critique call would hang a turn indefinitely.
+    http_options=types.HttpOptions(timeout=genai_client.MODEL_CALL_TIMEOUT_MS),
 )
 
 critique_agent = Agent(

@@ -45,6 +45,7 @@ langfuse_client = get_client()
 from google.adk.agents import Agent, LoopAgent
 from google.genai import types
 
+from src.services import genai_client
 from src.tools.document_search import search_documents
 from src.tools.financial_data import get_financial_data
 from src.tools.web_search import web_search_tool
@@ -139,6 +140,10 @@ question, follow a plan-execute-synthesize flow:
 _GENERATE_CONTENT_CONFIG = types.GenerateContentConfig(
     max_output_tokens=4096,
     frequency_penalty=0.4,
+    # ADK builds its own genai.Client for model calls and sets no timeout, so
+    # without this every model call is unbounded - see genai_client.py's
+    # MODEL_CALL_TIMEOUT_MS for why the client-level one never reached here.
+    http_options=types.HttpOptions(timeout=genai_client.MODEL_CALL_TIMEOUT_MS),
 )
 
 # Renamed from root_agent (see ADR-0010): this is now one sub-agent of the
