@@ -91,7 +91,7 @@ from google.genai import types
 from src import config
 from src.evaluation.langfuse_sync import link_run_to_dataset, push_question_set
 from src.evaluation.metrics import print_summary, summarise
-from src.evaluation.replay import FixtureMissError, FixtureMode, tool_fixtures
+from src.evaluation.replay import FixtureMissError, FixtureMode, ToolFixtureSweep
 from src.evaluation.schema import CycleRecord, EvalQuestion, EvalRun, RunRecord
 from src.research_agent.agent import langfuse_client, research_agent, root_agent
 from src.research_agent.critique import CRITIQUE_AGENT_NAME
@@ -247,6 +247,7 @@ async def run_once(
     budget: int,
     rep: int,
     mode: FixtureMode,
+    fixture_sweep: ToolFixtureSweep,
     fixtures_dir: Path,
     timeout_s: float,
     contended: bool = False,
@@ -261,6 +262,13 @@ async def run_once(
     `contended` is recorded, not enforced: the caller decides whether this run
     shares the machine with others (run_sweep's concurrent phase), and only it
     can know. Recording it here keeps the flag with the latency it qualifies.
+
+    `fixture_sweep` is the ONE `ToolFixtureSweep` for the whole sweep (its
+    patches are already installed by the time any `run_once` call happens -
+    see run_sweep) - this call only opens `fixture_sweep.run(...)`, the
+    per-turn dispatch context, which is what makes it safe to call this
+    concurrently for several questions at once (see replay.py's module
+    docstring, "Concurrent sweeps").
     """
     record = RunRecord(
         question_id=question.id,
@@ -296,7 +304,7 @@ async def run_once(
                     pass  # never let trace-id capture affect a run's outcome
 
     started = time.monotonic()
-    with tool_fixtures(root_agent, mode, fixture_path) as fixture_session:
+    with fixture_sweep.run(fixture_path) as fixture_session:
         try:
             await asyncio.wait_for(_inner(), timeout=timeout_s)
             record.latency_s = time.monotonic() - started
@@ -410,25 +418,18 @@ async def run_sweep(
     interleaving was doing for this phase: arms run literally simultaneously,
     so live-world drift cannot land on one arm rather than the other.
 
-    Concurrency is live-mode only. `replay.tool_fixtures` monkeypatches shared
-    module-level singletons in place (`research_agent.tools` entries and
-    `web_search_tool.run_async`) and holds the patch across the whole awaited
-    turn, so two concurrent fixture sessions would serve each other's
-    fixtures, and a run finishing first would restore the real tools underneath
-    one still in flight - silently defeating replay's no-live-call guarantee.
-    Record mode additionally races `_FixtureStore._flush`'s whole-file rewrite.
-    See ADR-0012; making that layer reentrant is deliberately out of scope.
+    Concurrency is no longer restricted by mode. `replay.ToolFixtureSweep`
+    installs the tool patch exactly once for this whole sweep (below), and
+    each `run_once` call dispatches through it via a `contextvars.ContextVar`
+    scoped to that call's own `asyncio.Task` - concurrent turns resolve to
+    their own fixture store and session with no shared mutable dispatch
+    state (replay) or only record mode's deliberate, necessary sharing of one
+    store per fixture path (see replay.py's module docstring, "Concurrent
+    sweeps"). This replaces the mode != "live" => concurrency = 1 downgrade
+    ADR-0012 recorded as deferred work.
     """
     plan = _plan_runs(questions, budgets, reps)
     total = len(plan)
-
-    if mode != "live" and concurrency > 1:
-        print(
-            f"[concurrency] forced to 1 for mode={mode!r} - replay/record patch shared "
-            f"agent objects in place and are not safe to run concurrently (ADR-0012).",
-            flush=True,
-        )
-        concurrency = 1
 
     timed = [item for item in plan if LATENCY_TARGET_TAG in item[3].tags]
     untimed = [item for item in plan if LATENCY_TARGET_TAG not in item[3].tags]
@@ -441,42 +442,47 @@ async def run_sweep(
         flush=True,
     )
 
-    for rep, arm, budget, question in timed:
-        done += 1
-        print(f"[{done}/{total}] timed rep={rep} arm={arm} question={question.id!r}...", end=" ", flush=True)
-        record = await run_once(question, arm, budget, rep, mode, fixtures_dir, timeout_s, contended=False)
-        results.append(record)
-        print(_status(record), flush=True)
-
-    if not untimed:
-        return results
-
-    semaphore = asyncio.Semaphore(concurrency)
-    contended = concurrency > 1
-
-    async def _guarded(item: tuple[int, str, int, EvalQuestion]) -> RunRecord:
-        rep, arm, budget, question = item
-        async with semaphore:
+    with ToolFixtureSweep(root_agent, mode) as fixture_sweep:
+        for rep, arm, budget, question in timed:
+            done += 1
+            print(f"[{done}/{total}] timed rep={rep} arm={arm} question={question.id!r}...", end=" ", flush=True)
             record = await run_once(
-                question, arm, budget, rep, mode, fixtures_dir, timeout_s, contended=contended
+                question, arm, budget, rep, mode, fixture_sweep, fixtures_dir, timeout_s, contended=False
             )
-        nonlocal done
-        done += 1
-        # One complete line per completion, never the sequential phase's
-        # "start ... finish" pair - concurrent runs would interleave the two
-        # halves and produce unreadable output.
-        print(
-            f"[{done}/{total}] rep={rep} arm={arm} question={question.id!r}: {_status(record)}",
-            flush=True,
-        )
-        return record
+            results.append(record)
+            print(_status(record), flush=True)
 
-    # gather wraps each coroutine in its own Task, which is required rather
-    # than incidental: langfuse's get_current_trace_id reads OTEL's active
-    # span from a contextvar, and contextvars are copied per Task. Driving
-    # these as bare coroutines on one Task would have them share a context and
-    # attribute every run's trace id to whichever ran last.
-    results.extend(await asyncio.gather(*(_guarded(item) for item in untimed)))
+        if not untimed:
+            return results
+
+        semaphore = asyncio.Semaphore(concurrency)
+        contended = concurrency > 1
+
+        async def _guarded(item: tuple[int, str, int, EvalQuestion]) -> RunRecord:
+            rep, arm, budget, question = item
+            async with semaphore:
+                record = await run_once(
+                    question, arm, budget, rep, mode, fixture_sweep, fixtures_dir, timeout_s, contended=contended
+                )
+            nonlocal done
+            done += 1
+            # One complete line per completion, never the sequential phase's
+            # "start ... finish" pair - concurrent runs would interleave the two
+            # halves and produce unreadable output.
+            print(
+                f"[{done}/{total}] rep={rep} arm={arm} question={question.id!r}: {_status(record)}",
+                flush=True,
+            )
+            return record
+
+        # gather wraps each coroutine in its own Task, which is required for
+        # two independent reasons: langfuse's get_current_trace_id reads
+        # OTEL's active span from a contextvar, and replay.ToolFixtureSweep.run
+        # sets _active_run on a contextvar too - both are copied per Task, so
+        # driving these as bare coroutines on one Task would have them share a
+        # context, attributing every run's trace id to whichever ran last and
+        # letting concurrent turns see each other's fixture dispatch.
+        results.extend(await asyncio.gather(*(_guarded(item) for item in untimed)))
     return results
 
 
@@ -548,7 +554,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_CONCURRENCY,
         help="Untimed runs to execute at a time. latency_target questions always run sequentially "
-        "and complete before any concurrent run starts. Forced to 1 in record/replay mode.",
+        "and complete before any concurrent run starts. Applies in every mode, including "
+        "record/replay - see replay.ToolFixtureSweep.",
     )
     parser.add_argument("--mode", choices=["live", "record", "replay"], default="live")
     parser.add_argument(

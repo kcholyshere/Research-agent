@@ -140,10 +140,52 @@ exactly the metric this tier exists to measure. Aborting keeps whatever was
 captured up to the miss and marks the run fixture-incomplete, which is an
 honest "this run tells you nothing" rather than a plausible-looking bad
 number.
+
+## Concurrent sweeps: patch once, dispatch per run via a ContextVar
+
+The tools are shared, module-level singletons (`research_agent.tools`
+entries, `web_search_tool`'s `AgentTool` instance - see the two interception
+points above), so they can only be patched once, not once per run: patching
+per run is exactly what made the original design (ADR-0012) forbid
+concurrency, because two runs sharing the same underlying object would race
+to install and restore each other's patches mid-turn.
+
+What actually needs to vary per run is not the patch itself but which
+`_FixtureStore` (and which run's `FixtureSession` stats) a call should be
+served from. `ToolFixtureSweep` splits the two lifetimes accordingly: its
+`__enter__`/`__exit__` (used once, around the whole sweep) install and
+restore the patch; its `run()` context manager (used once per turn, inside
+`asyncio.gather`) sets `_active_run`, a `contextvars.ContextVar`, for the
+duration of that one turn. `asyncio.gather` wraps each coroutine in its own
+`Task`, and a `Task`'s context is a copy taken at creation time - so setting
+`_active_run` inside one run's `Task` is invisible to every other `Task`
+running concurrently, with no locking needed for that part. The patched
+wrappers read `_active_run` at call time rather than closing over a store, so
+a call made with nothing installed (mode="live", or any stray call outside a
+`run()` block) just falls through to the real tool - that is the whole
+mechanism, not a special case for it.
+
+Replay needs no further coordination: it never writes, so every run gets its
+own fresh `_FixtureStore` loaded independently from disk, and two concurrent
+replays of the same question each see the full recorded set rather than
+racing over one shared pool of consumable slots (which would make a second
+concurrent rep see fewer fixtures purely from scheduling - a run alone at
+concurrency 1 never has that problem, and concurrency must not change what a
+run can see).
+
+Record mode is the one case with real shared mutable state: `_flush()`
+rewrites the whole fixture file, so two runs independently loading their own
+snapshot of the same path and racing to append+flush would lose whichever
+one flushed first (a classic lost update). `ToolFixtureSweep` keeps one
+`_FixtureStore` per fixture path for the life of the sweep (`_record_stores`)
+so every run recording the SAME question id shares one in-memory entries list
+and one flush target, rather than each run holding a private copy.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import functools
 import inspect
 import json
@@ -172,7 +214,14 @@ class FixtureMissError(RuntimeError):
 
 @dataclass
 class FixtureSession:
-    """Handle returned by `tool_fixtures` for the duration of its `with` block.
+    """Handle returned by `ToolFixtureSweep.run` for the duration of one run's `with` block.
+
+    Always per-run, even when the `_FixtureStore` backing it is shared across
+    several concurrent runs (record mode targeting the same fixture path -
+    see `ToolFixtureSweep._store_for`): each run's own `calls_recorded`/
+    `misses`/`inexact_matches` must stay attributable to that run alone, so
+    `_FixtureStore.handle` takes the session as an argument per call rather
+    than owning one for its own lifetime.
 
     `calls_recorded` counts fixture entries actually written to disk this
     session - so it is necessarily 0 in "replay" and "live" modes. It is not
@@ -216,18 +265,32 @@ def _load_fixture_file(path: Path) -> list[dict[str, Any]]:
 
 
 class _FixtureStore:
-    """Backs every patched tool for one `tool_fixtures` session.
+    """Backs every patched tool for one or more runs sharing a fixture path.
 
-    One store is shared by every wrapper created for a given `with` block, so
-    a single fixture file and a single `FixtureSession` (misses,
-    calls_recorded) stay consistent across however many tools got patched.
+    In replay mode there is exactly one run per store (see
+    `ToolFixtureSweep._store_for`), so `self._entries`/`self._slots` are
+    effectively private to that run's turn. In record mode a store may be
+    shared by several concurrent runs recording the SAME question id - that
+    sharing is deliberate (see the module docstring's record-mode section)
+    and is what keeps `_flush()`'s whole-file rewrite from losing entries to
+    a lost-update race. `handle` takes the calling run's `FixtureSession` as
+    an argument rather than owning one, precisely because a shared store must
+    not attribute one run's stats to another's.
     """
 
-    def __init__(self, mode: Literal["record", "replay"], path: Path, session: FixtureSession) -> None:
+    def __init__(self, mode: Literal["record", "replay"], path: Path) -> None:
         self._mode = mode
         self._path = path
-        self._session = session
         self._entries: list[dict[str, Any]] = _load_fixture_file(path)
+        # Guards the append-then-flush sequence below. Not needed for
+        # correctness against asyncio's cooperative scheduling today - there
+        # is no `await` between the append and the write, so no other Task
+        # can interleave mid-sequence even when several share this store -
+        # but that safety is an accident of the current implementation, not
+        # an invariant a future edit should have to preserve by hand. The
+        # lock makes "only one flush of this store's entries happens at a
+        # time" an explicit guarantee instead of an implicit one.
+        self._record_lock = asyncio.Lock()
 
         # Built once at entry, not per-call: replay must never touch disk or
         # re-derive state mid-turn. A flat list of consumable slots rather
@@ -254,12 +317,14 @@ class _FixtureStore:
         tool_name: str,
         args: dict[str, Any],
         real_call: Callable[[], Any],
+        session: FixtureSession,
     ) -> Any:
         if self._mode == "record":
             response = await real_call()
-            self._entries.append({"tool": tool_name, "args": args, "response": response})
-            self._flush()
-            self._session.calls_recorded += 1
+            async with self._record_lock:
+                self._entries.append({"tool": tool_name, "args": args, "response": response})
+                self._flush()
+            session.calls_recorded += 1
             return response
 
         # Replay: real_call is never invoked, by construction - this branch
@@ -275,7 +340,7 @@ class _FixtureStore:
         # docstring for why that is not the nearest-match cheat it resembles.
         fallback = self._take(lambda slot: slot["tool"] == tool_name)
         if fallback is not None:
-            self._session.inexact_matches.append(f"{tool_name} args={args!r}")
+            session.inexact_matches.append(f"{tool_name} args={args!r}")
             return fallback
 
         # Nothing recorded for this tool at all, which is what a genuine
@@ -283,7 +348,7 @@ class _FixtureStore:
         # turn that continues past this point produces a wrong answer and a
         # search storm, contaminating the redundancy metric with a failure
         # that is an artefact of the fixture rather than of the agent.
-        self._session.misses.append(f"{tool_name} args={args!r}")
+        session.misses.append(f"{tool_name} args={args!r}")
         raise FixtureMissError(
             f"No fixture recorded for tool {tool_name!r} (args {args!r}). "
             "This run is fixture-incomplete - re-record it before trusting "
@@ -319,7 +384,7 @@ class _FixtureStore:
 def _iter_llm_agents(agent: BaseAgent) -> Iterator[LlmAgent]:
     """Walk `agent` and its sub-agents, yielding every `LlmAgent` found.
 
-    Needed because the object handed to `tool_fixtures` is not always the
+    Needed because the object handed to `ToolFixtureSweep` is not always the
     tool-bearing agent itself: `root_agent` (src/research_agent/agent.py) is
     a `LoopAgent` wrapping `research_agent`, and `LoopAgent` has no `tools`
     attribute of its own - only its `LlmAgent` sub-agents do. Recursing once
@@ -332,9 +397,29 @@ def _iter_llm_agents(agent: BaseAgent) -> Iterator[LlmAgent]:
         yield from _iter_llm_agents(sub_agent)
 
 
-def _make_function_wrapper(
-    tool_name: str, original: Callable[..., Any], store: _FixtureStore
-) -> Callable[..., Any]:
+# Carries the active run's dispatch target - which `_FixtureStore` to read or
+# write, and which `FixtureSession` to attribute stats to - for the duration
+# of one turn. Read by the patched wrappers below at call time rather than
+# closed over at patch time, which is what lets the patch itself be installed
+# exactly once per sweep (see `ToolFixtureSweep`) instead of once per run:
+# `contextvars.ContextVar.set` inside an `asyncio.Task` is invisible to every
+# other concurrently-running `Task` (each gets its own copy of the context at
+# creation - see `asyncio.gather` in run_eval.run_sweep), so two concurrent
+# runs reading this same module-level ContextVar still resolve to their own
+# store/session with no shared mutable dispatch state. `None` (the default)
+# is what makes mode="live" behaviour fall out for free: nothing ever calls
+# `.set` outside a `ToolFixtureSweep.run` block, so a patched wrapper called
+# with nothing installed just falls through to the real tool.
+@dataclass
+class _ActiveRun:
+    store: _FixtureStore
+    session: FixtureSession
+
+
+_active_run: contextvars.ContextVar[_ActiveRun | None] = contextvars.ContextVar("_active_run", default=None)
+
+
+def _make_function_wrapper(tool_name: str, original: Callable[..., Any]) -> Callable[..., Any]:
     """Build the record/replay stand-in for one plain-function tool.
 
     `functools.wraps` is load-bearing, not cosmetic: `FunctionTool.__init__`
@@ -350,14 +435,15 @@ def _make_function_wrapper(
         async def real_call() -> Any:
             return await original(**kwargs) if is_async else original(**kwargs)
 
-        return await store.handle(tool_name, kwargs, real_call)
+        active = _active_run.get()
+        if active is None:
+            return await real_call()
+        return await active.store.handle(tool_name, kwargs, real_call, active.session)
 
     return wrapper
 
 
-def _make_agent_tool_wrapper(
-    tool_name: str, original_run_async: Callable[..., Any], store: _FixtureStore
-) -> Callable[..., Any]:
+def _make_agent_tool_wrapper(tool_name: str, original_run_async: Callable[..., Any]) -> Callable[..., Any]:
     """Build the record/replay stand-in for one `AgentTool`'s `run_async`.
 
     Matches `AgentTool.run_async`'s own signature (keyword-only `args` and
@@ -370,17 +456,22 @@ def _make_agent_tool_wrapper(
         async def real_call() -> Any:
             return await original_run_async(args=args, tool_context=tool_context)
 
-        return await store.handle(tool_name, args, real_call)
+        active = _active_run.get()
+        if active is None:
+            return await real_call()
+        return await active.store.handle(tool_name, args, real_call, active.session)
 
     return wrapper
 
 
-def _patch_tools(agent: BaseAgent, store: _FixtureStore) -> list[Callable[[], None]]:
+def _patch_tools(agent: BaseAgent) -> list[Callable[[], None]]:
     """Patch every evidence-gathering tool found under `agent`; return restorers.
 
     Each restorer is a zero-argument callable that undoes exactly one patch;
-    `tool_fixtures` runs all of them in `finally` regardless of how the `with`
-    block exits.
+    `ToolFixtureSweep.__exit__` runs all of them regardless of how the sweep
+    ended. Wrappers no longer close over a store (see `_active_run` above) -
+    this is what makes it safe to call `_patch_tools` exactly once per sweep
+    instead of once per run.
     """
     restorers: list[Callable[[], None]] = []
 
@@ -389,7 +480,7 @@ def _patch_tools(agent: BaseAgent, store: _FixtureStore) -> list[Callable[[], No
         for index, tool in enumerate(tools):
             if isinstance(tool, AgentTool):
                 original_run_async = tool.run_async
-                tool.run_async = _make_agent_tool_wrapper(tool.name, original_run_async, store)
+                tool.run_async = _make_agent_tool_wrapper(tool.name, original_run_async)
                 restorers.append(functools.partial(setattr, tool, "run_async", original_run_async))
             elif callable(tool):
                 name = getattr(tool, "__name__", None)
@@ -401,7 +492,7 @@ def _patch_tools(agent: BaseAgent, store: _FixtureStore) -> list[Callable[[], No
                 if name is None or name in CONTROL_TOOLS:
                     continue
                 original = tool
-                tools[index] = _make_function_wrapper(name, original, store)
+                tools[index] = _make_function_wrapper(name, original)
                 restorers.append(functools.partial(tools.__setitem__, index, original))
             # Anything else (a BaseToolset, say) is left untouched - nothing
             # in this project currently attaches one, and silently patching a
@@ -412,31 +503,86 @@ def _patch_tools(agent: BaseAgent, store: _FixtureStore) -> list[Callable[[], No
     return restorers
 
 
-@contextmanager
-def tool_fixtures(agent: BaseAgent, mode: FixtureMode, fixture_path: Path) -> Iterator[FixtureSession]:
-    """Patch `agent`'s tools for the duration of the block, then restore them exactly.
+class ToolFixtureSweep:
+    """Owns one sweep's tool patches and its record-mode store cache.
 
-    `mode="live"` takes no action at all - no discovery, no patching, no file
-    I/O - so it can never distort a live latency measurement, which is the
-    other thing this same fixture layer needs to stay honest for (see
+    Two lifetimes, deliberately not one - see the module docstring's
+    "Concurrent sweeps" section for the full reasoning:
+
+    - The patch itself (`__enter__`/`__exit__`) is installed once for the
+      whole sweep, because the tools are shared module-level singletons and
+      patching them per run is what made concurrency unsafe in the first
+      place (ADR-0012).
+    - Fixture dispatch (`run()`) is per turn: it sets `_active_run` for the
+      duration of one `with` block, scoped to the calling `asyncio.Task` by
+      `contextvars`, so concurrent turns each resolve to their own store and
+      session with no shared mutable state (replay) or only the deliberate,
+      necessary sharing that record mode's file safety requires (record).
+
+    `mode="live"` makes both lifetimes no-ops - no discovery, no patching, no
+    file I/O - so it can never distort a live latency measurement (see
     references/evaluation_brainstorm.md's replay-mode section: live mode is
     kept specifically for latency and operational health, separate from the
     deterministic content assertions replay mode exists for).
     """
-    session = FixtureSession(mode=mode, misses=[], calls_recorded=0)
 
-    if mode == "live":
-        yield session
-        return
+    def __init__(self, agent: BaseAgent, mode: FixtureMode) -> None:
+        self._agent = agent
+        self._mode = mode
+        self._restorers: list[Callable[[], None]] = []
+        # Record mode only - see `_store_for` and the module docstring's
+        # record-mode section. Keyed by fixture path so every run recording
+        # the SAME question id in this sweep shares one store, one in-memory
+        # entries list and one flush target, rather than each loading its own
+        # stale snapshot and losing another run's entries on flush.
+        self._record_stores: dict[Path, _FixtureStore] = {}
 
-    store = _FixtureStore(mode=mode, path=fixture_path, session=session)
-    restorers = _patch_tools(agent, store)
-    try:
-        yield session
-    finally:
-        # Always run every restorer, even if the block above raised - a
-        # leaked patch would silently corrupt every later run in the same
-        # process (the same class of bug the ab_harness session-reuse trap
-        # describes, one layer down).
-        for restore in restorers:
+    def __enter__(self) -> "ToolFixtureSweep":
+        if self._mode != "live":
+            self._restorers = _patch_tools(self._agent)
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        # Always run every restorer, even if the sweep raised - a leaked
+        # patch would silently corrupt every later run in the same process
+        # (the same class of bug the ab_harness session-reuse trap describes,
+        # one layer down).
+        for restore in self._restorers:
             restore()
+        self._restorers = []
+
+    def _store_for(self, fixture_path: Path) -> _FixtureStore:
+        if self._mode == "record":
+            store = self._record_stores.get(fixture_path)
+            if store is None:
+                store = _FixtureStore(mode="record", path=fixture_path)
+                self._record_stores[fixture_path] = store
+            return store
+        # Replay: always a fresh store, never cached. Sharing would mean two
+        # concurrent replays of the SAME question compete over one pool of
+        # consumable slots, so a second run could see fewer fixtures purely
+        # from scheduling - a run alone at concurrency 1 never has that
+        # problem, and concurrency must not change what a run can see.
+        return _FixtureStore(mode="replay", path=fixture_path)
+
+    @contextmanager
+    def run(self, fixture_path: Path) -> Iterator[FixtureSession]:
+        """Dispatch one turn's tool calls to `fixture_path`'s store, for the block's duration.
+
+        Must be called from inside this sweep's `with ToolFixtureSweep(...)`
+        block - the patch it dispatches through has to already be installed.
+        Safe to call concurrently from several `asyncio.Task`s (see
+        run_eval.run_sweep's `asyncio.gather`): `_active_run.set`/`.reset` are
+        scoped to the calling Task's copy of the context, not process-global.
+        """
+        session = FixtureSession(mode=self._mode)
+        if self._mode == "live":
+            yield session
+            return
+
+        store = self._store_for(fixture_path)
+        token = _active_run.set(_ActiveRun(store=store, session=session))
+        try:
+            yield session
+        finally:
+            _active_run.reset(token)
