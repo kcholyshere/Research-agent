@@ -2,33 +2,52 @@
 Version-controlled record of what each evaluation run showed. Design rationale is
 ADR-0011 (what the pipeline measures) and ADR-0012 (how a sweep is scheduled).
 
-## Latest baseline - 2026-07-29
-248 runs (31 questions x 2 arms x 4 reps), live, concurrency 4, 62 minutes.
-`20260729T140829Z_live_reps4_budgets0-1.json`.
+## Latest baseline - 2026-07-29 (post-fix)
+248 runs, live, concurrency 4. `20260729T163541Z_live_reps4_budgets0-1.json`.
 
-| arm | runs | scored | hard pass | cycles=1 | cycles=2 |
+| arm | runs | scored | hard pass | prev | cycles=2 |
 |---|---|---|---|---|---|
-| budget0 | 124 | 122 | 81% | 124 | 0 |
-| budget1 | 124 | 122 | 81% | 118 | 6 |
+| budget0 | 124 | 124 | 76% | 81% | 0 |
+| budget1 | 124 | 124 | 81% | 81% | 4 |
 
-Latency (median / IQR, seconds). Only the timed phase is comparable across sweeps
-or against the 15s target; the rest ran concurrently and is throughput, not speed.
+Failing assertions against the same-day pre-fix baseline, both scored with the
+corrected metrics (ADR-0013), so this is like-for-like:
 
-| arm | phase | cycles | n | median | IQR |
-|---|---|---|---|---|---|
-| budget0 | timed | 1 | 24 | 9.0 | 3.9 |
-| budget1 | timed | 1 | 24 | 11.8 | 5.8 |
-| budget0 | concurrent | 1 | 98 | 25.5 | 45.5 |
-| budget1 | concurrent | 1 | 92 | 28.5 | 48.3 |
-| budget1 | concurrent | 2 | 6 | 87.2 | 49.1 |
+| assertion | before | after |
+|---|---|---|
+| redundancy | 59 | 66 |
+| routing | 35 | 42 |
+| decline | 31 | 32 |
+| citation | 7 | 7 |
+| content | 6 | 5 |
+| total | 138 | 152 |
 
-Regressions by assertion: redundancy 59, citation 40, decline 37, routing 35,
-content 6. Health: 0 fixture-incomplete, 1 timeout, 3 rate-limited of 248.
+Latency, timed phase: budget0 median 9.1s, budget1 10.7s - both inside the 15s
+target. Concurrent phase median 22.9s / 23.1s, down from 25.5s / 28.5s.
+Reliability improved outright: 0 errored, 0 timed out, 0 rate-limited, 248/248
+scored, against 4 lost runs before.
 
-Two findings beyond the numbers. The arms are identical at 81%, so the critique
-budget changes nothing about routing or redundancy. And the loop's continuation
-path fired on real turns for the first time (6 runs at `cycles=2`); until now it
-had only been confirmed by driving `critique_agent` against a synthetic draft.
+### The tool-call cap traded one defect for another
+Per-tool call volume fell exactly as intended - `kb-charges-on-borrowings` 6.5
+to 4.1 mean calls, `decline-auditor-fee` 11.4 to 6.6 (and 181-290s to ~80s),
+`web-premise-refuting` 5.0 to 3.9. No run now exceeds 8 tool calls; the old
+worst was 12.
+
+But assertions got worse, for two reasons that are the same reason:
+
+1. The cap is per tool (3), while the eval's `max_tool_calls` bounds the turn
+   in total (1 to 4). A turn making 3 knowledge-base calls and 3 web calls is
+   within the cap and still fails redundancy.
+2. Refusing a `search_documents` call pushes the agent to the web rather than
+   to an answer. `decline-segment-margin` and `decline-headcount-by-country`
+   now go to web on 8 of 8 runs, `decline-auditor-fee` 7 of 8. The refusal text
+   says in terms "do not substitute a different source"; it is ignored, which
+   is the same finding that motivated the cap in the first place.
+
+So the cap bounded the search storm and redirected it across tools instead of
+stopping it. Net: cheaper and faster turns, more assertion failures. The fix
+for this is a per-turn total ceiling rather than a per-tool one - what the
+eval actually asserts - not a firmer refusal message.
 
 ## Where things live
 | Thing | Path | Tracked |
