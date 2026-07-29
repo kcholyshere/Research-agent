@@ -1,4 +1,12 @@
 # Project Context
+## Response style (read first)
+Keep responses short, focused, and worth the read. Length is a bottleneck here, not a courtesy.
+- Default to a few lines. Bullets over prose. No preamble, no recap of what was just done unless asked.
+- Surface what matters for the practice series and its presentations: how a component works, the trade-offs of a design, how a metric is defined, how the solution is evaluated. These are what get asked in meetings.
+- Do not narrate low-level fixes. "X was broken, fixed" is enough - the reasoning belongs in the commit message, code comments, or `agent_docs/decisions.md`, not the reply.
+- Always surface an architectural decision that needs a call, with the options and trade-offs. That exception overrides brevity.
+- Skip caveats, verification narration, and status colour that will not change a decision.
+
 ## What
 An advanced autonomous research agent, built incrementally: phase 1 is a core RAG agent (Plan-Execute-Synthesize over a private knowledge base via a Document Search Tool), later phases add autonomous planning, critique, and refinement of its own research process. Grid University practice series - the capstone project for a Data Science internship's GenAI module; follows on from the Finrag project.
 
