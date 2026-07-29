@@ -1,5 +1,4 @@
 # Research-agent
-
 An autonomous research agent built incrementally on the Agent Development Kit (ADK): phase 1 is a core RAG agent - a Plan-Execute-Synthesize flow over a private knowledge base, with the Document Search Tool built on the retrieval stack reused from the Finrag project (as the practice mandates).
 
 Status: phase 1, verified against the real GCP project (`gd-gcp-internship-ds`, `gemini-3.5-flash`). Corpus: `ifc-annual-report-2024-financials.pdf` - see `agent_docs/TODOS.md` for the live checklist and `agent_docs/phase_1_requirements.md` for the requirements.
@@ -7,7 +6,6 @@ Status: phase 1, verified against the real GCP project (`gd-gcp-internship-ds`, 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for a diagram of how the pieces fit together.
 
 ## Layout
-
 ```
 src/
 ├── config.py                  <- GCP project/model IDs, paths, chunking, top-k
@@ -23,7 +21,6 @@ src/
 ```
 
 ## Setup
-
 ```bash
 uv sync
 cp .env.example .env   # project: gd-gcp-internship-ds

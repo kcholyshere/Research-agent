@@ -1,5 +1,4 @@
 # Evaluation results
-
 Running record of evaluation runs across iterations. Raw run outputs live in
 `data/processed/eval_runs/` and are **gitignored** (regenerable measurement
 noise); this file is the version-controlled record of what each run showed and
@@ -9,7 +8,6 @@ Design rationale for the pipeline itself is ADR-0011; the plan it implements is
 `references/evaluation_brainstorm.md`.
 
 ## Where things live
-
 | Thing | Path | Tracked |
 |---|---|---|
 | Question set (21 labelled questions) | `data/eval/questions.yaml` | yes |
@@ -23,7 +21,6 @@ Design rationale for the pipeline itself is ADR-0011; the plan it implements is
 | This record | `EVALUATION.md` | yes |
 
 ## How to reproduce
-
 ```bash
 # Full sweep: 21 questions x 2 arms x 3 reps = 126 runs, ~2 hours, sequential
 PYTHONPATH=. python -u -m src.evaluation.run_eval --reps 3 --mode live
@@ -43,9 +40,7 @@ agent calls, so a metric bug does not cost another sweep.
 ---
 
 ## Run history
-
 ### 2026-07-28 - first baseline (pre-attribution-fix)
-
 `20260728T134242Z_live_reps3_budgets0-1.json` - 126 runs, reps=3, live mode,
 arms `critique_budget` 0 and 1. 5 runs lost to Vertex `429 RESOURCE_EXHAUSTED`.
 66 of 121 scored runs clean.
@@ -92,7 +87,6 @@ Notes:
   Figures above are post-fix, recomputed from the stored records.
 
 ### 2026-07-29 - attribution fix (subset only)
-
 `20260729T100106Z_live_reps2_budgets0-1.json` - 16 runs, reps=2, live, 4
 questions (`web-wbg-president`, `fin-currency`, `delegate-news-topic`,
 `kb-net-income`). **A subset, not comparable like-for-like with the baseline
@@ -129,7 +123,6 @@ are unaffected.
 ---
 
 ## Open defects the eval currently measures
-
 | Defect | Evidence | Status |
 |---|---|---|
 | Answers a different question with a plausible figure | `decline-future-figure` returns FY2024 `1,485` for a FY2027 question | open, most serious |

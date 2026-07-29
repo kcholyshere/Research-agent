@@ -1,5 +1,4 @@
 # Project Context
-
 ## What
 An advanced autonomous research agent, built incrementally: phase 1 is a core RAG agent (Plan-Execute-Synthesize over a private knowledge base via a Document Search Tool), later phases add autonomous planning, critique, and refinement of its own research process. Grid University practice series - the capstone project for a Data Science internship's GenAI module; follows on from the Finrag project.
 
@@ -17,6 +16,7 @@ The series' focus is system architecture and design thinking for agentic systems
 - Optional UI: `src/ui/app.py`, Streamlit, a thin chat client over `root_agent` via `google.adk.runners.InMemoryRunner` (see ADR-0002). Containerisation: Docker (Dockerfile present, build not yet verified).
 
 ## Critical rules
+- Markdown: never leave a blank line directly after a heading. The first line of content (or the next heading, where a section is immediately followed by a subsection) goes on the line straight below it. Applies to every `#` level, in every markdown file in this repo.
 - Commit and push at reasonable intervals (per logical step, not one batch at the end).
 - Requirements per phase live in `agent_docs/phase_N_requirements.md`; keep `agent_docs/TODOS.md` current as phases progress.
 - The moment a TODO item is actually fixed or verified, check it off in `agent_docs/TODOS.md` in the same turn - don't batch updates for later. Keep each entry to one to two lines max; detail belongs in commit messages, code comments, or `agent_docs/decisions.md`, not here.
