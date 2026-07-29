@@ -28,12 +28,18 @@ def search_documents(query: str) -> list[dict]:
     notes, covering IFC's FY2024 income, assets, investment portfolio, capital
     and accounting policies.
 
-    Use this only for questions about IFC's own financial reporting. It contains
-    nothing about any other organisation, and nothing about current events,
-    market prices, sport or general knowledge. For an unrelated query it returns
-    its nearest passages anyway rather than an error, so calling it to confirm
-    that the knowledge base does not cover a subject tells you nothing - decide
-    from this description instead.
+    Use this only for questions about IFC's own financial reporting. A question
+    merely being about IFC is not enough: this corpus is one financial report,
+    not a source on the organisation. It does not cover what IFC is, who owns
+    or governs it, which group it belongs to, where it is headquartered, its
+    history, leadership, or any organisational fact outside those FY2024
+    statements - those are public knowledge and belong to web search. It
+    contains nothing about any other organisation either, and nothing about
+    current events, market prices, sport or general knowledge.
+
+    For an unrelated query it returns its nearest passages anyway rather than an
+    error, so calling it to confirm that the knowledge base does not cover a
+    subject tells you nothing - decide from this description instead.
 
     Args:
         query: A natural-language question or search phrase.

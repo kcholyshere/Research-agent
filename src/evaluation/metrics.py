@@ -421,6 +421,7 @@ class ArmSummary:
     n_runs: int
     n_fixture_incomplete: int
     n_timed_out: int
+    n_errored: int
     # Hard pass/fail per the brief: routing and redundancy only. Citation,
     # decline, content and wasted_cycle are still tracked (in regressions/
     # known_failures below) but do not feed this rate, since none of them are
@@ -454,8 +455,21 @@ def summarise(records: list[RunRecord], questions: list[EvalQuestion]) -> dict[s
     summaries: dict[str, ArmSummary] = {}
     for arm, arm_records in by_arm.items():
         incomplete = [r for r in arm_records if is_fixture_incomplete(r)]
-        usable = [r for r in arm_records if not is_fixture_incomplete(r)]
-        timed_out = [r for r in usable if r.timed_out]
+        # A run that errored or timed out is excluded from assertion scoring
+        # for the same reason a fixture-incomplete one is: it has no answer,
+        # so every content-shaped assertion fails on it and the failures
+        # describe the crash rather than the agent. Measured - three errored
+        # runs in one 16-run sweep produced three phantom citation
+        # regressions, which read exactly like a real attribution defect and
+        # sent this investigation down the wrong path until the stored
+        # answers were checked by hand.
+        usable = [
+            r
+            for r in arm_records
+            if not is_fixture_incomplete(r) and not r.timed_out and r.error is None
+        ]
+        timed_out = [r for r in arm_records if r.timed_out and not is_fixture_incomplete(r)]
+        errored = [r for r in arm_records if r.error is not None and not r.timed_out]
 
         regressions: list[tuple[str, AssertionResult]] = []
         known_failures: list[tuple[str, AssertionResult]] = []
@@ -483,6 +497,7 @@ def summarise(records: list[RunRecord], questions: list[EvalQuestion]) -> dict[s
             n_runs=len(arm_records),
             n_fixture_incomplete=len(incomplete),
             n_timed_out=len(timed_out),
+            n_errored=len(errored),
             hard_pass_rate=(hard_passed / hard_total) if hard_total else 1.0,
             regressions=regressions,
             known_failures=known_failures,
@@ -496,8 +511,9 @@ def print_summary(summaries: dict[str, ArmSummary]) -> None:
     for arm, s in summaries.items():
         print(f"\n=== arm: {arm} ===", flush=True)
         print(
-            f"  runs={s.n_runs} fixture_incomplete={s.n_fixture_incomplete} "
-            f"timed_out={s.n_timed_out} hard_pass_rate={s.hard_pass_rate:.0%}",
+            f"  runs={s.n_runs} scored={s.n_runs - s.n_fixture_incomplete - s.n_timed_out - s.n_errored} "
+            f"fixture_incomplete={s.n_fixture_incomplete} timed_out={s.n_timed_out} "
+            f"errored={s.n_errored} hard_pass_rate={s.hard_pass_rate:.0%}",
             flush=True,
         )
         if s.regressions:

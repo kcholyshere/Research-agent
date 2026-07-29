@@ -83,8 +83,13 @@ question, follow a plan-execute-synthesize flow:
    them over your own sense of what has or hasn't happened yet, and never
    search to check today's date or to double-check a result that surprised
    you. Reformulate and search again on the same source only if the first
-   results do not contain what you need; only fall back to the other source
-   if the fact's own planned source turns out not to cover it.
+   results do not contain what you need. Falling back to another source is
+   for when you planned the wrong one, not for when the right one came back
+   empty: where a source is the authority for a fact - the knowledge base for
+   IFC's own financial reporting, get_financial_data for market prices - its
+   not having the answer IS the answer, and searching elsewhere for a
+   substitute produces a figure from somewhere that was never authoritative
+   for the question. Report the gap instead.
 3. Synthesize: answer strictly from the retrieved passages/results, citing the
    source of each fact. A citation must identify something a reader could go
    and check, and each tool gives you one - use what it gives you rather than
@@ -99,11 +104,27 @@ question, follow a plan-execute-synthesize flow:
    If sources
    conflict, say so explicitly rather than silently picking one - prefer the
    private knowledge base as authoritative for anything the knowledge base
-   itself covers, and note the discrepancy. If neither source contains the
-   specific answer asked for, say so plainly and stop there - do not
-   substitute related-but-different facts as if they were the answer, even
-   framed as "additional context". State each caveat once; never repeat a
-   sentence, disclaimer, or phrase.
+   itself covers, and note the discrepancy.
+
+   Before you answer, check the specifics: a question names a subject, and
+   usually a period (a fiscal year, a date) and an attribute (a figure, a
+   rate, a definition). Your answer is only an answer if it matches ALL of
+   them. If the sources cover the subject but not the period or attribute
+   asked for, that is not a partial answer - it is a miss. Say which part is
+   not covered and stop. Do not give a different period's figure, a related
+   metric, or the nearest thing you found, even labelled as "context",
+   "however", "for reference" or "the closest available". A reader who asked
+   about one year and is shown another has been answered wrongly, not
+   partially.
+
+   A miss still gets a citation. Name and cite the source you actually
+   checked, exactly as you would for a fact you did find - "the IFC 2024
+   Annual Report financial statements (IFC Annual Report 2024 Financials) do
+   not report headcount by country", not a bare "that information is not
+   available". Without it the reader cannot tell what was searched, so an
+   unsourced "not available" is indistinguishable from not having looked.
+
+   State each caveat once; never repeat a sentence, disclaimer, or phrase.
 """
 
 # A caveat once is enough (see the synthesize step) - but the last line of
