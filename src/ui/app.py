@@ -31,7 +31,13 @@ def _runner() -> InMemoryRunner:
     return InMemoryRunner(agent=root_agent, app_name=APP_NAME)
 
 
-async def _run_turn(runner: InMemoryRunner, session_id: str, message: str, critique_budget: int) -> str:
+async def _run_turn(
+    runner: InMemoryRunner,
+    session_id: str,
+    message: str,
+    critique_budget: int,
+    web_search_thinking_budget: int,
+) -> str:
     content = genai_types.Content(role="user", parts=[genai_types.Part(text=message)])
     final_text = "(no response)"
     # session_id/user_id group this turn's spans into Langfuse's Sessions/Users
@@ -40,11 +46,19 @@ async def _run_turn(runner: InMemoryRunner, session_id: str, message: str, criti
         # critique_budget is the per-request soft cap the critique agent honours
         # (ADR-0010) - 0 short-circuits to a single research cycle with no
         # critique pass, matching pre-phase-4 behaviour.
+        # web_search_thinking_budget is read the same way by web_search_agent's
+        # before_model_callback (src/tools/web_search.py) - AgentTool copies
+        # this session's state into the sub-agent's own session when
+        # research_agent calls web_search_tool, so one state_delta here reaches
+        # both agents' per-request knobs.
         async for event in runner.run_async(
             user_id=USER_ID,
             session_id=session_id,
             new_message=content,
-            state_delta={"critique_budget": critique_budget},
+            state_delta={
+                "critique_budget": critique_budget,
+                "web_search_thinking_budget": web_search_thinking_budget,
+            },
         ):
             # Match on the author, not just is_final_response(): since phase 4
             # (ADR-0010) the turn runs two agents, and ADK marks a final
@@ -84,10 +98,7 @@ st.caption(
     f"(Document Search Tool, corpus: {config.RAW_DATA_DIR})"
 )
 
-# One expander for advanced, infrequently-touched per-request settings - a
-# planned thinking-budget slider (ADR-0010) lands alongside critique_budget
-# here later, so this stays a shared home for controls rather than a
-# one-off widget bolted on next to the chat box.
+# One expander for advanced, infrequently-touched per-request settings.
 with st.expander("Advanced configuration", expanded=False):
     critique_budget = st.slider(
         "Critique iterations",
@@ -102,6 +113,43 @@ with st.expander("Advanced configuration", expanded=False):
             "cost of extra latency per iteration."
         ),
     )
+
+    # Named discrete levels rather than a raw token count: the number itself
+    # (256 vs 512 vs 1024) means little to someone tuning latency, the level
+    # does. select_slider returns the label; _web_search_thinking_levels maps
+    # it back to the token budget web_search_agent's before_model_callback
+    # applies (src/tools/web_search.py). Measured (n=6, direct Vertex probe):
+    # unset ("automatic" thinking) put the web search sub-agent at a median
+    # 19.95s/3,310 thinking tokens per call; 512 measured 9.46s for the same
+    # probe - google_search grounding needs little deliberation, so most of
+    # that thinking time was overhead the answer didn't need.
+    _web_search_thinking_levels = {"Off": 0, "Low": 256, "Medium": 512, "High": 1024}
+    # Falls back to "Medium" rather than raising if DEFAULT_WEB_SEARCH_THINKING_BUDGET
+    # is ever set to a value outside these four levels (e.g. -1, Gemini's own
+    # "automatic" budget - a legitimate config value, just not one of the
+    # slider's named levels) - a wrong default slider position is recoverable
+    # by the user; a crashed page on load is not.
+    _default_thinking_level = next(
+        (
+            label
+            for label, budget in _web_search_thinking_levels.items()
+            if budget == config.DEFAULT_WEB_SEARCH_THINKING_BUDGET
+        ),
+        "Medium",
+    )
+    _web_search_thinking_label = st.select_slider(
+        "Web search thinking budget",
+        options=list(_web_search_thinking_levels),
+        value=_default_thinking_level,
+        help=(
+            "How much the web search sub-agent is allowed to 'think' before "
+            "answering. Off disables thinking entirely; higher levels let it "
+            "reason more before replying, at the cost of extra latency per "
+            "web search call. Google Search grounding needs little "
+            "deliberation, so Medium is a reasonable default."
+        ),
+    )
+    web_search_thinking_budget = _web_search_thinking_levels[_web_search_thinking_label]
 
 runner = _runner()
 session_id = asyncio.run(_ensure_session(runner))
@@ -129,7 +177,15 @@ if prompt := st.chat_input("Ask a question about the knowledge base"):
 
         def _run_turn_sync() -> None:
             try:
-                turn_result["answer"] = asyncio.run(_run_turn(runner, session_id, prompt, critique_budget))
+                turn_result["answer"] = asyncio.run(
+                    _run_turn(
+                        runner,
+                        session_id,
+                        prompt,
+                        critique_budget,
+                        web_search_thinking_budget,
+                    )
+                )
             except Exception as exc:
                 # Vertex errors, an empty/missing FAISS index, etc. should read as a
                 # message in the chat, not crash the page.

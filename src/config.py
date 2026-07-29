@@ -48,3 +48,12 @@ MAX_CRITIQUE_ITERATIONS = 3
 # typical latency close to the pre-phase-4 baseline. A request-supplied
 # budget of 0 reproduces that baseline exactly - no critique LLM call at all.
 DEFAULT_CRITIQUE_BUDGET = 1
+
+# web_search_agent's thinking budget (src/tools/web_search.py), in tokens -
+# 0 disables thinking, -1 is Gemini's own "automatic" budget. Measured
+# against a direct Vertex probe (n=6): unset (automatic) put this sub-agent
+# at a median 19.95s/3,310 thinking tokens per call; 512 measured 9.46s for
+# the same probe. 512 ("Medium" in the Streamlit UI) is the default; the UI
+# also offers Off/Low/High, settable per request the same way
+# DEFAULT_CRITIQUE_BUDGET is.
+DEFAULT_WEB_SEARCH_THINKING_BUDGET = 512

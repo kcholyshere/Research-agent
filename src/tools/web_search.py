@@ -14,6 +14,8 @@ if we need more control over the search provider or result format later.
 
 from google.adk.agents import Agent
 from google.adk.agents.callback_context import CallbackContext
+from google.adk.models.llm_request import LlmRequest
+from google.adk.models.llm_response import LlmResponse
 from google.adk.tools import google_search
 from google.adk.tools.agent_tool import AgentTool
 from google.genai import types
@@ -82,12 +84,77 @@ def _append_grounding_sources(callback_context: CallbackContext) -> types.Conten
 # Same runaway-repetition safety net as root_agent (src/research_agent/agent.py)
 # - a Gemini decoding loop can in principle hit any agent using this model, so
 # it's applied here too rather than assumed to be root_agent-specific.
+#
+# thinking_config is this sub-agent's own field, set on this module's own
+# GenerateContentConfig object - deliberately NOT on research_agent's or
+# critique_agent's (see agent.py/critique.py), which are separate
+# GenerateContentConfig instances entirely. A direct Vertex probe (n=6)
+# measured this sub-agent at a median 19.95s/3,310 thinking tokens with no
+# budget set (Gemini's "automatic" thinking); pinning thinking_budget=512
+# measured 9.46s for the same probe - google_search grounding needs little
+# deliberation, so most of that thinking time was overhead, not reasoning
+# that changed the answer. The value here is the static default/fallback;
+# _apply_thinking_budget below lets a single request override it.
 _GENERATE_CONTENT_CONFIG = types.GenerateContentConfig(
     max_output_tokens=4096,
     frequency_penalty=0.4,
+    thinking_config=types.ThinkingConfig(
+        thinking_budget=config.DEFAULT_WEB_SEARCH_THINKING_BUDGET
+    ),
 )
 
 _WEB_SEARCH_AGENT_NAME = "web_search_agent"
+
+# Session-state key the Streamlit UI writes to per turn (see src/ui/app.py) -
+# named distinctly from critique_agent's "critique_budget" since both keys
+# can be present in the same session state at once.
+_THINKING_BUDGET_STATE_KEY = "web_search_thinking_budget"
+
+
+def _apply_thinking_budget(
+    callback_context: CallbackContext, llm_request: LlmRequest
+) -> LlmResponse | None:
+    """Apply this request's thinking budget to the outgoing LlmRequest.
+
+    Verified directly against the installed google-adk==2.5.0 (ADR-0002's
+    pin; confirmed via importlib.metadata.version("google-adk") in this
+    venv), by reading the actual source, not docs:
+    - base_llm_flow.py's _handle_before_model_callback calls a
+      before_model_callback as callback(callback_context=..., llm_request=...)
+      with the LlmRequest ADK is about to send - basic.py's
+      _build_basic_request has already set llm_request.config =
+      agent.generate_content_config.model_copy(deep=True) by the time this
+      runs, i.e. a fresh, request-private copy, not a reference to this
+      module's _GENERATE_CONTENT_CONFIG. Mutating llm_request.config here is
+      therefore safe under concurrent turns with different budgets - each
+      gets its own copy - and cannot leak into the static default.
+    - Mutating llm_request.config in place and returning None lets the
+      mutated request go out; returning a non-None LlmResponse here would
+      instead short-circuit the call entirely (used by critique_agent's
+      before_agent_callback for its own, different, purpose), which is not
+      wanted here - this callback only ever adjusts the request.
+    Both points, plus the state plumbing below, were confirmed empirically
+    (not just by reading source) with a spied-callback probe: two turns
+    through this agent with web_search_thinking_budget=0 and =1024 in the
+    parent session's state_delta produced llm_request.config.thinking_config
+    of 0 and 1024 respectively, each on its own distinct config object.
+
+    Session state, not a tool argument, is how the value gets here: the
+    Streamlit UI passes state_delta={"web_search_thinking_budget": n} into
+    runner.run_async on the PARENT (research_agent-facing) session, the same
+    pattern critique_agent's "critique_budget" uses. AgentTool.run_async (the
+    object web_search_tool wraps around _web_search_agent) copies the
+    parent's tool_context.state into the sub-agent's own freshly created
+    session before running it (google/adk/tools/agent_tool.py, state_dict
+    passed to session_service.create_session), so this callback's
+    callback_context.state sees the same key without any extra plumbing.
+    """
+    budget = callback_context.state.get(
+        _THINKING_BUDGET_STATE_KEY, config.DEFAULT_WEB_SEARCH_THINKING_BUDGET
+    )
+    llm_request.config.thinking_config = types.ThinkingConfig(thinking_budget=budget)
+    return None
+
 
 _web_search_agent = Agent(
     name=_WEB_SEARCH_AGENT_NAME,
@@ -104,6 +171,7 @@ relevant facts you find. State each fact once; never repeat a sentence or
 phrase.""",
     tools=[google_search],
     generate_content_config=_GENERATE_CONTENT_CONFIG,
+    before_model_callback=_apply_thinking_budget,
     after_agent_callback=_append_grounding_sources,
 )
 
