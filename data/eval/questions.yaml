@@ -284,7 +284,7 @@ questions:
   - id: decline-not-listed
     question: What is IFC's stock ticker symbol and what is its share price today?
     expected_routes: [web]
-    tags: [web, decline, routing_boundary]
+    tags: [web, decline, routing_boundary, volatile]
     max_tool_calls: 2
     volatile: true
     expects_decline: true
