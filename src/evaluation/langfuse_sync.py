@@ -51,22 +51,26 @@ project during verification - see this change's report for cleanup notes):
   calling it twice with identical `run_name`/`dataset_item_id`/`trace_id`
   produced two distinct run-item ids. Left unguarded, every re-run of
   `link_run_to_dataset` against an unchanged file would duplicate rows in
-  Langfuse's run view. `_already_linked` below closes that gap by reading
-  `get_dataset_run` once per arm and skipping any (question_id, trace_id)
-  pair already present - which is also the right key to skip on: two
-  different reps of the same question in one arm have different trace_ids
-  and must both still be linked, only an exact repeat should be skipped.
+  Langfuse's run view.
+- `get_dataset_run(...).dataset_run_items` returns only the most-recently-
+  created item per `dataset_item_id`, NOT every row. This broke the first
+  version of the guard, which compared (question_id, trace_id) pairs: on a
+  multi-rep file only the last rep of each question looked already-linked, so
+  a second sync re-linked and re-scored every earlier rep. Measured, not
+  theorised - one trace reached 12 scores instead of 4 after three test
+  syncs, and neither scores nor run items have a delete API here, so the
+  duplicates were permanent. The guard is now whole-run (`_run_already_synced`):
+  the default run name is a content fingerprint of the file, so "this run
+  exists" already means "this file was synced".
 - `get_dataset_run` has the same ingestion lag the plan already documents for
   trace/observation fetches (18 of 47 empty on first fetch): a run item
   created moments earlier in the same process was invisible to an immediate
   follow-up `get_dataset_run` call, then present a few seconds later with no
   code change - reproduced directly against the probe dataset, not inferred.
-  In this project's actual use (a human re-running link_run_to_dataset
-  against a file minutes or hours after the first sync) that lag is a
-  non-issue; back-to-back calls seconds apart could still race and duplicate
-  a row despite the guard. Documented here rather than solved, since solving
-  it would mean polling an eventually-consistent read with no documented
-  bound, which is worse than an honest, narrow race window.
+  In this project's actual use (a human re-syncing a file minutes or hours
+  later) that lag is a non-issue; back-to-back calls seconds apart could
+  still race past the guard. Documented rather than solved, since solving it
+  would mean polling an eventually-consistent read with no documented bound.
 - `create_score(trace_id=, name=, value=, data_type=)` is how a score
   attaches to a specific run's trace; `data_type="BOOLEAN"` takes 1.0/0.0
   (confirmed against langfuse/batch_evaluation.py's own BOOLEAN example -
@@ -210,30 +214,38 @@ def _content_fingerprint(eval_run: EvalRun) -> str:
     return f"eval-{digest}"
 
 
-def _already_linked(client: Langfuse, dataset_name: str, run_name: str) -> set[tuple[str, str]]:
-    """(question_id, trace_id) pairs already linked to `run_name`, or empty.
+def _run_already_synced(client: Langfuse, dataset_name: str, run_name: str) -> bool:
+    """True when `run_name` already exists with at least one linked item.
 
-    One GET per arm, not per record - cheap next to the per-record POSTs it
-    guards. A run that does not exist yet (the common case: first sync of a
-    new file) raises inside get_dataset_run; that is not itself a failure
-    worth a warning, it just means nothing is linked yet, so it is swallowed
-    locally here rather than logged - any Langfuse outage this would also be
-    hiding still surfaces anyway, from the per-record create calls that
-    follow in link_run_to_dataset.
+    Deliberately a whole-run check rather than a per-record one. The first
+    version compared (question_id, trace_id) pairs from
+    `get_dataset_run(...).dataset_run_items` and dropped records it thought
+    were already there - which was wrong, and measurably so: that endpoint
+    returns only the most-recently-created run item per `dataset_item_id`,
+    not every row. On a multi-rep file only the last rep of each question
+    looked "already linked", so a second sync re-linked and re-scored every
+    earlier rep. One trace ended up with 12 scores instead of 4 after three
+    test syncs, and neither scores nor dataset run items have a delete API in
+    this SDK version, so the duplicates could not be cleaned up.
 
-    Best-effort, not a hard guarantee: get_dataset_run reads through the same
-    eventually-consistent ingestion path as trace fetches (see the module
-    docstring's "18 of 47 traces empty on first fetch" trap, reproduced here
-    too against a live run item that had not yet become visible seconds after
-    creation). Calls minutes or hours apart - this project's actual usage
-    pattern - are unaffected; calls seconds apart could still race past this
-    check and duplicate a row.
+    Because `run_name` defaults to a content fingerprint of the exact file
+    (see _content_fingerprint), "this run exists" already means "this file
+    was synced", so per-record bookkeeping buys nothing the name does not
+    give. Trade-off accepted knowingly: a sync that failed halfway leaves a
+    run that will now be skipped rather than completed - recover by passing
+    an explicit `run_name`, which is cheap, whereas silently duplicating
+    scores corrupts the data permanently.
+
+    A run that does not exist raises inside get_dataset_run; that is the
+    common first-sync case, not a failure, so it is swallowed here rather
+    than logged. A genuine Langfuse outage still surfaces from the per-record
+    create calls that follow.
     """
     try:
         run = client.get_dataset_run(dataset_name=dataset_name, run_name=run_name)
     except Exception:
-        return set()
-    return {(item.dataset_item_id, item.trace_id) for item in run.dataset_run_items if item.trace_id}
+        return False
+    return bool(getattr(run, "dataset_run_items", None))
 
 
 def _scores_for(record: RunRecord, question: EvalQuestion | None) -> list[tuple[str, float, str]]:
@@ -326,7 +338,14 @@ def link_run_to_dataset(
 
     for arm in dict.fromkeys(record.arm for record in eval_run.records):
         arm_run_name = f"{stem}-{arm}"
-        linked = _already_linked(client, dataset_name, arm_run_name)
+        if _run_already_synced(client, dataset_name, arm_run_name):
+            logger.info(
+                "langfuse_sync: run %s already exists in %s, skipping (pass an explicit "
+                "run_name to force a fresh one)",
+                arm_run_name,
+                dataset_name,
+            )
+            continue
 
         for record in (r for r in eval_run.records if r.arm == arm):
             if not record.trace_id:
@@ -337,17 +356,6 @@ def link_run_to_dataset(
                     arm,
                 )
                 continue
-            if (record.question_id, record.trace_id) in linked:
-                # Exact repeat of an earlier sync of this same file - not a
-                # new rep (those have different trace_ids and are linked
-                # normally, see _already_linked's docstring). Skipping here is
-                # what makes a second call to link_run_to_dataset on an
-                # unchanged file a true no-op instead of duplicating rows:
-                # dataset_run_items.create itself has no such guard (verified
-                # empirically - identical arguments twice produced two
-                # distinct run-item ids).
-                continue
-
             try:
                 client.api.dataset_run_items.create(
                     run_name=arm_run_name,

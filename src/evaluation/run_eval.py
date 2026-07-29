@@ -89,6 +89,7 @@ from google.adk.runners import InMemoryRunner
 from google.genai import types
 
 from src import config
+from src.evaluation.langfuse_sync import link_run_to_dataset, push_question_set
 from src.evaluation.metrics import print_summary, summarise
 from src.evaluation.replay import FixtureMissError, FixtureMode, tool_fixtures
 from src.evaluation.schema import CycleRecord, EvalQuestion, EvalRun, RunRecord
@@ -101,6 +102,17 @@ USER_ID = "eval-runner"
 DEFAULT_QUESTION_FILE = config.PROJECT_ROOT / "data" / "eval" / "questions.yaml"
 DEFAULT_FIXTURES_DIR = config.PROJECT_ROOT / "data" / "eval" / "fixtures"
 DEFAULT_OUTPUT_DIR = config.PROJECT_ROOT / "data" / "processed" / "eval_runs"
+
+# Stable across runs on purpose - a default that changed per invocation would
+# scatter every sweep into its own Langfuse dataset instead of accumulating
+# comparable arms in one place, defeating the whole point of the sync (see
+# langfuse_sync.py's module docstring: "so arms are comparable in the
+# existing UI").
+DEFAULT_LANGFUSE_DATASET = "research-agent-tier1-eval"
+DEFAULT_LANGFUSE_DESCRIPTION = (
+    "Tier 1 trace-level evaluation question set (data/eval/questions.yaml) - "
+    "see references/evaluation_brainstorm.md."
+)
 
 # Generous relative to a single-cycle turn (10-45s observed) because a
 # critique budget above 0 can multiply that by the iteration count, and the
@@ -344,6 +356,46 @@ async def run_sweep(
 
 
 # ---------------------------------------------------------------------------
+# Langfuse sync (post-hoc, opt-in - never on the measurement path)
+# ---------------------------------------------------------------------------
+
+
+def sync_to_langfuse(eval_run: EvalRun, question_file: Path, dataset_name: str) -> None:
+    """Mirror an already-finished `eval_run` into Langfuse. Never called mid-sweep.
+
+    Both requirement sources here are `langfuse_sync.py`'s own module
+    docstring ("a one-way, best-effort mirror of an already-finished run...
+    never on the critical measurement path") and this project's repeated
+    experience that coupling a measurement to an external service imports
+    that service's failure modes into the number being measured - so this is
+    only ever called after `eval_run` already exists (freshly written to disk
+    by main_async, or loaded back from it via --sync-only). Both
+    push_question_set and link_run_to_dataset already degrade to a logged
+    warning on any failure and never raise (langfuse_sync._never_raises), so
+    nothing here needs its own try/except to protect the caller's exit
+    status or the JSON already on disk.
+
+    Loads the FULL question file, not whichever subset this particular sweep
+    was filtered to with --questions/--tags: dataset_name is a shared,
+    long-lived Langfuse dataset that repeat runs land in (see
+    DEFAULT_LANGFUSE_DATASET), and push_question_set is explicitly safe to
+    call every time (upserts by id). Pushing only a smoke-test's one or two
+    questions would leave the dataset an incomplete fragment of questions.yaml
+    instead of a stable mirror of it; pushing the full file every time keeps
+    it in sync regardless of what happened to be measured today. The same
+    full set is passed to link_run_to_dataset purely for scoring labels
+    (routing_correct/redundant_calls need EvalQuestion.expected_routes) - it
+    does not change which records get linked, only whether their scores can
+    be computed.
+    """
+    print(f"\nSyncing to Langfuse dataset {dataset_name!r}...", flush=True)
+    questions = load_questions(question_file)
+    push_question_set(questions, dataset_name, description=DEFAULT_LANGFUSE_DESCRIPTION)
+    link_run_to_dataset(eval_run, dataset_name, questions=questions)
+    print("Langfuse sync attempted (see warnings above for anything skipped).", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -376,11 +428,44 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-summary", action="store_true", help="Skip printing the metrics.py rollup after the sweep."
     )
+    parser.add_argument(
+        "--sync-langfuse",
+        action="store_true",
+        help=(
+            "After the sweep has written its JSON, push the question set and link this run into "
+            "Langfuse as a dataset run (post-hoc; a sync failure never affects the run's exit status)."
+        ),
+    )
+    parser.add_argument(
+        "--langfuse-dataset-name",
+        type=str,
+        default=DEFAULT_LANGFUSE_DATASET,
+        help="Langfuse dataset name for --sync-langfuse/--sync-only; defaults to a stable, shared name "
+        "so repeat runs land in the same dataset.",
+    )
+    parser.add_argument(
+        "--sync-only",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Skip the sweep entirely: load an existing EvalRun JSON file from PATH and sync it to "
+        "Langfuse (implies --sync-langfuse). Lets a sync be fixed or retried without re-running a sweep.",
+    )
     return parser
 
 
 async def main_async(argv: list[str] | None = None) -> EvalRun:
     args = build_arg_parser().parse_args(argv)
+
+    if args.sync_only is not None:
+        # A fix-the-sync-without-repeating-the-sweep escape hatch (see the
+        # flag's own help text) - deliberately the only thing this branch
+        # does: no question filtering, no sweep, no re-writing the JSON that
+        # is already the source of truth on disk. EvalRun.from_json is the
+        # same loader link_run_to_dataset's own docstring assumes callers use.
+        eval_run = EvalRun.from_json(args.sync_only)
+        sync_to_langfuse(eval_run, args.question_file, args.langfuse_dataset_name)
+        return eval_run
 
     question_ids = _parse_str_set(args.questions)
     tags = _parse_str_set(args.tags)
@@ -430,6 +515,13 @@ async def main_async(argv: list[str] | None = None) -> EvalRun:
     if not args.no_summary:
         summaries = summarise(records, questions)
         print_summary(summaries)
+
+    if args.sync_langfuse:
+        # Strictly after to_json above - the local JSON is already the
+        # complete, correct record of this sweep by this point, so nothing
+        # about the sync (success or failure) can change what got measured
+        # or what got written.
+        sync_to_langfuse(eval_run, args.question_file, args.langfuse_dataset_name)
 
     return eval_run
 
