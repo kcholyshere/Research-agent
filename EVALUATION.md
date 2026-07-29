@@ -2,6 +2,34 @@
 Version-controlled record of what each evaluation run showed. Design rationale is
 ADR-0011 (what the pipeline measures) and ADR-0012 (how a sweep is scheduled).
 
+## Latest baseline - 2026-07-29
+248 runs (31 questions x 2 arms x 4 reps), live, concurrency 4, 62 minutes.
+`20260729T140829Z_live_reps4_budgets0-1.json`.
+
+| arm | runs | scored | hard pass | cycles=1 | cycles=2 |
+|---|---|---|---|---|---|
+| budget0 | 124 | 122 | 81% | 124 | 0 |
+| budget1 | 124 | 122 | 81% | 118 | 6 |
+
+Latency (median / IQR, seconds). Only the timed phase is comparable across sweeps
+or against the 15s target; the rest ran concurrently and is throughput, not speed.
+
+| arm | phase | cycles | n | median | IQR |
+|---|---|---|---|---|---|
+| budget0 | timed | 1 | 24 | 9.0 | 3.9 |
+| budget1 | timed | 1 | 24 | 11.8 | 5.8 |
+| budget0 | concurrent | 1 | 98 | 25.5 | 45.5 |
+| budget1 | concurrent | 1 | 92 | 28.5 | 48.3 |
+| budget1 | concurrent | 2 | 6 | 87.2 | 49.1 |
+
+Regressions by assertion: redundancy 59, citation 40, decline 37, routing 35,
+content 6. Health: 0 fixture-incomplete, 1 timeout, 3 rate-limited of 248.
+
+Two findings beyond the numbers. The arms are identical at 81%, so the critique
+budget changes nothing about routing or redundancy. And the loop's continuation
+path fired on real turns for the first time (6 runs at `cycles=2`); until now it
+had only been confirmed by driving `critique_agent` against a synthetic draft.
+
 ## Where things live
 | Thing | Path | Tracked |
 |---|---|---|
@@ -35,34 +63,6 @@ Three tags cut across the above rather than describing a question's subject:
 asserted only in replay against a fixture; `latency_target` (6) marks the runs
 timed in isolation; `known_defect` (2) marks a question expected to fail today
 against a logged defect, reported apart from fresh regressions.
-
-## Latest baseline - 2026-07-29
-248 runs (31 questions x 2 arms x 4 reps), live, concurrency 4, 62 minutes.
-`20260729T140829Z_live_reps4_budgets0-1.json`.
-
-| arm | runs | scored | hard pass | cycles=1 | cycles=2 |
-|---|---|---|---|---|---|
-| budget0 | 124 | 122 | 81% | 124 | 0 |
-| budget1 | 124 | 122 | 81% | 118 | 6 |
-
-Latency (median / IQR, seconds). Only the timed phase is comparable across sweeps
-or against the 15s target; the rest ran concurrently and is throughput, not speed.
-
-| arm | phase | cycles | n | median | IQR |
-|---|---|---|---|---|---|
-| budget0 | timed | 1 | 24 | 9.0 | 3.9 |
-| budget1 | timed | 1 | 24 | 11.8 | 5.8 |
-| budget0 | concurrent | 1 | 98 | 25.5 | 45.5 |
-| budget1 | concurrent | 1 | 92 | 28.5 | 48.3 |
-| budget1 | concurrent | 2 | 6 | 87.2 | 49.1 |
-
-Regressions by assertion: redundancy 59, citation 40, decline 37, routing 35,
-content 6. Health: 0 fixture-incomplete, 1 timeout, 3 rate-limited of 248.
-
-Two findings beyond the numbers. The arms are identical at 81%, so the critique
-budget changes nothing about routing or redundancy. And the loop's continuation
-path fired on real turns for the first time (6 runs at `cycles=2`); until now it
-had only been confirmed by driving `critique_agent` against a synthetic draft.
 
 ## Open defects
 As of the 2026-07-29 baseline. Update this table and the date with each sweep.
