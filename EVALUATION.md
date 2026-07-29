@@ -1,11 +1,6 @@
 # Evaluation results
-Running record of evaluation runs across iterations. Raw run outputs live in
-`data/processed/eval_runs/` and are **gitignored** (regenerable measurement
-noise); this file is the version-controlled record of what each run showed and
-what changed between them.
-
-Design rationale for the pipeline itself is ADR-0011; the plan it implements is
-`references/evaluation_brainstorm.md`.
+Version-controlled record of what each evaluation run showed. Design rationale is
+ADR-0011 (what the pipeline measures) and ADR-0012 (how a sweep is scheduled).
 
 ## Where things live
 | Thing | Path | Tracked |
@@ -18,139 +13,79 @@ Design rationale for the pipeline itself is ADR-0011; the plan it implements is
 | Record/replay layer | `src/evaluation/replay.py` | yes |
 | Langfuse sync (opt-in, `--sync-langfuse`) | `src/evaluation/langfuse_sync.py` | yes |
 | Raw run outputs | `data/processed/eval_runs/*.json` | no |
-| This record | `EVALUATION.md` | yes |
 
-## How to reproduce
-```bash
-# Full sweep: 31 questions x 2 arms x 4 reps = 248 runs
-PYTHONPATH=. python -u -m src.evaluation.run_eval --reps 4 --mode live
+## Latest baseline - 2026-07-29
+248 runs (31 questions x 2 arms x 4 reps), live, concurrency 4, 62 minutes.
+`20260729T140829Z_live_reps4_budgets0-1.json`.
 
-# Same, measured strictly one run at a time (slower; only needed to compare
-# untimed latency against a pre-ADR-0012 run)
-PYTHONPATH=. python -u -m src.evaluation.run_eval --reps 4 --mode live --concurrency 1
-
-# Fast smoke: filter by question id or tag
-PYTHONPATH=. python -u -m src.evaluation.run_eval --questions kb-net-income,fin-crypto --reps 1
-
-# Record fixtures, then replay deterministically (content assertions on volatile questions).
-# Record appends rather than overwrites, so run it 2-3 times for a question whose
-# call count varies - one pass captures only that run's exact calls, and replay
-# consumes slots one per call, so a longer replay run exhausts a single-pass fixture.
-PYTHONPATH=. python -u -m src.evaluation.run_eval --mode record --questions <id>
-PYTHONPATH=. python -u -m src.evaluation.run_eval --mode replay --questions <id>
-```
-
-Since ADR-0012 the sweep runs in two phases. Every `latency_target` question
-runs first, strictly sequentially, and finishes before anything else starts -
-those are the only runs whose wall-clock is comparable across sweeps or against
-the 15s target. Everything else then runs `--concurrency` at a time (default 4)
-and is flagged `contended` in the run file, with its latency reported under a
-separate heading. Measured 2026-07-29 on an 8-run smoke set: 559.5s sequential
-against 336.5s at concurrency 4.
-
-Concurrency is live-mode only and is forced to 1 in `record`/`replay`, which
-patch shared agent objects in place. `concurrency` is recorded in each run's
-settings, so a stored run says how it was measured.
-
-**Latency from a `concurrency > 1` sweep is only comparable on the timed phase.**
-Runs before 2026-07-29 predate the flag and read as uncontended, which they were.
-
-Metrics can be recomputed over a stored run file with no agent calls, so a
-metric bug does not cost another sweep.
-
----
-
-## Run history
-### 2026-07-28 - first baseline (pre-attribution-fix)
-`20260728T134242Z_live_reps3_budgets0-1.json` - 126 runs, reps=3, live mode,
-arms `critique_budget` 0 and 1. 5 runs lost to Vertex `429 RESOURCE_EXHAUSTED`.
-66 of 121 scored runs clean.
-
-| arm | runs | hard pass | regressions | known-defect hits |
-|---|---|---|---|---|
-| budget0 | 63 | 69% | 53 | 19 |
-| budget1 | 63 | 71% | 50 | 17 |
-
-Latency (median / IQR, seconds), segmented by cycle count:
-
-| arm | cycles | n | median | IQR | max |
+| arm | runs | scored | hard pass | cycles=1 | cycles=2 |
 |---|---|---|---|---|---|
-| budget0 | 1 | 63 | 18.1 | 38.2 | 298.1 |
-| budget1 | 1 | 61 | 20.0 | 38.1 | 299.5 |
-| budget1 | 2 | 2 | 184.5 | 83.4 | 212.3 |
+| budget0 | 124 | 122 | 81% | 124 | 0 |
+| budget1 | 124 | 122 | 81% | 118 | 6 |
 
-Regressions by assertion: redundancy 39, routing 20, citation 14, decline 11,
-content 4.
+Latency (median / IQR, seconds). Only the timed phase is comparable across sweeps
+or against the 15s target; the rest ran concurrently and is throughput, not speed.
 
-Failing 6/6 (fully reproducible, not noise):
+| arm | phase | cycles | n | median | IQR |
+|---|---|---|---|---|---|
+| budget0 | timed | 1 | 24 | 9.0 | 3.9 |
+| budget1 | timed | 1 | 24 | 11.8 | 5.8 |
+| budget0 | concurrent | 1 | 98 | 25.5 | 45.5 |
+| budget1 | concurrent | 1 | 92 | 28.5 | 48.3 |
+| budget1 | concurrent | 2 | 6 | 87.2 | 49.1 |
 
-- `web-ifc-parent` **routing** - calls the knowledge base for a public question.
-  This is the phase 2 redundancy defect that commit `390f940` was believed to
-  have fixed. It is not fixed.
-- `fin-coverage-gap` **routing + decline** - on USD/PLN it falls back to web and
-  produces a number instead of declining.
-- `decline-future-figure` **routing 6/6, decline 5/6, content 4/6** - asked for
-  FY2027 net income, returns the FY2024 figure `1,485`. Most serious finding: a
-  plausible answer to a different question.
-- `kb-charges-on-borrowings` **redundancy** - up to 8 KB calls for one figure.
-- `web-current-event` **redundancy** - up to 10 web searches.
-- `loop-multipart` **redundancy** - 5-6 calls against a max of 3.
+Regressions by assertion: redundancy 59, citation 40, decline 37, routing 35,
+content 6. Health: 0 fixture-incomplete, 1 timeout, 3 rate-limited of 248.
 
-Notes:
+Two findings beyond the numbers. The arms are identical at 81%, so the critique
+budget changes nothing about routing or redundancy. And the loop's continuation
+path fired on real turns for the first time (6 runs at `cycles=2`); until now it
+had only been confirmed by driving `critique_agent` against a synthetic draft.
 
-- The multi-cycle path fired (2 runs at `cycles=2`), so the per-cycle split and
-  `critique_outcome` handling were exercised on real turns rather than only
-  synthetically. Two runs is thin evidence.
-- Two metric defects were found by checking suspicious numbers against stored
-  answers, and fixed before these figures were trusted: the citation check only
-  matched a literal `.pdf` filename (16 false positives per arm), and the
-  latency label compared a single-tool verdict against a single-cycle median.
-  Figures above are post-fix, recomputed from the stored records.
+## Open defects
+As of the 2026-07-29 baseline. Update this table and the date with each sweep.
 
-### 2026-07-29 - attribution fix (subset only)
-`20260729T100106Z_live_reps2_budgets0-1.json` - 16 runs, reps=2, live, 4
-questions (`web-wbg-president`, `fin-currency`, `delegate-news-topic`,
-`kb-net-income`). **A subset, not comparable like-for-like with the baseline
-above.**
-
-| arm | runs | hard pass | regressions |
-|---|---|---|---|
-| budget0 | 8 | 100% | 0 |
-| budget1 | 8 | 75% | 4 (routing + redundancy only) |
-
-Latency: budget1 `cycles=1` median 12.4s (IQR 9.1); `cycles=2` median 104.2s.
-
-What changed: web attribution was repaired at the tool boundary. Gemini's
-`google_search` grounding never puts URLs in the model's text - they arrive as
-structured `grounding_metadata`, and `AgentTool` forwards only text, so the
-research agent had never been given a URL it could cite. `"(Google Search)"` was
-the model naming the only source it could see. An `after_agent_callback` on the
-web sub-agent now appends a `Sources:` block from the grounding chunks. The
-financial half was a genuine prompt gap: `get_financial_data` already returned
-its source URL and synthesis simply never used it.
-
-Answers now carry real URLs, e.g.
-`Source: [Yahoo Finance Currencies](https://finance.yahoo.com/markets/currencies/)`.
-
-The seven `attribution-broken` known-defect markers were removed from the
-question set: the claim they encoded ("no web trace has yet produced a real
-URL") is no longer true, and a stale marker files a genuine future regression as
-already-known.
-
-**Outstanding:** the full baseline has not been re-run since this fix, so its
-citation and latency columns are stale. Routing, redundancy and decline findings
-are unaffected.
-
----
-
-## Open defects the eval currently measures
 | Defect | Evidence | Status |
 |---|---|---|
-| Answers a different question with a plausible figure | `decline-future-figure` returns FY2024 `1,485` for a FY2027 question | open, most serious |
-| Falls back to web instead of declining | `fin-coverage-gap` routing + decline 6/6 | open |
-| Public questions still hit the knowledge base | `web-ifc-parent` routing 6/6 | open, regression of a "fixed" defect |
-| Redundant searching | up to 8 KB calls, 10 web searches on single questions | open |
+| Falls back to web instead of declining, then answers from the wrong source | 6 questions; routing 35 + decline 37. `decline-fy25-commitments` returns FY24 `31,654` for an FY25 question | open, most serious - one bug behind two assertion keys |
+| Redundant searching | `kb-charges-on-borrowings` up to 10 KB calls for one figure | open |
+| KB answers carry no citation | 40 hits, incl. `kb-net-income` - the attribution fix covered web/financial, not the corpus | open, regression of a "fixed" defect |
 | Premise-refuting search storm | `web-premise-refuting`, up to 12 searches | open, known defect |
-| Decline padding | `decline-headcount-by-country` pads to 366 words | open, known defect |
-| No turn timeout in production code | eval harness bounds runs at 300s; the agent itself does not | open |
+| No turn timeout in production code | the eval harness bounds runs at 300s; the agent does not | open |
 | Loop improvement unmeasured | wasted-cycle detection is deterministic only; "did cycle N+1 improve" needs Tier 3 | not built |
+
+<details>
+<summary>Run history</summary>
+
+### 2026-07-29 - full baseline on the 31-question set
+See "Latest baseline" above. First sweep after the question-set expansion and the
+two-phase concurrent scheduler (ADR-0012); 4x the throughput per run of the
+2026-07-28 sweep. Confirmed `6346b44`'s figure-substitution fix was
+period-specific rather than general: `decline-fy25-commitments` reproduces it.
+
+### 2026-07-29 - attribution fix (subset, 16 runs)
+`20260729T100106Z_live_reps2_budgets0-1.json`, 4 questions. Not comparable
+like-for-like with a full sweep.
+
+Gemini's `google_search` grounding never puts URLs in the model's text - they
+arrive as structured `grounding_metadata`, and `AgentTool` forwards only text, so
+the research agent had never been given a URL it could cite. `"(Google Search)"`
+was the model naming the only source it could see. An `after_agent_callback` on
+the web sub-agent now appends a `Sources:` block from the grounding chunks. The
+financial half was a prompt gap: `get_financial_data` already returned its source
+URL and synthesis never used it. The seven `attribution-broken` known-defect
+markers were removed, since a stale marker files a real future regression as
+already-known.
+
+### 2026-07-28 - first baseline (126 runs, pre-attribution-fix)
+`20260728T134242Z_live_reps3_budgets0-1.json`. budget0 69% hard pass, budget1
+71%. Latency `cycles=1` median 18.1s / 20.0s. Regressions: redundancy 39, routing
+20, citation 14, decline 11, content 4.
+
+Two metric defects were found by checking suspicious numbers against stored
+answers, and fixed before these figures were trusted: the citation check only
+matched a literal `.pdf` filename (16 false positives per arm), and the latency
+label compared a single-tool verdict against a single-cycle median. Figures above
+are post-fix.
+
+</details>
