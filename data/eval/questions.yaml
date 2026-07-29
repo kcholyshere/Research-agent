@@ -239,20 +239,22 @@ questions:
       substituting the FY2024 figure as if it answered the question, which is
       the plausible-looking wrong answer here.
 
-  - id: decline-fy25-commitments
-    question: What were IFC's own-account commitments for the fiscal year ending June 30, 2025?
+  - id: decline-segment-margin
+    question: What was IFC's net profit margin on its Africa portfolio in FY24?
     expected_routes: [knowledge_base]
     tags: [kb, decline, unanswerable]
     max_tool_calls: 2
-    must_not_contain: ["31,654", "31.7"]
     expects_decline: true
     notes: >-
-      The commitments counterpart to decline-future-figure, and structurally
-      unanswerable for the same reason: the corpus is the FY24 report. Guards
-      the FY24 figure specifically ($31,654 million / $31.7 billion), which is
-      the plausible-looking substitution here. Kept after commit 6346b44
-      tightened synthesis to treat a period mismatch as a miss rather than a
-      partial answer - this question is what stops that regressing.
+      Absent by construction rather than merely by period: IFC reports the
+      portfolio by region and reports income in aggregate, but never a
+      per-region profit margin, and no public source derives one either. It
+      replaced decline-fy25-commitments, which asked for FY25 figures - FY25
+      ended in June 2025, so the answer genuinely is on the public web and the
+      question could not assert a decline without calling correct behaviour a
+      failure. The trap that remains is arithmetic: the pieces to invent a
+      margin are all in the corpus, so the tempting failure is to compute one
+      and present it as reported.
 
   - id: decline-auditor-fee
     question: What fee did IFC pay its external auditor for the audit of its FY24 financial statements?

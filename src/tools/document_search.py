@@ -6,6 +6,7 @@ plans against, so it states what the knowledge base contains and what comes
 back. Keep it in sync with the actual corpus in data/raw/.
 """
 
+import asyncio
 from functools import lru_cache
 
 from src import config
@@ -19,7 +20,20 @@ def _index():
     return faiss_store.load_index()
 
 
-def search_documents(query: str) -> list[dict]:
+def _search_blocking(query: str) -> list[dict]:
+    """The real retrieval, synchronous - always called off the event loop.
+
+    Kept as a separate function rather than inlined so the blocking work has
+    one obvious home and the async wrapper stays a wrapper. FAISS's own search
+    is fast in memory, but `similarity_search` first embeds the query, and
+    `GeminiEmbeddings.embed_query` is a synchronous HTTP call to Vertex - so
+    this blocks for a network round trip, not for a vector lookup.
+    """
+    docs = _index().similarity_search(query, k=config.TOP_K)
+    return [{"text": doc.page_content, **doc.metadata} for doc in docs]
+
+
+async def search_documents(query: str) -> list[dict]:
     """Search the private knowledge base for passages relevant to the query.
 
     The knowledge base holds one corpus: the International Finance Corporation
@@ -48,5 +62,12 @@ def search_documents(query: str) -> list[dict]:
         The most relevant passages, each with its text and source document,
         ordered most-relevant first.
     """
-    docs = _index().similarity_search(query, k=config.TOP_K)
-    return [{"text": doc.page_content, **doc.metadata} for doc in docs]
+    # Async purely so the blocking embed-then-search work leaves the event
+    # loop free. It used to run inline: ADK calls a sync tool directly rather
+    # than in an executor, so every knowledge-base lookup stalled the whole
+    # loop for its Vertex embedding round trip. That was invisible while the
+    # eval ran one turn at a time, and became a real ceiling once the sweep
+    # started running the untimed phase concurrently (ADR-0012) - four
+    # concurrent turns cannot overlap through a call that holds the loop.
+    # Nothing about the tool's contract or its return shape changes.
+    return await asyncio.to_thread(_search_blocking, query)

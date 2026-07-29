@@ -63,6 +63,7 @@ from google.adk.tools import ToolContext
 from google.genai import types
 
 from src import config
+from src.research_agent import tool_budget
 
 CRITIQUE_AGENT_NAME = "critique_agent"
 
@@ -122,6 +123,12 @@ def reset_turn_state(callback_context: CallbackContext) -> None:
     state["original_query"] = _user_query_text(callback_context)
     state["critique_iterations_used"] = 0
     state["critique_followups"] = ""
+    # research_agent's per-turn tool-call budget rides on this same hook
+    # rather than its own: this is the only callback in the system that fires
+    # once per turn instead of once per refinement cycle, and a budget that
+    # refilled each cycle would not bound a loop that re-runs the same
+    # searches - see tool_budget.py's module docstring.
+    state[tool_budget.STATE_KEY] = {}
 
 
 def _tools_used_this_cycle(callback_context: CallbackContext) -> set[str]:

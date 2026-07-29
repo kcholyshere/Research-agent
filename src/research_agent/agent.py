@@ -51,6 +51,7 @@ from src.tools.web_search import web_search_tool
 
 # Imported after instrument() (see the observability note above) - this
 # module's own import constructs critique_agent = Agent(...) at load time.
+from src.research_agent import tool_budget
 from src.research_agent.critique import critique_agent, reset_turn_state
 
 INSTRUCTION = """You are a research agent with three sources of evidence: a
@@ -152,6 +153,12 @@ research_agent = Agent(
     instruction=INSTRUCTION,
     tools=[search_documents, get_financial_data, web_search_tool],
     generate_content_config=_GENERATE_CONTENT_CONFIG,
+    # A hard per-turn ceiling on calls to each tool. The instruction above
+    # already forbids re-searching a fact it has, and the 2026-07-29 baseline
+    # measured up to 10 search_documents calls for one figure anyway - so the
+    # bound lives in code, for the same reason max_output_tokens does
+    # (ADR-0009). See tool_budget.py for the ceiling and the refusal wording.
+    before_tool_callback=tool_budget.enforce_tool_budget,
     output_key="draft_answer",
 )
 
