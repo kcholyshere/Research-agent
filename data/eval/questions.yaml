@@ -92,8 +92,6 @@ questions:
     expected_routes: [web]
     tags: [web, single_tool, redundancy_check, latency_target]
     max_tool_calls: 2
-    known_defects:
-      citation: "attribution-broken - no web trace has yet produced a real URL"
     notes: >-
       The trap is that this sounds like it belongs to the IFC corpus and does
       not. A search_documents call here is the exact redundancy defect this
@@ -104,8 +102,6 @@ questions:
     expected_routes: [web]
     tags: [web, single_tool, redundancy_check]
     max_tool_calls: 2
-    known_defects:
-      citation: "attribution-broken - no web trace has yet produced a real URL"
     notes: >-
       Stable public fact (World Bank Group, Washington DC) chosen so this
       question can carry content assertions in live mode, unlike the volatile
@@ -120,8 +116,6 @@ questions:
     tags: [web, single_tool, volatile, latency_target]
     max_tool_calls: 2
     volatile: true
-    known_defects:
-      citation: "attribution-broken - no web trace has yet produced a real URL"
     notes: >-
       Deliberately NOT routed to get_financial_data: the financial tool's three
       hardcoded Yahoo Finance URLs cover stocks, crypto and currencies, not
@@ -138,7 +132,6 @@ questions:
     volatile: true
     known_defects:
       redundancy: "premise-refuting-research-loop - ~5 searches and ~100s instead of concluding no match happened"
-      citation: "attribution-broken - no web trace has yet produced a real URL"
     notes: >-
       The known open defect, kept in the set precisely because it fails. When no
       such match happened, the agent searches about five times and burns roughly
@@ -242,8 +235,6 @@ questions:
     max_tool_calls: 3
     volatile: true
     must_contain: ["1,485"]
-    known_defects:
-      citation: "attribution-broken - no web trace has yet produced a real URL"
     notes: >-
       Genuinely requires combining sources, so both routes are expected. The
       KB half is stable and asserted; the web half is volatile, which is why
@@ -307,8 +298,6 @@ questions:
     tags: [web, volatile, phase5_candidate]
     max_tool_calls: 2
     volatile: true
-    known_defects:
-      citation: "attribution-broken - no web trace has yet produced a real URL"
     notes: >-
       News-shaped and therefore the natural first delegation case. Today the
       correct route is web, because no News Agent exists; when phase 5 lands,
@@ -322,8 +311,6 @@ questions:
     tags: [web, volatile, phase5_candidate]
     max_tool_calls: 2
     volatile: true
-    known_defects:
-      citation: "attribution-broken - no web trace has yet produced a real URL"
     notes: >-
       Second delegation case, broader than delegate-news-topic so the two
       together cover both a named-entity news query and an open topical one.

@@ -86,7 +86,17 @@ question, follow a plan-execute-synthesize flow:
    results do not contain what you need; only fall back to the other source
    if the fact's own planned source turns out not to cover it.
 3. Synthesize: answer strictly from the retrieved passages/results, citing the
-   source (document name, or URL for web results) of each fact. If sources
+   source of each fact. A citation must identify something a reader could go
+   and check, and each tool gives you one - use what it gives you rather than
+   naming the tool itself. Never write "(Google Search)", "(web search)" or
+   any other tool name as a source; that is not a citation.
+   - search_documents: cite the document name and, where the passage gives
+     one, the page.
+   - web_search_tool: its result ends with a "Sources:" list of domains and
+     URLs. Cite the URL of the source a fact came from.
+   - get_financial_data: its result includes a "source" field holding the URL
+     the figures were fetched from. Cite that URL.
+   If sources
    conflict, say so explicitly rather than silently picking one - prefer the
    private knowledge base as authoritative for anything the knowledge base
    itself covers, and note the discrepancy. If neither source contains the
