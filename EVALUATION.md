@@ -11,7 +11,7 @@ Design rationale for the pipeline itself is ADR-0011; the plan it implements is
 | Thing | Path | Tracked |
 |---|---|---|
 | Question set (31 labelled questions) | `data/eval/questions.yaml` | yes |
-| Replay fixtures | `data/eval/fixtures/` | yes |
+| Replay fixtures (all 15 volatile questions) | `data/eval/fixtures/` | yes |
 | Record schema | `src/evaluation/schema.py` | yes |
 | Runner + CLI | `src/evaluation/run_eval.py` | yes |
 | Assertions + aggregation | `src/evaluation/metrics.py` | yes |
@@ -32,7 +32,10 @@ PYTHONPATH=. python -u -m src.evaluation.run_eval --reps 4 --mode live --concurr
 # Fast smoke: filter by question id or tag
 PYTHONPATH=. python -u -m src.evaluation.run_eval --questions kb-net-income,fin-crypto --reps 1
 
-# Record fixtures, then replay deterministically (content assertions on volatile questions)
+# Record fixtures, then replay deterministically (content assertions on volatile questions).
+# Record appends rather than overwrites, so run it 2-3 times for a question whose
+# call count varies - one pass captures only that run's exact calls, and replay
+# consumes slots one per call, so a longer replay run exhausts a single-pass fixture.
 PYTHONPATH=. python -u -m src.evaluation.run_eval --mode record --questions <id>
 PYTHONPATH=. python -u -m src.evaluation.run_eval --mode replay --questions <id>
 ```
