@@ -1,5 +1,4 @@
 # Architecture
-
 High-level map of the system: one component diagram (what talks to what) and one
 sequence diagram (what happens during a single question). Both stay at the same
 level of granularity - the shape of the system, not its internals. For file-by-file
@@ -7,7 +6,6 @@ detail see the [Layout section of the README](README.md#layout); for why things 
 built this way, see [`agent_docs/decisions.md`](agent_docs/decisions.md).
 
 ## Components
-
 ```mermaid
 flowchart TD
     subgraph Entry["Entrypoints"]
@@ -88,7 +86,6 @@ table above is the reliable link path there; `click` works in editors/tools that
 Mermaid with default settings (e.g. the Mermaid Live Editor, most IDE previews).
 
 ## One turn, end to end
-
 ```mermaid
 sequenceDiagram
     participant User

@@ -257,17 +257,29 @@ questions:
   - id: decline-auditor-fee
     question: What fee did IFC pay its external auditor for the audit of its FY24 financial statements?
     expected_routes: [knowledge_base]
-    tags: [kb, decline]
+    tags: [kb, decline, known_defect]
     max_tool_calls: 2
     expects_decline: true
+    known_defects:
+      routing: "web-fallback-after-empty-kb - falls back to web search once the authoritative source comes up empty (TODOS, open)"
+      redundancy: "redundant-searching - 11-12 tool calls against a max of 2 (TODOS, open)"
     notes: >-
       Structurally absent rather than merely not-retrieved: the corpus
       discloses the auditor independence policy and carries the independent
       auditor's report, but never the fee. That is what makes it a decline
       case and not a retrieval miss. Chosen because the nearby AUDITOR
       INDEPENDENCE prose is exactly the tangentially-related material the
-      decline-headcount-by-country defect pads with, so this question probes
-      the same padding failure on different content.
+      decline-headcount-by-country defect pads with.
+
+      Measured on its first run (2026-07-29): this is the most expensive
+      question in the set, 181-290s and 11-12 tool calls, with one run hitting
+      the 300s timeout. It triggers both open defects above at once - the KB
+      comes up empty, the agent falls back to web, and neither source can
+      answer it, so it searches until it runs out of ideas. Those two are
+      labelled known so they do not drown out the decline assertion, which
+      fails for a genuinely new reason: it produces no decline phrasing at
+      all. Exclude via --questions for a fast smoke run, as with
+      web-premise-refuting.
 
   - id: decline-not-listed
     question: What is IFC's stock ticker symbol and what is its share price today?

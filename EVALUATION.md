@@ -10,20 +10,24 @@ Design rationale for the pipeline itself is ADR-0011; the plan it implements is
 ## Where things live
 | Thing | Path | Tracked |
 |---|---|---|
-| Question set (21 labelled questions) | `data/eval/questions.yaml` | yes |
+| Question set (31 labelled questions) | `data/eval/questions.yaml` | yes |
 | Replay fixtures | `data/eval/fixtures/` | yes |
 | Record schema | `src/evaluation/schema.py` | yes |
 | Runner + CLI | `src/evaluation/run_eval.py` | yes |
 | Assertions + aggregation | `src/evaluation/metrics.py` | yes |
 | Record/replay layer | `src/evaluation/replay.py` | yes |
-| Langfuse sync (opt-in, **not yet wired**) | `src/evaluation/langfuse_sync.py` | yes |
+| Langfuse sync (opt-in, `--sync-langfuse`) | `src/evaluation/langfuse_sync.py` | yes |
 | Raw run outputs | `data/processed/eval_runs/*.json` | no |
 | This record | `EVALUATION.md` | yes |
 
 ## How to reproduce
 ```bash
-# Full sweep: 21 questions x 2 arms x 3 reps = 126 runs, ~2 hours, sequential
-PYTHONPATH=. python -u -m src.evaluation.run_eval --reps 3 --mode live
+# Full sweep: 31 questions x 2 arms x 4 reps = 248 runs
+PYTHONPATH=. python -u -m src.evaluation.run_eval --reps 4 --mode live
+
+# Same, measured strictly one run at a time (slower; only needed to compare
+# untimed latency against a pre-ADR-0012 run)
+PYTHONPATH=. python -u -m src.evaluation.run_eval --reps 4 --mode live --concurrency 1
 
 # Fast smoke: filter by question id or tag
 PYTHONPATH=. python -u -m src.evaluation.run_eval --questions kb-net-income,fin-crypto --reps 1
@@ -33,9 +37,23 @@ PYTHONPATH=. python -u -m src.evaluation.run_eval --mode record --questions <id>
 PYTHONPATH=. python -u -m src.evaluation.run_eval --mode replay --questions <id>
 ```
 
-Sequential by necessity: parallel runs contend for Vertex quota and inflate the
-latency being measured. Metrics can be recomputed over a stored run file with no
-agent calls, so a metric bug does not cost another sweep.
+Since ADR-0012 the sweep runs in two phases. Every `latency_target` question
+runs first, strictly sequentially, and finishes before anything else starts -
+those are the only runs whose wall-clock is comparable across sweeps or against
+the 15s target. Everything else then runs `--concurrency` at a time (default 4)
+and is flagged `contended` in the run file, with its latency reported under a
+separate heading. Measured 2026-07-29 on an 8-run smoke set: 559.5s sequential
+against 336.5s at concurrency 4.
+
+Concurrency is live-mode only and is forced to 1 in `record`/`replay`, which
+patch shared agent objects in place. `concurrency` is recorded in each run's
+settings, so a stored run says how it was measured.
+
+**Latency from a `concurrency > 1` sweep is only comparable on the timed phase.**
+Runs before 2026-07-29 predate the flag and read as uncontended, which they were.
+
+Metrics can be recomputed over a stored run file with no agent calls, so a
+metric bug does not cost another sweep.
 
 ---
 
