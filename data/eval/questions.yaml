@@ -174,6 +174,21 @@ questions:
     max_tool_calls: 1
     volatile: true
 
+  - id: fin-multi-crypto
+    question: What are the current prices of Bitcoin and Ethereum?
+    expected_routes: [financial]
+    tags: [financial, multi_part, volatile]
+    max_tool_calls: 1
+    volatile: true
+    notes: >-
+      Two figures from one page, so max_tool_calls stays 1 - fetching the
+      crypto page twice for two rows of the same table is the redundancy defect
+      in miniature. Also the multi-part counterpart to fin-crypto: the critique
+      short-circuit keys on the tools a cycle used, not on how many parts the
+      question has (critique.py::_skip_critique_llm_call), so this must still
+      come out single-cycle. If it does not, the short-circuit is matching on
+      question shape somewhere it should not.
+
   - id: fin-coverage-gap
     question: What is the current USD to PLN exchange rate?
     expected_routes: [financial]
@@ -224,6 +239,52 @@ questions:
       substituting the FY2024 figure as if it answered the question, which is
       the plausible-looking wrong answer here.
 
+  - id: decline-fy25-commitments
+    question: What were IFC's own-account commitments for the fiscal year ending June 30, 2025?
+    expected_routes: [knowledge_base]
+    tags: [kb, decline, unanswerable]
+    max_tool_calls: 2
+    must_not_contain: ["31,654", "31.7"]
+    expects_decline: true
+    notes: >-
+      The commitments counterpart to decline-future-figure, and structurally
+      unanswerable for the same reason: the corpus is the FY24 report. Guards
+      the FY24 figure specifically ($31,654 million / $31.7 billion), which is
+      the plausible-looking substitution here. Kept after commit 6346b44
+      tightened synthesis to treat a period mismatch as a miss rather than a
+      partial answer - this question is what stops that regressing.
+
+  - id: decline-auditor-fee
+    question: What fee did IFC pay its external auditor for the audit of its FY24 financial statements?
+    expected_routes: [knowledge_base]
+    tags: [kb, decline]
+    max_tool_calls: 2
+    expects_decline: true
+    notes: >-
+      Structurally absent rather than merely not-retrieved: the corpus
+      discloses the auditor independence policy and carries the independent
+      auditor's report, but never the fee. That is what makes it a decline
+      case and not a retrieval miss. Chosen because the nearby AUDITOR
+      INDEPENDENCE prose is exactly the tangentially-related material the
+      decline-headcount-by-country defect pads with, so this question probes
+      the same padding failure on different content.
+
+  - id: decline-not-listed
+    question: What is IFC's stock ticker symbol and what is its share price today?
+    expected_routes: [web]
+    tags: [web, decline, routing_boundary]
+    max_tool_calls: 2
+    volatile: true
+    expects_decline: true
+    notes: >-
+      A category error, not a missing fact - IFC is not publicly listed, so no
+      ticker or share price exists to find. The assertion that matters is the
+      routing boundary: get_financial_data covers stocks, so this is the
+      question most likely to pull a call into it, and doing so would mean the
+      agent went looking for a price before establishing there is one. Web is
+      the expected route because confirming a non-listing is a public-knowledge
+      lookup; the knowledge base has no bearing on it either.
+
   # --- Multi-source: genuinely needs two sources ---------------------------
   # The counterpart to the redundancy checks. Here two tools are correct, and
   # consulting only one is the failure.
@@ -256,6 +317,47 @@ questions:
       the cycle used more than get_financial_data, so a critique call is
       legitimate.
 
+  - id: multi-web-and-financial
+    question: What is the current price of Bitcoin, and what has the European Central Bank most recently said about regulating crypto assets?
+    expected_routes: [financial, web]
+    tags: [multi_source, volatile]
+    max_tool_calls: 3
+    volatile: true
+    notes: >-
+      The only question in the set that pairs two sources with the knowledge
+      base correctly left out, so it is the sole assertion that a multi-source
+      question does not drag search_documents in by reflex. It also splits the
+      "financial-sounding" boundary down the middle: the price belongs to
+      get_financial_data and the policy statement does not, in one question.
+
+  - id: multi-all-three
+    question: What was IFC's net income in FY24, what is the current EUR to USD exchange rate, and who is the current President of the World Bank Group?
+    expected_routes: [knowledge_base, web, financial]
+    tags: [multi_source, volatile]
+    max_tool_calls: 4
+    volatile: true
+    must_contain: ["1,485"]
+    notes: >-
+      Artificial as a user question, but it is the only case that exercises all
+      three routes in one turn, which is where under-research is most likely -
+      three sources is the point at which dropping one becomes cheap for the
+      planner. max_tool_calls is 4, allowing one reformulation on top of the
+      three required calls and no more.
+
+  - id: multi-kb-and-web-context
+    question: How much did IFC disburse for its own account in FY24, and how does that compare with the World Bank Group's recently announced lending capacity?
+    expected_routes: [knowledge_base, web]
+    tags: [multi_source, volatile, comparison]
+    max_tool_calls: 3
+    volatile: true
+    must_contain: ["19.1"]
+    notes: >-
+      The comparison-shaped counterpart to multi-kb-and-web, which asks for two
+      facts side by side. Here the second half is only meaningful relative to
+      the first, so an answer that reports both figures without relating them
+      is the failure this question exists to expose. KB ground truth: $19.1
+      billion disbursed for own account in FY24.
+
   # --- Critique loop behaviour --------------------------------------------
   # Aimed at the phase 4 loop rather than at routing. Run these with arms at
   # critique_budget 0 and 1 - budget 0 reproduces the pre-phase-4 single-cycle
@@ -287,6 +389,55 @@ questions:
       primary probe for the failure mode the plan calls out first - a loop that
       burns cycles restating the same answer. Compare cycle count across the
       budget 0 and budget 1 arms; they should match.
+
+  - id: loop-multipart-mixed
+    question: What were IFC's total assets as of June 30, 2023, what was the carrying value of its total investment portfolio at June 30, 2024, and how many Long-Term Finance projects did its Own Account investments support in FY24?
+    expected_routes: [knowledge_base]
+    tags: [kb, multi_part, critique_loop]
+    max_tool_calls: 3
+    must_contain: ["110,547", "58,747", "365"]
+    notes: >-
+      loop-multipart's three facts sit close together in the report; these three
+      are drawn from the balance sheet, the investment portfolio table and the
+      commitments section respectively. That matters because a single retrieval
+      can plausibly cover three neighbouring facts in one pass, which lets a
+      genuine continuation go untested - spreading them forces either more
+      retrieval or a real second cycle. Ground truth: $110,547m, $58,747m, 365
+      projects. Charges on borrowings was the obvious third fact and was
+      deliberately rejected: $2,598m does not retrieve reliably (the measured
+      table-retrieval weakness kb-charges-on-borrowings exists to expose), so
+      including it here would fail this question for a retrieval reason and
+      contaminate what is meant to be a critique-loop probe.
+
+  - id: loop-comparison
+    question: How did IFC's own-account commitments and its own-account disbursements change from FY23 to FY24?
+    expected_routes: [knowledge_base]
+    tags: [kb, multi_part, critique_loop, comparison]
+    max_tool_calls: 3
+    must_contain: ["31,654", "27,704", "19.1", "18.7"]
+    notes: >-
+      Four figures, but the hard part is that the question is answerable in
+      halves - a draft covering commitments alone looks complete in isolation.
+      That is the critique agent's hardest legitimate continuation case, since
+      its stated grounds to continue are a named sub-question the draft does not
+      address at all, and a half-answer is precisely where that judgement is
+      easiest to get wrong in either direction. Ground truth: commitments
+      $27,704m to $31,654m, disbursements $18.7bn to $19.1bn.
+
+  - id: loop-definitional-single
+    question: Which two quantities is IFC's Capital Utilization Ratio calculated from?
+    expected_routes: [knowledge_base]
+    tags: [kb, single_tool, critique_loop, wasted_cycle_check]
+    max_tool_calls: 2
+    must_contain: ["Capital Required", "Capital Available"]
+    notes: >-
+      The second wasted-cycle probe, and deliberately prose rather than numeric.
+      loop-single-fact's answer is a date, so two drafts of it are near-identical
+      strings and difflib scores them trivially similar; a definitional answer can
+      be restated many ways while adding nothing, which is the case
+      check_wasted_cycle's 0.95 similarity threshold is actually at risk of
+      missing. Fully answerable in one cycle, so cycle count should match across
+      the budget 0 and budget 1 arms.
 
   # --- Phase 5 forward compatibility --------------------------------------
   # Delegation cases, present from the outset as the plan requires so that
