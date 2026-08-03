@@ -538,9 +538,20 @@ questions:
     max_tool_calls: 2
     expects_artefact: true
     artefact_format: code
-    artefact_must_contain: ["1,485"]
+    artefact_must_contain: ["1485"]
     expects_citation: false
     notes: >-
+      artefact_must_contain is "1485" and NOT "1,485", which is the whole point
+      of this entry keeping its own note. The first version pinned the
+      comma-formatted figure and failed on the first real run against a
+      perfectly correct artefact: the agent emitted
+      `net_income_usd_millions: int = 1485`, because a Python integer literal
+      cannot carry a thousands separator - `1,485` in source is a tuple. The
+      check was measuring prose house style in a file where that style is a
+      syntax error. Same instrument-defect family as the 80-word decline
+      threshold and the citation marker test, found the same way, by reading
+      the stored output instead of trusting the count.
+
       Covers the second output format and the one with an extra required
       argument - "code" is the only format for which Canvas rejects the call
       outright when `language` is missing, so this is also the case that
