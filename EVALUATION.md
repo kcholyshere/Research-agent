@@ -115,3 +115,106 @@ label compared a single-tool verdict against a single-cycle median. Figures abov
 are post-fix.
 
 </details>
+## 2026-08-03 - post-phase-5/6 sweep (140 runs, budget 0 only)
+First sweep with the phase 5 News Agent and the phase 6 Canvas tool in place.
+35 questions x 1 arm x 4 reps, live, concurrency 4, 0 timeouts and 0 errors.
+Single arm by choice: the budget-0 vs budget-1 comparison was the agreed first
+thing to cut for time, and budget 0 is directly comparable to the budget-0 half
+of the four earlier sweeps.
+
+| assertion | failing | checked | pass |
+|---|---|---|---|
+| routing | 13 | 140 | 91% |
+| redundancy | 47 | 140 | 66% |
+| citation | 3 | 136 | 98% |
+| decline | 8 | 20 | 60% |
+| content | 4 | 52 | 92% |
+| artefact | 4 | 12 | 67% |
+| total | 79 | 500 | 84% |
+
+Hard pass rate (routing plus redundancy) 79%.
+
+### What landed
+Phase 5 routing works: both delegation questions go to `get_latest_news` with
+one call each, and routing improved to 91% - the best it has measured on this
+project.
+
+The over-triggering guard fired **zero times across all 140 runs**. That is the
+result worth keeping from this sweep: `check_artefact` scores "no artefact was
+produced" on every question that did not ask for one, and no non-artefact
+question produced a document. The gate on the synthesise step holds, so phase 6
+did not leak into the prose path.
+
+`canvas-not-requested` also spent exactly the same three `search_documents`
+calls as `kb-net-income`, which is the control confirming a deliverable request
+does not increase search volume.
+
+### One real new defect: HTML artefacts never get rendered
+`canvas-html-multi-source` failed `artefact` 4 of 4 and `citation` 3 of 4.
+Routing was correct every time (knowledge base plus financial), so the research
+worked; the finalise step simply did not fire. The model writes the HTML inline
+in its reply instead of calling `create_canvas`, and the stored answers show it
+reasoning about whether to - one begins "Wait, can we use CSS inside the
+`create_canvas` tool for HTML?", another "Wait, let's complete the HTML tags and
+avoid cutting off".
+
+Two things to fix, and they are separable:
+- Step 4 of the planner instruction is permissive about HTML in a way it is not
+  about markdown or code, and the model reads authoring markup as its own job.
+  Markdown and code artefacts rendered fine, so this is specific to the format
+  the model believes it can write itself.
+- Chain-of-thought is leaking into the answer text on this question. That is not
+  a Canvas defect and would be worth a look on its own.
+
+### Redundancy is unchanged, as expected
+66% pass, and the failures are the same questions as every previous sweep
+(`kb-charges-on-borrowings` at 5 calls, `decline-segment-margin` at 6,
+`web-premise-refuting` at 6). ADR-0015 predicted exactly this: a ceiling bounds
+the worst case and cannot produce efficiency. The three Canvas questions fail
+redundancy for the same reason the rest of the knowledge-base set does, not for
+anything phase 6 introduced - the control above is what establishes that.
+
+### Note on comparing against earlier runs
+Re-scoring the 2026-08-03 09:20 sweep with today's question set now shows
+routing at 80% rather than 87%, because the two delegation questions expect
+`[news_agent]` and that run predates the tool. That is a label change, not a
+regression - a pre-phase-5 run cannot satisfy a post-phase-5 label. Compare
+those two questions only within their own era.
+### 2026-08-03, later: the HTML artefact defect, fixed and re-measured
+The defect above was reproduced first rather than patched from the summary, and
+the mode was not "forgot to call the tool" but "did the tool's job itself". Of
+four pre-fix runs, three hand-wrote a styled page into the answer - their own CSS
+classes, `<div class="card">`, a `<style>` block - and one narrated a review of
+its own stylesheet ("there is a minor bug in the CSS of Section 4, `</>` instead
+of `</style>`"). Routing was correct on all four, so nothing failed but the
+artefact assertion. The answers were also truncated mid-markup, because authoring
+a whole HTML document runs into `max_output_tokens`.
+
+The cause was ambiguous wording, not model waywardness. The tool described
+`output_format: "html"` as "a styled standalone page", which reads as *you supply
+one* rather than *this tool produces one*, and the planner instruction repeated
+the phrasing. On that reading, hand-writing the markup is the obedient
+interpretation. The fix removes the ambiguity rather than adding a fourth
+prohibition to an instruction that already carried three.
+
+| | artefact produced |
+|---|---|
+| before the fix | 1 of 4 runs |
+| after the fix | 5 of 5 completed runs |
+
+Every post-fix run called `create_canvas` exactly once and returned a 4.6-5.3 KB
+HTML artefact with a short covering note, which is the intended shape. Two reps
+across those batches died on OAuth transport errors from a tethered connection
+and are excluded as environment rather than code.
+
+The chain-of-thought leakage noted as a separate defect turned out to be the same
+one. It appears only in the pre-fix run, where the model was reviewing its own
+CSS; all five post-fix answers are clean of it. It was a symptom of the model
+doing Canvas's job, not an independent defect, and needed no separate fix.
+
+`check_artefact` now also fails any answer containing raw block-level or styling
+markup, on every question rather than only artefact ones - writing a document into
+the reply is a defect regardless of what was asked. Inline emphasis tags are
+excluded deliberately, since they appear in quoted source text and would accuse
+correct answers. Calibrated against the 248 stored answers from the 09:20 sweep:
+zero false positives.

@@ -96,6 +96,27 @@ from google.adk.tools.tool_context import ToolContext
 # see ADR-0015.
 MAX_TOOL_CALLS_PER_TURN = 5
 
+# Tools that produce output rather than gather evidence, and are therefore
+# neither counted against the ceiling nor refusable by it.
+#
+# create_canvas (phase 6) is terminal: it contributes no fact, nothing is
+# planned after it, and it runs precisely once at the end of a turn that was
+# asked for a deliverable. Counting it would be wrong twice over. It would
+# consume a slot that exists to bound *searching*, and - the failure that
+# actually matters - a report turn plausibly spends KB search, one
+# reformulation, and a web search before it renders anything, which puts
+# create_canvas at or past the ceiling. Refusing it would mean the artefact
+# silently does not exist while the turn still returns a perfectly ordinary
+# prose answer. That is invisible from the outside: no error, no missing
+# response, just a deliverable that quietly became a paragraph.
+#
+# Deliberately a name-keyed set rather than a flag on the tool object: ADK's
+# auto-wrapped function tools carry no field this project controls, and
+# matching on the name is what `src/evaluation/schema.py` already does for
+# CONTROL_TOOLS and OUTPUT_TOOLS. The two lists must agree - if a fourth
+# evidence tool or a second output tool is added, both change together.
+OUTPUT_TOOLS: frozenset[str] = frozenset({"create_canvas"})
+
 # Session-state key holding {tool_name: calls_so_far} for the current turn.
 # Reset by critique.reset_turn_state, which is the LoopAgent's own
 # before_agent_callback and therefore the one hook in this system that fires
@@ -112,10 +133,12 @@ def _refusal(used: int, breakdown: dict[str, int]) -> dict[str, Any]:
         "error": "tool_call_budget_exhausted",
         "detail": (
             f"You have used all {used} evidence-gathering tool calls available for this "
-            f"turn ({spent}). No tool of any kind can be called again for this question - "
-            "not this one, not a different one. Answer now from what you have already "
-            "retrieved. If it does not contain what was asked for, say so plainly and name "
-            "the source you checked."
+            f"turn ({spent}). No further evidence-gathering tool can be called for this "
+            "question - not this one, not a different one. Answer now from what you have "
+            "already retrieved. If it does not contain what was asked for, say so plainly "
+            "and name the source you checked. If this question asked for a report, "
+            "document or code file, you may still call create_canvas to produce it - that "
+            "formats what you have and gathers nothing new."
         ),
     }
 
@@ -123,10 +146,15 @@ def _refusal(used: int, breakdown: dict[str, int]) -> dict[str, Any]:
 def enforce_tool_budget(
     tool: BaseTool, args: dict[str, Any], tool_context: ToolContext
 ) -> dict[str, Any] | None:
-    """Count this turn's tool calls in total; refuse every tool past the ceiling.
+    """Count this turn's evidence calls in total; refuse every tool past the ceiling.
 
     Returning None lets the real tool run, which is the path every
     well-behaved turn takes. Returning a dict short-circuits the call.
+
+    Tools in OUTPUT_TOOLS are exempt on both counts - they neither increment
+    the counter nor can be refused by it, because they produce rather than
+    retrieve and a spent search budget has no bearing on rendering what was
+    already found.
 
     The per-tool breakdown is still recorded, because it is the useful thing
     to see in a trace and in the refusal text - but it is the TOTAL that is
@@ -139,6 +167,12 @@ def enforce_tool_budget(
     mutating the nested dict returned by `state.get(...)` would not always be
     recorded as a change.
     """
+    # Output tools bypass the ceiling entirely - not counted, never refused.
+    # Checked before the counter is even read, so a spent budget cannot block
+    # the artefact that the turn was asked for (see OUTPUT_TOOLS above).
+    if tool.name in OUTPUT_TOOLS:
+        return None
+
     counts = dict(tool_context.state.get(STATE_KEY) or {})
     used = sum(counts.values())
     if used >= MAX_TOOL_CALLS_PER_TURN:

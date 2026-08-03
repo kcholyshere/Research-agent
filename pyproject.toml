@@ -4,7 +4,12 @@ version = "0.1.0"
 description = "Autonomous research agent (Plan-Execute-Synthesize RAG over ADK), Grid University practice series"
 requires-python = ">=3.13"
 dependencies = [
-    "google-adk>=2.5.0,<3",
+    # The [a2a] extra pulls a2a-sdk, which the phase 5 A2A delegation needs
+    # (ADR-0017 revision). ADK ships google.adk.a2a in the base package but
+    # every entry point behind it raises missing_extra until a2a-sdk is present,
+    # so the extra is not optional for this project - it is the phase 5
+    # requirement.
+    "google-adk[a2a]>=2.5.0,<3",
     "google-genai>=2.10.0,<3",
     "python-dotenv>=1.2.2,<2",
     "faiss-cpu>=1.14.3,<2",
@@ -23,4 +28,14 @@ dependencies = [
     # the evaluation question set is a YAML deliverable, so a future adk
     # release dropping pyyaml would break the eval rather than just the build.
     "pyyaml>=6.0.3,<7",
+    # Same reasoning, same precedent - phase 5's News Agent service
+    # (src/news_service/server.py) and its client tool
+    # (src/tools/news_agent.py) are both on the shipped agent path, not just
+    # test/build tooling, but fastapi/uvicorn/httpx were previously only
+    # transitive dependencies of google-adk. A future adk release dropping
+    # any of them would silently break the A2A demo rather than the build,
+    # the same failure mode pyyaml's comment above already flags.
+    "fastapi>=0.139.2,<1",
+    "uvicorn>=0.51.0,<1",
+    "httpx>=0.28.1,<1",
 ]

@@ -68,6 +68,19 @@ from src.services import genai_client
 
 CRITIQUE_AGENT_NAME = "critique_agent"
 
+# Session-state key holding the artefact create_canvas rendered this cycle, so
+# the critique reviews the deliverable rather than the covering note that
+# accompanies it. Written by agent.py's after_tool_callback, read by this
+# module's INSTRUCTION via {last_artefact?}, cleared per turn by
+# reset_turn_state below.
+#
+# It lives in state rather than being passed through draft_answer because
+# draft_answer is research_agent's output_key - ADK owns what goes in it, and
+# an artefact turn's draft is legitimately a short note. Overwriting it would
+# also corrupt what the evaluation stores as the cycle's draft, which is the
+# input to check_wasted_cycle's similarity comparison.
+LAST_ARTEFACT_KEY = "last_artefact"
+
 
 def exit_loop(tool_context: ToolContext) -> dict:
     """End the research loop for this turn.
@@ -124,6 +137,12 @@ def reset_turn_state(callback_context: CallbackContext) -> None:
     state["original_query"] = _user_query_text(callback_context)
     state["critique_iterations_used"] = 0
     state["critique_followups"] = ""
+    # Cleared per turn like everything else here. Without this a session that
+    # asked for a report and then asked an ordinary question would show the
+    # previous turn's artefact to the critique, which would judge a plain
+    # answer against a stale document - the same cross-turn leak this whole
+    # callback exists to prevent.
+    state[LAST_ARTEFACT_KEY] = ""
     # research_agent's per-turn tool-call budget rides on this same hook
     # rather than its own: this is the only callback in the system that fires
     # once per turn instead of once per refinement cycle, and a budget that
@@ -217,6 +236,17 @@ Original question:
 
 Draft answer (with its citations):
 {draft_answer}
+
+Artefact this cycle produced, if any (empty for most turns):
+{last_artefact?}
+
+If the artefact above is non-empty, the turn was asked for a deliverable and
+THAT is the answer under review - the draft above it is only a covering note,
+so judge completeness and citation against the artefact and not against the
+note. An artefact that answers the question is complete even if the note
+mentions almost nothing. Never raise a follow-up asking for something the
+artefact already contains, and never ask for the artefact to be reformatted,
+restructured, or restyled: form is not a gap.
 
 Your only job is to decide whether a SPECIFIC part of the original question
 above remains unanswered by the draft, or whether the draft states a claim

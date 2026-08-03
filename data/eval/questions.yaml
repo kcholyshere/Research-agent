@@ -258,30 +258,35 @@ questions:
 
   - id: decline-auditor-fee
     question: What fee did IFC pay its external auditor for the audit of its FY24 financial statements?
-    expected_routes: [knowledge_base]
-    tags: [kb, decline, known_defect]
-    max_tool_calls: 2
-    expects_decline: true
-    known_defects:
-      routing: "web-fallback-after-empty-kb - falls back to web search once the authoritative source comes up empty (TODOS, open)"
-      redundancy: "redundant-searching - 11-12 tool calls against a max of 2 (TODOS, open)"
+    expected_routes: [knowledge_base, web]
+    tags: [kb, web, multi_source]
+    max_tool_calls: 3
+    expects_decline: false
+    must_contain: ["3.3"]
     notes: >-
-      Structurally absent rather than merely not-retrieved: the corpus
-      discloses the auditor independence policy and carries the independent
-      auditor's report, but never the fee. That is what makes it a decline
-      case and not a retrieval miss. Chosen because the nearby AUDITOR
-      INDEPENDENCE prose is exactly the tangentially-related material the
-      decline-headcount-by-country defect pads with.
+      RELABELLED 2026-08-03. This was a decline case and the label was wrong -
+      the fee is absent from the corpus but IS publicly disclosed, so the
+      correct behaviour is exactly what the agent does: find the corpus empty,
+      go to the web, and answer with attribution. Verified against the primary
+      source, IFC's FY2024 Annual Information Statement as filed with the SEC:
+      $3.3m audit services, $0.3m audit-related, $0.8m non-audit. The agent
+      produced $3.3m/$0.3m in 5 of 8 runs on the 2026-08-03 sweep.
 
-      Measured on its first run (2026-07-29): this is the most expensive
-      question in the set, 181-290s and 11-12 tool calls, with one run hitting
-      the 300s timeout. It triggers both open defects above at once - the KB
-      comes up empty, the agent falls back to web, and neither source can
-      answer it, so it searches until it runs out of ideas. Those two are
-      labelled known so they do not drown out the decline assertion, which
-      fails for a genuinely new reason: it produces no decline phrasing at
-      all. Exclude via --questions for a fast smoke run, as with
-      web-premise-refuting.
+      The original label asserted "neither source can answer it" and hung two
+      known_defects off that premise - a routing failure for the web fallback
+      and a redundancy failure for the search volume. The web fallback is
+      correct here, so `expected_routes` now carries both routes and the
+      routing known_defect is gone. This is the fifth instrument defect on this
+      project and the first that was a wrong ground-truth label rather than a
+      wrong check: for four sweeps the agent was scored as failing three
+      assertions on this question while answering it correctly.
+
+      `max_tool_calls: 3` because two sources legitimately need two calls and
+      the corpus reformulation after an empty first search is reasonable. The
+      search volume is still worth watching - 6 calls on every run of the
+      2026-08-03 sweep, so redundancy fails and now does so as a real
+      regression rather than a labelled one. That is the intended reading: the
+      volume is a genuine defect, the web fallback never was.
 
   - id: decline-not-listed
     question: What is IFC's stock ticker symbol and what is its share price today?
@@ -459,24 +464,142 @@ questions:
 
   - id: delegate-news-topic
     question: What is the latest news about the International Finance Corporation?
-    expected_routes: [web]
-    tags: [web, volatile, phase5_candidate]
+    expected_routes: [news_agent]
+    tags: [news_agent, volatile, delegation]
     max_tool_calls: 2
     volatile: true
     notes: >-
-      News-shaped and therefore the natural first delegation case. Today the
-      correct route is web, because no News Agent exists; when phase 5 lands,
-      expected_routes flips to [news_agent] and this question becomes the
-      routing assertion for that delegation. Recorded now rather than later so
-      the pre-delegation baseline is measured rather than reconstructed.
+      News-shaped and therefore the natural first delegation case. Flipped from
+      [web] to [news_agent] on 2026-08-03 when phase 5 landed, exactly as this
+      entry said it would - the pre-delegation baseline was measured on the web
+      route across four sweeps rather than reconstructed afterwards, which is
+      the whole reason it was written before the tool existed.
+
+      The assertion now has teeth in both directions: the News Agent is a
+      separate process, so a turn that answers this from web_search_tool
+      instead is the failure mode to catch. That is not hypothetical - the
+      planner instruction previously enumerated three sources by name, so
+      before its routing clause was updated a news question would have gone to
+      the web and answered perfectly adequately, making the misroute invisible
+      in the output and visible only here.
 
   - id: delegate-news-general
     question: What are the main headlines in development finance this week?
-    expected_routes: [web]
-    tags: [web, volatile, phase5_candidate]
+    expected_routes: [news_agent]
+    tags: [news_agent, volatile, delegation]
     max_tool_calls: 2
     volatile: true
     notes: >-
       Second delegation case, broader than delegate-news-topic so the two
       together cover both a named-entity news query and an open topical one.
-      Same phase 5 flip applies.
+      Flipped to [news_agent] with it on 2026-08-03.
+
+  # --- Canvas / artefact cases (phase 6) -----------------------------------
+  # These assert the OUTPUT shape, not the research. Facts still come from the
+  # same three evidence sources, and the routing/redundancy bounds below are
+  # deliberately identical to what the same question would carry without a
+  # deliverable attached - phase 6 must not change how much the agent searches,
+  # only what it does with what it found. create_canvas is excluded from the
+  # tool count (schema.OUTPUT_TOOLS), so max_tool_calls means the same thing
+  # here as everywhere else.
+  #
+  # The negative case is canvas-not-requested, and it is the important one: the
+  # over-triggering guard. Note that check_artefact scores that direction on
+  # EVERY question in this file, not only that one, so all 31 pre-phase-6
+  # entries now also assert "no artefact was produced".
+
+  - id: canvas-kb-report
+    question: Write me a short markdown report on IFC's FY24 net income and total assets, with one section for each.
+    expected_routes: [knowledge_base]
+    tags: [kb, canvas, artefact]
+    max_tool_calls: 2
+    expects_artefact: true
+    artefact_format: markdown
+    artefact_must_contain: ["1,485"]
+    notes: >-
+      The base artefact case: one source, two facts, an explicitly requested
+      format and an explicitly requested structure. artefact_must_contain pins
+      the net income figure inside the DOCUMENT rather than in the answer,
+      which is the assertion that matters - the agent can research correctly,
+      say the right thing in its covering note, and still hand Canvas a hollow
+      document. must_contain would not catch that.
+
+      max_tool_calls stays at 2, the same bound kb-net-income carries for the
+      same figures, because asking for a report is not a licence to search more
+      widely. Measured on the first real turn (2026-08-03): the agent spent 6
+      search_documents calls on it, so this fails redundancy today for the same
+      reason kb-charges-on-borrowings does. That is the existing redundancy
+      defect showing up on a new question, not a Canvas defect.
+
+  - id: canvas-code-artefact
+    question: Generate a Python code file that defines a dataclass holding IFC's FY24 net income and total assets, with the figures filled in from the knowledge base.
+    expected_routes: [knowledge_base]
+    tags: [kb, canvas, artefact]
+    max_tool_calls: 2
+    expects_artefact: true
+    artefact_format: code
+    artefact_must_contain: ["1485"]
+    expects_citation: false
+    notes: >-
+      artefact_must_contain is "1485" and NOT "1,485", which is the whole point
+      of this entry keeping its own note. The first version pinned the
+      comma-formatted figure and failed on the first real run against a
+      perfectly correct artefact: the agent emitted
+      `net_income_usd_millions: int = 1485`, because a Python integer literal
+      cannot carry a thousands separator - `1,485` in source is a tuple. The
+      check was measuring prose house style in a file where that style is a
+      syntax error. Same instrument-defect family as the 80-word decline
+      threshold and the citation marker test, found the same way, by reading
+      the stored output instead of trusting the count.
+
+      Covers the second output format and the one with an extra required
+      argument - "code" is the only format for which Canvas rejects the call
+      outright when `language` is missing, so this is also the case that
+      exercises the validation-error-then-retry path in step 4 of the planner
+      instruction.
+
+      expects_citation is false, and deliberately so rather than by oversight:
+      a source file cites in comments, and the citation check looks for URLs or
+      document-and-page references in prose. Asserting it here would be the
+      same instrument mistake as the 80-word decline threshold - holding output
+      to a rule calibrated on a different shape of output.
+
+  - id: canvas-html-multi-source
+    question: Produce an HTML briefing page comparing IFC's FY24 net income from the annual report with the current price of Bitcoin.
+    expected_routes: [knowledge_base, financial]
+    tags: [kb, financial, canvas, artefact, multi_source]
+    max_tool_calls: 3
+    volatile: true
+    expects_artefact: true
+    artefact_format: html
+    notes: >-
+      The third format, and the case that checks Canvas does not disturb
+      multi-source routing: the deliverable needs one fact from the knowledge
+      base and one from live market data, so it asserts that adding an output
+      step leaves the planner's source selection alone.
+
+      volatile because the Bitcoin price moves, so no content assertion is
+      pinned - routing, format and the artefact existing are what this scores.
+      artefact_must_contain is deliberately empty for the same reason: pinning
+      a figure that changes hourly is what replay fixtures exist for, and this
+      question earns its keep on structure rather than content.
+
+  - id: canvas-not-requested
+    question: What was IFC's net income in FY24?
+    expected_routes: [knowledge_base]
+    tags: [kb, canvas, negative]
+    max_tool_calls: 2
+    must_contain: ["1,485"]
+    notes: >-
+      The over-triggering guard, and the most valuable of the four. A plain
+      factual question that must be answered in prose - producing an artefact
+      here is a failure, because the user who asked a question would have been
+      handed a file. expects_artefact is left false, which is what makes
+      check_artefact score it in the negative direction.
+
+      It duplicates kb-net-income's question on purpose. That is not
+      redundancy in the dataset: the pair is the control, so if the phase 6
+      instruction starts reading ordinary questions as document requests, the
+      two entries diverge and say so. Keeping it as its own id rather than
+      adding the assertion to kb-net-income keeps the phase 6 guard visible as
+      a phase 6 guard.

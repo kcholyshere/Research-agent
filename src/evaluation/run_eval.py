@@ -196,6 +196,41 @@ def _split_into_cycles(events: list) -> list[CycleRecord]:
                 current = CycleRecord(index=len(cycles))
                 exit_seen = False
             current.tools_called.extend(call.name for call in event.get_function_calls())
+
+            # Capture the phase 6 artefact from create_canvas's function
+            # RESPONSE, not from the agent's prose. On an artefact turn the
+            # answer is a short covering note by design (agent.py's step 4
+            # says so), and the deliverable is the thing the assertions care
+            # about - so an artefact read out of the answer text would be
+            # whatever the model chose to paste, not what it actually
+            # rendered.
+            #
+            # Verified against a real turn on google-adk 2.5.0 rather than
+            # assumed: the function-response event for a tool called by
+            # research_agent is itself authored by research_agent (so it lands
+            # in this branch), and `response` is the tool's returned dict with
+            # "artefact", "format" and "path" intact - a 4,287-character
+            # artefact arrived whole, not truncated or stringified.
+            #
+            # Last write wins within a cycle. A cycle that rendered twice
+            # after a validation error should record what it ended up with,
+            # and cross-cycle re-renders stay visible because each cycle keeps
+            # its own record (see CycleRecord.artefact).
+            for response in event.get_function_responses():
+                if response.name != "create_canvas":
+                    continue
+                payload = response.response
+                if not isinstance(payload, dict) or payload.get("status") != "ok":
+                    # An error return is a real outcome, not an artefact: the
+                    # `artefact` assertion should see "nothing was produced"
+                    # so a validation failure the agent never recovered from
+                    # reads as a failure rather than as an absent field.
+                    continue
+                current.artefact = payload.get("artefact", "")
+                current.artefact_format = payload.get("format", "")
+                current.artefact_language = payload.get("language", "")
+                current.artefact_path = payload.get("path", "")
+
             if event.content is not None and event.is_final_response():
                 text = _event_text(event)
                 if text:
