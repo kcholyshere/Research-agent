@@ -1,7 +1,8 @@
-"""The core research agent: a Plan-Execute-Synthesize flow over three tools -
-the private-knowledge-base Document Search Tool (phase 1), the Financial Data
-Tool (phase 3), and the public-internet Web Search Tool (phase 2) - wrapped
-in a phase 4 critique/refinement loop.
+"""The core research agent: a Plan-Execute-Synthesize flow over four evidence
+tools - the private-knowledge-base Document Search Tool (phase 1), the
+public-internet Web Search Tool (phase 2), the Financial Data Tool (phase 3),
+and the A2A News Agent delegation (phase 5) - plus the phase 6 Canvas output
+tool, all wrapped in a phase 4 critique/refinement loop.
 
 ADK conventions: this module exposes `root_agent`, which `adk run src/research_agent`
 and `adk web src` discover by name. That symbol is now the `LoopAgent`
@@ -53,7 +54,7 @@ from src.services import genai_client
 from src.tools.canvas import create_canvas
 from src.tools.document_search import search_documents
 from src.tools.financial_data import get_financial_data
-from src.tools.news_agent import get_latest_news
+from src.tools.news_agent import news_agent_tool
 from src.tools.web_search import web_search_tool
 
 # Imported after instrument() (see the observability note above) - this
@@ -101,7 +102,8 @@ def _record_artefact(
 INSTRUCTION = """You are a research agent with four sources of evidence: a
 private knowledge base (search_documents), live financial market data
 (get_financial_data), the latest news on a topic from an independent News Agent
-you delegate to (get_latest_news), and the public internet (web_search_tool).
+you delegate to over A2A (news_agent), and the public internet
+(web_search_tool).
 You also have one output tool, create_canvas, which is not a source and gathers
 nothing - it renders research you have already done into a finished artefact.
 For every question, follow a plan-execute-synthesize flow:
@@ -118,10 +120,10 @@ For every question, follow a plan-execute-synthesize flow:
    the private knowledge base's own documents; get_financial_data for current
    prices or movements of stocks, cryptocurrencies, or currency exchange
    rates (never use web_search_tool for those - the financial tool's
-   predefined sources are the authority on them); get_latest_news when the
+   predefined sources are the authority on them); news_agent when the
    question asks for the latest or recent news, headlines, or current
-   developments on a topic, which is delegated to a dedicated News Agent and
-   must not go to web_search_tool instead; web_search_tool for anything else
+   developments on a topic - that is delegated to a separate News Agent running
+   as its own service, and must not go to web_search_tool instead; web_search_tool for anything else
    public, current, or outside those documents. A question asking for a
    specific public fact is not a news request even when the fact is recent -
    news means "what is being reported about this topic now", not "look this
@@ -136,7 +138,7 @@ For every question, follow a plan-execute-synthesize flow:
    a template, anything phrased as "write me...", "produce...", "draft...",
    "generate a ... file". Those end with a create_canvas call. This changes
    nothing about which sources you consult or how many calls you make: the
-   facts still come from the three evidence tools, and create_canvas only
+   facts still come from the four evidence tools, and create_canvas only
    formats what you have gathered. A deliverable request is not a licence to
    search more widely than the question needs.
 2. Execute: call only the tool(s) you planned for each fact, once each. If a
@@ -165,11 +167,12 @@ For every question, follow a plan-execute-synthesize flow:
      URLs. Cite the URL of the source a fact came from.
    - get_financial_data: its result includes a "source" field holding the URL
      the figures were fetched from. Cite that URL.
-   - get_latest_news: its result ends with a "Sources:" list in the same shape
-     web_search_tool's does. Cite the URL of the source each item came from,
-     never the News Agent or the tool as the source. If it returns an "error"
-     instead, say plainly that the News Agent could not be reached and do not
-     answer the news part from your own knowledge or substitute a web search.
+   - news_agent: its answer carries the source URLs for the items it reports.
+     Cite the URL each fact came from, never the News Agent or the tool itself
+     as the source. If the delegation fails or comes back empty, say plainly
+     that the News Agent could not be reached and do not answer the news part
+     from your own knowledge or substitute a web search - an unreachable
+     specialist is a gap to report, not a reason to guess.
    If sources
    conflict, say so explicitly rather than silently picking one - prefer the
    private knowledge base as authoritative for anything the knowledge base
@@ -260,7 +263,7 @@ research_agent = Agent(
         search_documents,
         get_financial_data,
         web_search_tool,
-        get_latest_news,
+        news_agent_tool,
         create_canvas,
     ],
     generate_content_config=_GENERATE_CONTENT_CONFIG,

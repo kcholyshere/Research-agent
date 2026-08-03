@@ -71,14 +71,19 @@ TOOL_TO_ROUTE: dict[str, RouteTarget] = {
     # genuine routing defect.
     "web_search_agent": RouteTarget.WEB,
     "get_financial_data": RouteTarget.FINANCIAL,
-    # Phase 5's A2A delegation, which is what NEWS_AGENT above was reserved
-    # for. Unlike web_search_agent, this name needed no guessing and no
-    # correction: the A2A client is a plain function tool, so ADK takes the
-    # name straight from `__name__` and there is no AgentTool indirection to
-    # get wrong. Verified against a real turn's `function_call.name` anyway,
-    # because that is the check whose absence caused the web_search_agent
-    # incident documented directly above.
-    "get_latest_news": RouteTarget.NEWS_AGENT,
+    # Phase 5's A2A delegation, which is what NEWS_AGENT above was reserved for.
+    #
+    # "news_agent", NOT "get_latest_news". This entry has already been wrong
+    # once, in exactly the way the web_search_agent comment above warns about.
+    # The first phase 5 implementation was a plain function tool, so the name
+    # came from `__name__` and "get_latest_news" was right. Rebuilding it on the
+    # A2A protocol made the client a RemoteA2aAgent wrapped in an AgentTool, and
+    # AgentTool names itself after the agent it wraps - so the name became the
+    # remote agent's own, "news_agent". Same trap, same file, second occurrence.
+    # Verified against the constructed tool object (src/tools/news_agent.py
+    # exports NEWS_AGENT_TOOL_NAME read off the tool, not written as a literal)
+    # and against a real turn's call.name.
+    "news_agent": RouteTarget.NEWS_AGENT,
 }
 
 # Loop-control calls, not evidence-gathering. They show up in the same event
