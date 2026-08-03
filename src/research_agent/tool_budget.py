@@ -1,4 +1,4 @@
-"""A hard, per-turn ceiling on how many times each tool may be called.
+"""A hard ceiling on how many evidence-gathering tool calls a turn may make.
 
 Why this exists in code rather than in the instruction: the instruction
 already forbids the behaviour this bounds. Step 2 of `agent.py`'s INSTRUCTION
@@ -34,12 +34,29 @@ this project is already fighting.
 
 ## The ceiling
 
-Three calls per tool per turn. The eval's own `max_tool_calls` labels sit
-between 1 and 4 across the question set, and the instruction sanctions one
-reformulation on a miss, so three leaves genuine reformulation intact while
-cutting a 10-call storm off at its third attempt. It is per tool rather than
-per turn in total, so a multi-source question that legitimately needs the
-knowledge base twice and the web once is unaffected.
+Five calls per turn in total, across all tools, and reaching it refuses every
+tool rather than the one that ran out.
+
+It was three per tool first, and the sweep that followed showed why that is
+the wrong unit. Bounding each tool separately leaves an unspent budget on
+every other tool, so a turn refused on `search_documents` simply used the web
+instead: `decline-headcount-by-country` and `decline-segment-margin` went to
+the web on 8 of 8 runs, total calls per turn barely moved (4.4 to 4.9), and
+routing failures rose from 35 to 42. The cap bounded the storm and redirected
+it. Counting the turn removes the sideways exit, which is the only thing that
+made the redirection possible.
+
+Five, because the largest legitimate need in the question set is four
+(`multi-all-three` routes to all three sources with `max_tool_calls: 4`) and
+the instruction sanctions one reformulation on a miss.
+
+What this cannot do, stated plainly because the first version of this module
+implied otherwise: a ceiling bounds waste, it cannot produce efficiency. A
+question with `max_tool_calls: 2` still fails redundancy whenever the agent
+spends four calls badly - the ceiling only stops the fifth. Making the agent
+efficient rather than merely bounded needs the planner to commit to a
+declared plan and the executor to be held to it, which is ADR-0015's deferred
+option, not something a counter can reach.
 
 Note this is a ceiling, not a target: a well-behaved turn never reaches it,
 and reaching it is itself a signal worth seeing in a trace.
@@ -52,8 +69,32 @@ from typing import Any
 from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.tool_context import ToolContext
 
-# Per tool, per turn. See the module docstring for why three.
-MAX_CALLS_PER_TOOL_PER_TURN = 3
+# Total evidence-gathering calls per turn, across ALL tools.
+#
+# It was three PER TOOL until the 2026-07-29 post-fix sweep measured what that
+# actually does. Per-tool counting bounded each tool and let the turn escape
+# sideways: refused on search_documents, the agent went to the web, which had
+# its own untouched budget. decline-headcount-by-country went to the web on 8
+# of 8 runs, decline-segment-margin 8 of 8, and total calls per turn barely
+# moved (4.4 to 4.9) while routing failures rose from 35 to 42. The cap
+# bounded the storm and redirected it.
+#
+# So the ceiling is now the turn, and hitting it refuses EVERY tool rather
+# than one. That is the whole point: the previous refusal ASKED the model not
+# to substitute another source ("do not substitute a different source, a
+# different period, or a related figure") and it did anyway - the fourth time
+# in this project that prompt wording lost to behaviour. Removing the option
+# is a bound; asking again would have been a fourth request.
+#
+# Five, because the largest legitimate need in the question set is four
+# (multi-all-three routes to all three sources, max_tool_calls 4), and one
+# reformulation on a miss is sanctioned by the instruction. Five leaves that
+# intact and bounds everything else. Note what this cannot do: a ceiling
+# bounds waste, it cannot produce efficiency, so questions with
+# max_tool_calls of 2 will still fail redundancy whenever the agent uses four
+# calls badly. Fixing that needs a planner constrained to a declared plan -
+# see ADR-0015.
+MAX_TOOL_CALLS_PER_TURN = 5
 
 # Session-state key holding {tool_name: calls_so_far} for the current turn.
 # Reset by critique.reset_turn_state, which is the LoopAgent's own
@@ -65,16 +106,16 @@ MAX_CALLS_PER_TOOL_PER_TURN = 3
 STATE_KEY = "tool_calls_this_turn"
 
 
-def _refusal(tool_name: str, used: int) -> dict[str, Any]:
+def _refusal(used: int, breakdown: dict[str, int]) -> dict[str, Any]:
+    spent = ", ".join(f"{name} x{n}" for name, n in sorted(breakdown.items()))
     return {
         "error": "tool_call_budget_exhausted",
         "detail": (
-            f"You have already called {tool_name} {used} times this turn, which is the "
-            f"limit. No further {tool_name} calls are available for this question. "
-            "Answer now from what you have already retrieved. If what you retrieved "
-            "does not contain the fact that was asked for, say so plainly and name the "
-            "source you checked - do not substitute a different source, a different "
-            "period, or a related figure."
+            f"You have used all {used} evidence-gathering tool calls available for this "
+            f"turn ({spent}). No tool of any kind can be called again for this question - "
+            "not this one, not a different one. Answer now from what you have already "
+            "retrieved. If it does not contain what was asked for, say so plainly and name "
+            "the source you checked."
         ),
     }
 
@@ -82,10 +123,16 @@ def _refusal(tool_name: str, used: int) -> dict[str, Any]:
 def enforce_tool_budget(
     tool: BaseTool, args: dict[str, Any], tool_context: ToolContext
 ) -> dict[str, Any] | None:
-    """Count this turn's calls per tool; refuse past the ceiling.
+    """Count this turn's tool calls in total; refuse every tool past the ceiling.
 
     Returning None lets the real tool run, which is the path every
     well-behaved turn takes. Returning a dict short-circuits the call.
+
+    The per-tool breakdown is still recorded, because it is the useful thing
+    to see in a trace and in the refusal text - but it is the TOTAL that is
+    compared against the ceiling. That distinction is the whole fix: counting
+    per tool leaves an unspent budget on every other tool, and a turn that
+    cannot search the knowledge base again will use one rather than conclude.
 
     The counter is read, incremented and written back as a new dict rather
     than mutated in place, because ADK tracks state deltas by assignment -
@@ -93,9 +140,9 @@ def enforce_tool_budget(
     recorded as a change.
     """
     counts = dict(tool_context.state.get(STATE_KEY) or {})
-    used = counts.get(tool.name, 0)
-    if used >= MAX_CALLS_PER_TOOL_PER_TURN:
-        return _refusal(tool.name, used)
-    counts[tool.name] = used + 1
+    used = sum(counts.values())
+    if used >= MAX_TOOL_CALLS_PER_TURN:
+        return _refusal(used, counts)
+    counts[tool.name] = counts.get(tool.name, 0) + 1
     tool_context.state[STATE_KEY] = counts
     return None
