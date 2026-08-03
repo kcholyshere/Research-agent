@@ -109,6 +109,18 @@ data/processed/*.jsonl
 # version control when it is promoted by hand into data/eval/baselines/.
 data/processed/eval_runs/
 
+# Canvas artefacts (phase 6) - generated output, same reasoning as eval_runs
+# directly above. Every artefact is regenerable by asking the agent for one, and
+# they accumulate fast: one afternoon of testing produced 48 files, including
+# throwaway cases like "amp-test.md" and "escaping-check-co.html".
+#
+# This rule is here because they were NOT ignored and got committed. The rules
+# above name data/processed/*.jsonl and data/processed/eval_runs/ specifically,
+# and artefacts/ did not exist when they were written, so `git add -A` swept the
+# lot into a PR. Worth noting the pattern: an ignore list that enumerates
+# subdirectories silently stops covering the parent the moment a new one appears.
+data/processed/artefacts/
+
 # Agent working docs (requirements notes, decision log) - not for version control
 /agent_docs/
 /references/
