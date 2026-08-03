@@ -433,7 +433,7 @@ questions:
     expected_routes: [knowledge_base]
     tags: [kb, multi_part, critique_loop, comparison]
     max_tool_calls: 3
-    must_contain: ["31,654", "27,704", "19.1", "18.7"]
+    must_contain: ["31,654", "27,704", "19,147", "18,689"]
     notes: >-
       Four figures, but the hard part is that the question is answerable in
       halves - a draft covering commitments alone looks complete in isolation.
@@ -441,7 +441,15 @@ questions:
       its stated grounds to continue are a named sub-question the draft does not
       address at all, and a half-answer is precisely where that judgement is
       easiest to get wrong in either direction. Ground truth: commitments
-      $27,704m to $31,654m, disbursements $18.7bn to $19.1bn.
+      $27,704m to $31,654m, disbursements $18,689m to $19,147m ($18.7bn to
+      $19.1bn). All four figures are asserted in millions on purpose. They were
+      previously mixed - commitments in millions, disbursements in billions -
+      which failed 3 of 4 runs that answered both halves correctly in millions
+      throughout, and passed the fourth only because it added a "(or ~$19.1
+      billion)" gloss. must_contain cannot express "either rendering", so each
+      question pins the form its answers actually use: loop-multipart asserts
+      the same disbursements figure as "19.1" because that is what its answers
+      write. An any-of form for must_contain would remove the need to choose.
 
   - id: loop-definitional-single
     question: Which two quantities is IFC's Capital Utilization Ratio calculated from?

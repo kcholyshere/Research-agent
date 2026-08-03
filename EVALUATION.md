@@ -218,3 +218,103 @@ the reply is a defect regardless of what was asked. Inline emphasis tags are
 excluded deliberately, since they appear in quoted source text and would accuse
 correct answers. Calibrated against the 248 stored answers from the 09:20 sweep:
 zero false positives.
+
+## 2026-08-03, later still - the phase 4 budget sweep, and what the loop actually does
+The first sweep aimed at phase 4 rather than at routing.
+`20260803T195834Z_live_reps4_budgets0-1.json`: the 5 `critique_loop` questions
+plus `kb-net-income` and `kb-cur-definition` as controls, 2 arms x 4 reps = 56
+runs, live, concurrency 4. 56/56 scored, 0 timeouts, 0 errors. Scoped rather
+than full because the hypothesis was narrow: does cycle 2 earn its latency.
+
+Every earlier sweep measured phase 4 by accident at best. The 2026-08-03 09:20
+run reached `cycles >= 2` on 3 of its 124 budget-1 runs, and the post-phase-5/6
+sweep was budget 0 only, which short-circuits the loop by design (ADR-0010). So
+the project's architectural centrepiece had effectively no measurement.
+
+### The headline: the loop ran, and chose to stop, every single time
+All 28 budget-1 runs finished at `cycles=1`. Not one second cycle, including on
+the five questions written specifically to provoke one.
+
+This is not the loop being skipped. The two arms separate cleanly on
+`critique_outcome`, which is what distinguishes the two explanations:
+
+| arm | critique outcome | n |
+|---|---|---|
+| budget 0 | `skipped` (short-circuit before the LLM call) | 28/28 |
+| budget 1 | `exit` (critique ran, reviewed, called `exit_loop`) | 28/28 |
+
+Follow-up questions raised across all 56 runs: **zero**. The budget-0 column is
+also the confirmation that ADR-0010's short-circuit still fires exactly as
+specified - budget 0 reproduces the pre-phase-4 path with no critique call at all.
+
+### What the loop costs when it decides to do nothing
+Median latency per question, arm against arm:
+
+| question | budget 0 | budget 1 | delta |
+|---|---|---|---|
+| loop-single-fact | 10.0s | 11.1s | +1.1s |
+| loop-multipart-mixed | 18.7s | 21.6s | +2.9s |
+| loop-definitional-single | 7.0s | 9.9s | +2.9s |
+| kb-net-income | 8.4s | 11.5s | +3.1s |
+| kb-cur-definition | 12.8s | 15.9s | +3.1s |
+| loop-comparison | 25.4s | 28.8s | +3.4s |
+| loop-multipart | 24.1s | 29.0s | +4.9s |
+
+About +3.1s median, and it is close to a flat cost rather than a proportional
+one - the critique call is one bounded LLM round trip whatever the question. On
+the cheapest question that is +37%; on the most expensive, +20%.
+
+The controls behave identically to the loop questions, which is the useful part:
+budget 1 changes nothing about the research cycle, so the arms differ only in
+whether a critique call happens after it. The routing and redundancy differences
+between arms (91% against 89% hard pass) are therefore pure run-to-run variance
+by construction, and they usefully calibrate the noise floor at n=28.
+
+### Is the critique right to exit?
+On this evidence, yes, and the one case that looked like a counter-example was an
+instrument defect rather than a missed gap.
+
+`loop-comparison` failed `content` on 3 of 4 budget-1 runs, which looked exactly
+like the critique agent reading an incomplete answer and passing it: the question
+has two halves, and the disbursements half appeared to be missing. It was not.
+Every run answered both halves correctly, in millions - `$19,147m` against
+`$18,689m` - while `must_contain` demanded `19.1` and `18.7`, the same two
+figures in billions. The one run that passed did so only because it volunteered a
+"(or ~$19.1 billion)" gloss alongside the millions figure.
+
+The question was asserting commitments in millions and disbursements in billions,
+so the agent had to write both renderings of the same number to pass. Fixed to
+`19,147`/`18,689`, making all four figures consistent with the units the corpus
+tables carry. Re-scored against the stored answers rather than re-run, since only
+the assertion changed:
+
+| | content failures |
+|---|---|
+| before the fix | 4 of 56 runs |
+| after the fix | 0 of 56 runs |
+
+That is the third instrument defect found by checking a suspicious number against
+a stored answer rather than trusting the aggregate (after the citation/latency
+pair in ADR-0013 and the decline threshold earlier today). The pattern is now
+established enough to state as a rule: an assertion that fails on a question the
+agent visibly got right is an assertion bug until proven otherwise.
+
+### What this does and does not establish
+It establishes that the loop terminates, that termination is overwhelmingly the
+outcome, that the short-circuit works, and that the cost of a no-op critique pass
+is about 3s.
+
+It does not establish that the loop improves answers, because on this set it
+never got the chance to try. `check_wasted_cycle` was applicable to 3 runs out of
+248 in the 09:20 sweep and 0 out of 56 here - the detector for a loop burning
+budget without progress has almost nothing to score. "Did cycle N+1 improve on
+cycle N" remains unmeasured, and the reason is no longer that the metric is
+missing but that cycle N+1 is.
+
+The honest presentation framing: phase 4 currently buys insurance rather than
+measured improvement. The instruction makes termination the default and requires
+the model to justify continuing (ADR-0010), and it turns out that under that
+instruction the model essentially never justifies continuing. Whether that is
+correctly calibrated or too conservative is the open question, and answering it
+needs questions with a deliberately unanswerable half rather than merely a
+multi-part one.
