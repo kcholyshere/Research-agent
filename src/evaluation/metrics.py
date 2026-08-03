@@ -149,7 +149,40 @@ _DECLINE_PHRASES = (
 # with tangentially related results rather than stopping" - a clean decline
 # in this agent's own traces runs to a sentence or two, so a generous word
 # count catches "kept going" without trying to judge prose quality.
-_DECLINE_PADDING_WORD_LIMIT = 80
+#
+# Raised from 80 to 200 on 2026-08-03, from reading all 19 padded failures in
+# the 2026-08-03 sweep rather than from taste. 80 was calibrated when a clean
+# decline "runs to a sentence or two". The synthesize instruction has since
+# been changed to REQUIRE a decline to name and cite the source it checked,
+# which makes a correct decline structurally longer - so the target moved and
+# the check did not, the same way _DECLINE_PHRASES and the citation marker test
+# both did before it. Every one of the 92-197 word answers reads as a model
+# decline: it leads with "not reported", names the source, cites pages, then
+# says what IS reported instead. The 189-197 word ones are among the best
+# answers the agent produces anywhere in the set.
+#
+# Honest limitation, recorded rather than hidden: length has largely stopped
+# separating a padded decline from a thorough one, so 200 buys a trustworthy
+# baseline for this sweep and not much more. The real fix is to stop inferring
+# the behaviour from prose shape - a `report_gap(fact, source_checked)` tool
+# makes declining a first-class action and the assertion deterministic
+# ("did it call the tool"), the same move `exit_loop` made for loop
+# termination. Deferred, see references/evaluation_improvements.md.
+_DECLINE_PADDING_WORD_LIMIT = 200
+
+# URLs are stripped before the decline word count. Measured cause, not
+# tidiness: web answers carry raw Vertex grounding-redirect URLs
+# (vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQ...), each of
+# which is a single ~200-character "word". The 297-word decline-not-listed
+# answer is roughly half URL by word count, so it scored as the worst padding
+# case in the sweep on the strength of its citations. Counting an opaque
+# redirect token as padding prose measures the citation style, not the defect.
+_URL_WORD_RE = re.compile(r"\S*https?://\S+")
+
+
+def _prose_word_count(text: str) -> int:
+    """Words in `text`, excluding URLs and the link targets around them."""
+    return len(_URL_WORD_RE.sub(" ", text).split())
 
 # Wasted-cycle similarity threshold. difflib's SequenceMatcher ratio is a
 # cheap, dependency-free proxy for "did the draft actually change" - it does
@@ -307,7 +340,7 @@ def check_decline(question: EvalQuestion, record: RunRecord) -> AssertionResult 
             passed=False,
             detail="no decline phrasing found - the agent may have fabricated an answer instead of declining",
         )
-    word_count = len(record.answer.split())
+    word_count = _prose_word_count(record.answer)
     padded = word_count > _DECLINE_PADDING_WORD_LIMIT
     passed = not padded
     return AssertionResult(

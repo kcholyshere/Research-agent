@@ -258,30 +258,35 @@ questions:
 
   - id: decline-auditor-fee
     question: What fee did IFC pay its external auditor for the audit of its FY24 financial statements?
-    expected_routes: [knowledge_base]
-    tags: [kb, decline, known_defect]
-    max_tool_calls: 2
-    expects_decline: true
-    known_defects:
-      routing: "web-fallback-after-empty-kb - falls back to web search once the authoritative source comes up empty (TODOS, open)"
-      redundancy: "redundant-searching - 11-12 tool calls against a max of 2 (TODOS, open)"
+    expected_routes: [knowledge_base, web]
+    tags: [kb, web, multi_source]
+    max_tool_calls: 3
+    expects_decline: false
+    must_contain: ["3.3"]
     notes: >-
-      Structurally absent rather than merely not-retrieved: the corpus
-      discloses the auditor independence policy and carries the independent
-      auditor's report, but never the fee. That is what makes it a decline
-      case and not a retrieval miss. Chosen because the nearby AUDITOR
-      INDEPENDENCE prose is exactly the tangentially-related material the
-      decline-headcount-by-country defect pads with.
+      RELABELLED 2026-08-03. This was a decline case and the label was wrong -
+      the fee is absent from the corpus but IS publicly disclosed, so the
+      correct behaviour is exactly what the agent does: find the corpus empty,
+      go to the web, and answer with attribution. Verified against the primary
+      source, IFC's FY2024 Annual Information Statement as filed with the SEC:
+      $3.3m audit services, $0.3m audit-related, $0.8m non-audit. The agent
+      produced $3.3m/$0.3m in 5 of 8 runs on the 2026-08-03 sweep.
 
-      Measured on its first run (2026-07-29): this is the most expensive
-      question in the set, 181-290s and 11-12 tool calls, with one run hitting
-      the 300s timeout. It triggers both open defects above at once - the KB
-      comes up empty, the agent falls back to web, and neither source can
-      answer it, so it searches until it runs out of ideas. Those two are
-      labelled known so they do not drown out the decline assertion, which
-      fails for a genuinely new reason: it produces no decline phrasing at
-      all. Exclude via --questions for a fast smoke run, as with
-      web-premise-refuting.
+      The original label asserted "neither source can answer it" and hung two
+      known_defects off that premise - a routing failure for the web fallback
+      and a redundancy failure for the search volume. The web fallback is
+      correct here, so `expected_routes` now carries both routes and the
+      routing known_defect is gone. This is the fifth instrument defect on this
+      project and the first that was a wrong ground-truth label rather than a
+      wrong check: for four sweeps the agent was scored as failing three
+      assertions on this question while answering it correctly.
+
+      `max_tool_calls: 3` because two sources legitimately need two calls and
+      the corpus reformulation after an empty first search is reasonable. The
+      search volume is still worth watching - 6 calls on every run of the
+      2026-08-03 sweep, so redundancy fails and now does so as a real
+      regression rather than a labelled one. That is the intended reading: the
+      volume is a genuine defect, the web fallback never was.
 
   - id: decline-not-listed
     question: What is IFC's stock ticker symbol and what is its share price today?
