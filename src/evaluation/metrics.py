@@ -412,13 +412,29 @@ def check_artefact(question: EvalQuestion, record: RunRecord) -> AssertionResult
       Canvas an empty or hollow document. The deliverable is the output on these
       questions, so a fact that reached only the covering note did not arrive.
 
-    Applies only to questions with expects_artefact set. Returns None otherwise
-    rather than a vacuous pass, matching every other check in this module -
-    scoring 31 non-artefact questions as "artefact OK" would inflate the totals
-    with assertions that were never at risk.
+    Runs in BOTH directions, and the negative direction is the more valuable of
+    the two. On a question that did not ask for a deliverable, producing one is
+    a failure: it means the planner read "summarise IFC's FY24 results" as a
+    document request, and the user who wanted an answer got a file. Unlike
+    every other check here this one is therefore not skipped for questions that
+    do not opt in - the assertion genuinely is at risk on all of them from the
+    moment Canvas exists, and it is the only guard against the phase 6
+    instruction over-triggering across the existing set. That is exactly the
+    regression the gated synthesise step was designed to avoid, so it needs to
+    be measured rather than assumed.
     """
     if not question.expects_artefact:
-        return None
+        if not record.artefact:
+            return None
+        return AssertionResult(
+            key="artefact",
+            passed=False,
+            detail=(
+                f"an artefact was produced ({record.artefact_format}, "
+                f"{len(record.artefact.split())} words) for a question that asked for an "
+                "answer, not a deliverable - create_canvas over-triggered"
+            ),
+        )
 
     if not record.artefact:
         return AssertionResult(

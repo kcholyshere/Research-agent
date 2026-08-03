@@ -71,6 +71,14 @@ TOOL_TO_ROUTE: dict[str, RouteTarget] = {
     # genuine routing defect.
     "web_search_agent": RouteTarget.WEB,
     "get_financial_data": RouteTarget.FINANCIAL,
+    # Phase 5's A2A delegation, which is what NEWS_AGENT above was reserved
+    # for. Unlike web_search_agent, this name needed no guessing and no
+    # correction: the A2A client is a plain function tool, so ADK takes the
+    # name straight from `__name__` and there is no AgentTool indirection to
+    # get wrong. Verified against a real turn's `function_call.name` anyway,
+    # because that is the check whose absence caused the web_search_agent
+    # incident documented directly above.
+    "get_latest_news": RouteTarget.NEWS_AGENT,
 }
 
 # Loop-control calls, not evidence-gathering. They show up in the same event

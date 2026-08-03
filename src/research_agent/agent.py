@@ -53,6 +53,7 @@ from src.services import genai_client
 from src.tools.canvas import create_canvas
 from src.tools.document_search import search_documents
 from src.tools.financial_data import get_financial_data
+from src.tools.news_agent import get_latest_news
 from src.tools.web_search import web_search_tool
 
 # Imported after instrument() (see the observability note above) - this
@@ -97,12 +98,13 @@ def _record_artefact(
         tool_context.state[LAST_ARTEFACT_KEY] = tool_response.get("artefact", "")
     return None
 
-INSTRUCTION = """You are a research agent with three sources of evidence: a
+INSTRUCTION = """You are a research agent with four sources of evidence: a
 private knowledge base (search_documents), live financial market data
-(get_financial_data), and the public internet (web_search_tool). You also have
-one output tool, create_canvas, which is not a source and gathers nothing - it
-renders research you have already done into a finished artefact. For every
-question, follow a plan-execute-synthesize flow:
+(get_financial_data), the latest news on a topic from an independent News Agent
+you delegate to (get_latest_news), and the public internet (web_search_tool).
+You also have one output tool, create_canvas, which is not a source and gathers
+nothing - it renders research you have already done into a finished artefact.
+For every question, follow a plan-execute-synthesize flow:
 
 0. Refinement check: {critique_followups?} holds specific follow-up
    sub-questions a prior critique pass raised against your last draft for
@@ -116,8 +118,14 @@ question, follow a plan-execute-synthesize flow:
    the private knowledge base's own documents; get_financial_data for current
    prices or movements of stocks, cryptocurrencies, or currency exchange
    rates (never use web_search_tool for those - the financial tool's
-   predefined sources are the authority on them); web_search_tool for
-   anything else public, current, or outside those documents. Only plan to
+   predefined sources are the authority on them); get_latest_news when the
+   question asks for the latest or recent news, headlines, or current
+   developments on a topic, which is delegated to a dedicated News Agent and
+   must not go to web_search_tool instead; web_search_tool for anything else
+   public, current, or outside those documents. A question asking for a
+   specific public fact is not a news request even when the fact is recent -
+   news means "what is being reported about this topic now", not "look this
+   up". Only plan to
    use multiple sources for a fact if the question genuinely requires
    combining evidence across them - not as a routine double-check of a
    source that already answers the fact on its own. State the plan briefly.
@@ -157,6 +165,11 @@ question, follow a plan-execute-synthesize flow:
      URLs. Cite the URL of the source a fact came from.
    - get_financial_data: its result includes a "source" field holding the URL
      the figures were fetched from. Cite that URL.
+   - get_latest_news: its result ends with a "Sources:" list in the same shape
+     web_search_tool's does. Cite the URL of the source each item came from,
+     never the News Agent or the tool as the source. If it returns an "error"
+     instead, say plainly that the News Agent could not be reached and do not
+     answer the news part from your own knowledge or substitute a web search.
    If sources
    conflict, say so explicitly rather than silently picking one - prefer the
    private knowledge base as authoritative for anything the knowledge base
@@ -243,7 +256,13 @@ research_agent = Agent(
     # src/tools/canvas.py for why it must be exempt from the tool budget and
     # from the redundancy metric; both exemptions key off its name, so renaming
     # it means changing tool_budget.OUTPUT_TOOLS and schema.OUTPUT_TOOLS too.
-    tools=[search_documents, get_financial_data, web_search_tool, create_canvas],
+    tools=[
+        search_documents,
+        get_financial_data,
+        web_search_tool,
+        get_latest_news,
+        create_canvas,
+    ],
     generate_content_config=_GENERATE_CONTENT_CONFIG,
     # A hard per-turn ceiling on calls to each tool. The instruction above
     # already forbids re-searching a fact it has, and the 2026-07-29 baseline
