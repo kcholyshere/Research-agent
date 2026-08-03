@@ -101,6 +101,21 @@ OutputFormat = Literal["markdown", "html", "code"]
 
 _EXTENSIONS: dict[str, str] = {"markdown": "md", "html": "html", "code": "txt"}
 
+# File extension per language, for the "code" format. Without this every code
+# artefact was written as .txt, so a generated Python file arrived named like a
+# note - the sort of detail that undercuts the thing it is demonstrating. Keyed
+# on the same normalisation as _COMMENT_TOKENS below (strip().lower()) so a
+# language spelled one way cannot get the right comment token and the wrong
+# extension. Falls back to _EXTENSIONS["code"] for anything unlisted, which is
+# the honest answer for a language this map has not been taught.
+_LANGUAGE_EXTENSIONS: dict[str, str] = {
+    "python": "py", "sql": "sql", "javascript": "js", "typescript": "ts",
+    "java": "java", "go": "go", "rust": "rs", "c": "c", "cpp": "cpp",
+    "c++": "cpp", "csharp": "cs", "c#": "cs", "ruby": "rb", "shell": "sh",
+    "bash": "sh", "html": "html", "css": "css", "yaml": "yml", "json": "json",
+    "kotlin": "kt", "swift": "swift", "scala": "scala", "php": "php", "r": "r",
+}
+
 # Artefacts land under data/processed/, alongside the FAISS index and the
 # stored evaluation runs - all three are build outputs rather than sources.
 ARTEFACT_DIR = config.PROJECT_ROOT / "data" / "processed" / "artefacts"
@@ -398,17 +413,24 @@ def create_canvas(
         }
 
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    # Normalised once and reused for the comment token and the file extension,
+    # so the two cannot disagree about what language this is.
+    language = request.language.strip().lower()
     env = _HTML_ENV if request.output_format == "html" else _ENV
     rendered = env.get_template(request.output_format).render(
         title=request.title,
         sections=request.sections,
         citations=request.citations,
         generated_at=generated_at,
-        comment=_COMMENT_TOKENS.get(request.language.strip().lower(), "#"),
+        comment=_COMMENT_TOKENS.get(language, "#"),
     )
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    path = ARTEFACT_DIR / f"{stamp}_{_slug(request.title)}.{_EXTENSIONS[request.output_format]}"
+    if request.output_format == "code":
+        extension = _LANGUAGE_EXTENSIONS.get(language, _EXTENSIONS["code"])
+    else:
+        extension = _EXTENSIONS[request.output_format]
+    path = ARTEFACT_DIR / f"{stamp}_{_slug(request.title)}.{extension}"
     try:
         ARTEFACT_DIR.mkdir(parents=True, exist_ok=True)
         path.write_text(rendered, encoding="utf-8")
@@ -424,6 +446,13 @@ def create_canvas(
     return {
         "status": "ok",
         "format": request.output_format,
+        # Echoed back rather than dropped: the UI needs it to highlight a code
+        # artefact correctly (Streamlit's st.code defaults to "python", so an
+        # unreported language means a SQL file is silently shown as Python), and
+        # the evaluation needs it to tell "asked for SQL, produced Python" from
+        # "produced nothing". Empty string for markdown and html, which have no
+        # language.
+        "language": language,
         "path": written,
         "word_count": len(rendered.split()),
         "artefact": rendered,

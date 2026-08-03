@@ -230,6 +230,11 @@ class CycleRecord:
     # "asked for HTML, produced markdown" offline with no agent call.
     artefact: str = ""
     artefact_format: str = ""
+    # The code artefact's language, "" for markdown and html. Recorded so a
+    # stored run can answer "asked for SQL, produced Python" offline - that is a
+    # distinct defect from producing nothing, and without this field it is
+    # simply invisible.
+    artefact_language: str = ""
     artefact_path: str = ""
 
 
@@ -333,6 +338,11 @@ class RunRecord:
     def artefact_format(self) -> str:
         rendered = self.artefacts
         return rendered[-1].artefact_format if rendered else ""
+
+    @property
+    def artefact_language(self) -> str:
+        rendered = self.artefacts
+        return rendered[-1].artefact_language if rendered else ""
 
     @property
     def cycle_count(self) -> int:

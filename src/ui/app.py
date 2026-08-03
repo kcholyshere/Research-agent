@@ -91,6 +91,7 @@ async def _run_turn(
                         artefact = {
                             "text": payload.get("artefact", ""),
                             "format": payload.get("format", ""),
+                            "language": payload.get("language", ""),
                             "path": payload.get("path", ""),
                         }
             if (
@@ -113,7 +114,7 @@ async def _run_turn(
 _ARTEFACT_MIME = {"markdown": "text/markdown", "html": "text/html", "code": "text/plain"}
 
 
-def _render_artefact(artefact: dict[str, str]) -> None:
+def _render_artefact(artefact: dict[str, str], key_suffix: str) -> None:
     """Show a Canvas artefact below the answer, with a download.
 
     Rendered per format rather than uniformly, because the useful view differs:
@@ -128,9 +129,13 @@ def _render_artefact(artefact: dict[str, str]) -> None:
       already has both would have the artefact's CSS leak into the app's own
       layout. The download plus "open the file" is the honest presentation of a
       standalone page.
-    - code is shown as code. No language is stored on the artefact, so the
-      highlighter is left to infer it rather than guessing wrongly from the
-      title.
+    - code is shown as code, highlighted with the artefact's own language.
+      Passing it matters more than it looks: st.code's `language` defaults to
+      "python" (verified against the installed Streamlit), so omitting it does
+      not mean "no highlighting" - it means every artefact is highlighted AS
+      Python, and a SQL or JavaScript file is quietly mislabelled. `None` is the
+      correct fallback for a language Canvas did not record, giving plain
+      monospace rather than a confident wrong guess.
     """
     text = artefact.get("text", "")
     if not text:
@@ -146,14 +151,20 @@ def _render_artefact(artefact: dict[str, str]) -> None:
         elif fmt == "html":
             st.code(text, language="html")
         else:
-            st.code(text)
+            st.code(text, language=artefact.get("language") or None)
         st.download_button(
             "Download artefact",
             data=text,
             file_name=name,
             mime=_ARTEFACT_MIME.get(fmt, "text/plain"),
             icon=":material/download:",
-            key=f"download-{name}",
+            # Keyed on position in the conversation, not the filename. Two
+            # artefacts in one session can share a name - the same request asked
+            # twice inside the same second produces the same title and the same
+            # timestamp - and a duplicate widget key is a hard Streamlit error,
+            # which would take the whole page down mid-demo rather than
+            # degrading.
+            key=f"download-{key_suffix}",
         )
 
 
@@ -230,7 +241,7 @@ session_id = asyncio.run(_ensure_session(runner))
 if "history" not in st.session_state:
     st.session_state["history"] = []
 
-for turn in st.session_state["history"]:
+for turn_index, turn in enumerate(st.session_state["history"]):
     with st.chat_message(turn["role"]):
         st.markdown(turn["content"])
         # Replayed from history rather than rendered once: Streamlit reruns the
@@ -238,7 +249,7 @@ for turn in st.session_state["history"]:
         # branch that produced it disappears the moment the user touches a
         # slider or sends another message.
         if turn.get("artefact"):
-            _render_artefact(turn["artefact"])
+            _render_artefact(turn["artefact"], key_suffix=f"history-{turn_index}")
 
 if prompt := st.chat_input("Ask a question about the knowledge base"):
     # Escape literal "$" - financial answers are full of dollar amounts, and
@@ -283,7 +294,12 @@ if prompt := st.chat_input("Ask a question about the knowledge base"):
         st.markdown(answer)
         artefact = turn_result.get("artefact")
         if artefact:
-            _render_artefact(artefact)
+            # "live" rather than a positional index: this render happens before
+            # the turn is appended to history, so the index it would get here is
+            # the one the history replay will also use on the next rerun - and
+            # the same key appearing twice in one script run is the error this
+            # avoids.
+            _render_artefact(artefact, key_suffix="live")
     st.session_state["history"].append(
         {"role": "assistant", "content": answer, "artefact": artefact}
     )

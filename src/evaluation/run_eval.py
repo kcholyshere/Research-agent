@@ -228,6 +228,7 @@ def _split_into_cycles(events: list) -> list[CycleRecord]:
                     continue
                 current.artefact = payload.get("artefact", "")
                 current.artefact_format = payload.get("format", "")
+                current.artefact_language = payload.get("language", "")
                 current.artefact_path = payload.get("path", "")
 
             if event.content is not None and event.is_final_response():
