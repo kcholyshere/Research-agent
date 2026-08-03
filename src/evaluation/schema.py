@@ -77,6 +77,29 @@ TOOL_TO_ROUTE: dict[str, RouteTarget] = {
 # stream as real tool calls and would otherwise be counted as routing.
 CONTROL_TOOLS: frozenset[str] = frozenset({"exit_loop"})
 
+# Output-producing calls, not evidence-gathering. Excluded from `tools_called`
+# for the same reason CONTROL_TOOLS is, but the consequence is sharper here.
+#
+# `check_redundancy` compares len(tools_called) against the question's
+# `max_tool_calls`, a bound written to police *searching*. create_canvas
+# (phase 6) retrieves nothing - it renders facts already gathered - so
+# counting it would add exactly one call to every artefact question and push
+# each of them one over its own bound. Every one would read as a redundancy
+# regression on a turn that behaved perfectly, and the bounds could not be
+# raised to compensate without also loosening the real search budget they
+# exist to enforce.
+#
+# Must stay in step with `src/research_agent/tool_budget.py`'s OUTPUT_TOOLS,
+# which exempts the same names from the runtime ceiling. Two lists rather than
+# one shared constant because the eval must be able to score a stored run
+# without importing the agent (and therefore without triggering Langfuse
+# instrumentation and a Vertex client) - but they are one concept, and a change
+# to either is a change to both.
+OUTPUT_TOOLS: frozenset[str] = frozenset({"create_canvas"})
+
+# Everything that is not evidence-gathering. `tools_called` filters on this.
+NON_EVIDENCE_TOOLS: frozenset[str] = CONTROL_TOOLS | OUTPUT_TOOLS
+
 
 @dataclass
 class EvalQuestion:
@@ -98,6 +121,21 @@ class EvalQuestion:
     # legitimately need two calls to one source (reformulation after a miss),
     # while five calls to it is the known premise-refuting defect.
     max_tool_calls: int = 2
+
+    # True when the question asks for a deliverable rather than an answer, so
+    # the turn is expected to call create_canvas and produce an artefact. The
+    # format it should produce, when set, is one of canvas.OutputFormat -
+    # asserting the format separately from the fact of an artefact existing,
+    # because "produced a document when asked for code" is a distinct and more
+    # interesting failure than "produced nothing".
+    expects_artefact: bool = False
+    artefact_format: str = ""
+    # Strings the ARTEFACT must contain, checked separately from must_contain.
+    # Kept apart on purpose: must_contain is scored against the answer, and an
+    # artefact turn's answer is a short covering note while the substance lives
+    # in the artefact. Folding them together would make it impossible to say
+    # whether the facts reached the deliverable or only the reply.
+    artefact_must_contain: list[str] = field(default_factory=list)
 
     # Content expectations. Kept deliberately weak - the plan is explicit that
     # anything touching live search or market data can carry routing and
@@ -129,7 +167,7 @@ class EvalQuestion:
     # which is the opposite of what this field exists for.
     #
     # Recognised keys: routing, redundancy, citation, decline, content,
-    # wasted_cycle.
+    # wasted_cycle, artefact.
     known_defects: dict[str, str] = field(default_factory=dict)
 
     notes: str = ""
@@ -163,6 +201,23 @@ class CycleRecord:
     # approved quickly" - the eval should be able to tell them apart.
     critique_outcome: str = ""  # "exit" | "continue" | "skipped" | ""
     critique_followups: str = ""
+
+    # The artefact create_canvas rendered in this cycle, if any, taken from the
+    # tool's function-response payload rather than from the agent's prose.
+    #
+    # Per cycle rather than per run because the refinement loop can render more
+    # than once: a critique that raises a genuine gap on an artefact turn sends
+    # the agent back, and the second pass rewrites the whole document. Storing
+    # only the final one would hide exactly the case worth seeing - two full
+    # renders where one would have done.
+    #
+    # Read from the function response, not the answer text, because the answer
+    # on an artefact turn is a short covering note. Both `artefact_format` and
+    # `artefact_path` come from the same payload, so a run can be checked for
+    # "asked for HTML, produced markdown" offline with no agent call.
+    artefact: str = ""
+    artefact_format: str = ""
+    artefact_path: str = ""
 
 
 @dataclass
@@ -227,7 +282,7 @@ class RunRecord:
             name
             for cycle in self.cycles
             for name in cycle.tools_called
-            if name not in CONTROL_TOOLS
+            if name not in NON_EVIDENCE_TOOLS
         ]
 
     @property
@@ -243,6 +298,28 @@ class RunRecord:
             if route is not None:
                 seen.setdefault(route, None)
         return list(seen)
+
+    @property
+    def artefacts(self) -> list[CycleRecord]:
+        """Cycles that rendered an artefact, in order."""
+        return [c for c in self.cycles if c.artefact]
+
+    @property
+    def artefact(self) -> str:
+        """The artefact this turn ended with, or "" if it produced none.
+
+        The LAST one rather than the first: when the refinement loop sends the
+        agent back, the second render is the turn's output and the first is
+        superseded. `artefacts` above keeps both, which is what makes a
+        redundant re-render visible.
+        """
+        rendered = self.artefacts
+        return rendered[-1].artefact if rendered else ""
+
+    @property
+    def artefact_format(self) -> str:
+        rendered = self.artefacts
+        return rendered[-1].artefact_format if rendered else ""
 
     @property
     def cycle_count(self) -> int:

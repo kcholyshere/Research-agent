@@ -57,3 +57,13 @@ DEFAULT_CRITIQUE_BUDGET = 1
 # also offers Off/Low/High, settable per request the same way
 # DEFAULT_CRITIQUE_BUDGET is.
 DEFAULT_WEB_SEARCH_THINKING_BUDGET = 512
+
+# News Agent service (phase 5, Agent-to-Agent demo) - a separate process
+# reached over plain HTTP, not an in-process import; see
+# src/news_service/server.py and src/tools/news_agent.py for why. A
+# dedicated timeout, not genai_client.HTTP_TIMEOUT_MS/MODEL_CALL_TIMEOUT_MS
+# (those bound Vertex calls this tool never makes directly): this bounds
+# the HTTP hop to a local service that the tool must degrade around rather
+# than hang on - see that tool's docstring.
+NEWS_AGENT_URL = os.getenv("NEWS_AGENT_URL", "http://localhost:8001")
+NEWS_AGENT_TIMEOUT_S = 20.0

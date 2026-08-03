@@ -9,7 +9,8 @@ poor test-retest reliability the brainstorm explicitly rejected, for
 assertions that do not need one.
 
 Layout: one `check_*` function per assertion in the brief (routing,
-redundancy, citation, decline, content, wasted_cycle), each returning an
+redundancy, citation, decline, content, wasted_cycle) plus `artefact`, added
+for phase 6's Canvas tool on the same terms, each returning an
 `AssertionResult` or `None` when the assertion does not apply to this
 question (e.g. a content check on a question with no must_contain/
 must_not_contain). `evaluate_run` runs all of them for one (question, run)
@@ -25,16 +26,16 @@ import statistics
 from dataclasses import dataclass, field
 from typing import Iterable
 
-from src.evaluation.schema import EvalQuestion, RunRecord
+from src.evaluation.schema import NON_EVIDENCE_TOOLS, EvalQuestion, RunRecord
 
-# The six assertion keys the brief fixes as the vocabulary for
+# The assertion keys the brief fixes as the vocabulary for
 # `EvalQuestion.known_defects`. Kept as a literal set (rather than inferring
 # it from whatever check_* happens to run) so a typo'd key in questions.yaml
 # fails to match anything rather than being silently accepted - the same
 #"don't let a naming mismatch masquerade as a real result" concern schema.py
 # already flags for TOOL_TO_ROUTE.
 ASSERTION_KEYS = frozenset(
-    {"routing", "redundancy", "citation", "decline", "content", "wasted_cycle"}
+    {"routing", "redundancy", "citation", "decline", "content", "wasted_cycle", "artefact"}
 )
 
 # 2026-07-28 measured baseline: 15s for single-cycle, single-tool turns only
@@ -298,9 +299,24 @@ def check_redundancy(question: EvalQuestion, record: RunRecord) -> AssertionResu
 
 
 def check_citation(question: EvalQuestion, record: RunRecord) -> AssertionResult | None:
+    """Does the turn's output cite something a reader could go and check?
+
+    Scans the artefact as well as the answer, joined, on artefact turns. Not a
+    loosening - a necessary correction for where the output moved to. Phase 6's
+    synthesize step hands create_canvas the finished sections with their facts
+    cited inline and collects every source into the artefact's own Sources
+    section, which leaves the *answer* a short covering note ("I have prepared
+    the report below"). Scoring the answer alone would fail the citation check
+    on every artefact question while the citations sat, correctly formatted, in
+    the deliverable - the fifth instance of this project's recurring instrument
+    defect, a check still measuring where the target used to be.
+    """
     if not question.expects_citation:
         return None
-    answer = record.answer
+    # Joined rather than checked separately: a citation anywhere in the turn's
+    # output satisfies this assertion, and which half carries it is a matter of
+    # format. `check_artefact` is what asserts the artefact's own content.
+    answer = f"{record.answer}\n{record.artefact}" if record.artefact else record.answer
 
     # Strip the known-broken placeholder before looking for a real citation,
     # so an answer whose ONLY attribution is "(Source: Google Search)" cannot
@@ -379,6 +395,61 @@ def check_content(question: EvalQuestion, record: RunRecord) -> AssertionResult 
     return AssertionResult(key="content", passed=passed, detail="; ".join(parts) or "all content expectations met")
 
 
+def check_artefact(question: EvalQuestion, record: RunRecord) -> AssertionResult | None:
+    """Did an artefact-requesting turn actually produce the artefact asked for?
+
+    Three failures, deliberately distinguished rather than collapsed into one
+    "artefact failed", on the same reasoning check_routing separates missing
+    from unexpected: they have different causes and different fixes.
+
+    - No artefact at all. The planner did not recognise a deliverable request,
+      or create_canvas was called and returned an error the agent gave up on.
+    - Wrong format. Recognised the request, ignored the form - "wrote a report
+      when asked for a code file" is a routing-shaped defect, not an absence.
+    - Facts missing from the artefact. The worst of the three and the reason
+      `artefact_must_contain` exists separately from `must_contain`: the agent
+      researched correctly, said the right thing in its reply, and then handed
+      Canvas an empty or hollow document. The deliverable is the output on these
+      questions, so a fact that reached only the covering note did not arrive.
+
+    Applies only to questions with expects_artefact set. Returns None otherwise
+    rather than a vacuous pass, matching every other check in this module -
+    scoring 31 non-artefact questions as "artefact OK" would inflate the totals
+    with assertions that were never at risk.
+    """
+    if not question.expects_artefact:
+        return None
+
+    if not record.artefact:
+        return AssertionResult(
+            key="artefact",
+            passed=False,
+            detail="no artefact was produced - create_canvas was never called, or every call errored",
+        )
+
+    problems: list[str] = []
+    if question.artefact_format and record.artefact_format != question.artefact_format:
+        problems.append(
+            f"format={record.artefact_format!r}, expected {question.artefact_format!r}"
+        )
+    missing = [s for s in question.artefact_must_contain if s not in record.artefact]
+    if missing:
+        problems.append(f"missing from artefact={missing}")
+
+    # A second render is not a failure on its own - a critique can raise a
+    # genuine gap that warrants rewriting the document - so this is reported
+    # in the detail of a pass rather than failing the assertion. It is
+    # check_wasted_cycle's job to say whether that extra cycle did any work.
+    renders = len(record.artefacts)
+    note = f"{renders} render(s)" if renders > 1 else "1 render"
+    return AssertionResult(
+        key="artefact",
+        passed=not problems,
+        detail="; ".join(problems)
+        or f"{record.artefact_format} artefact produced, {len(record.artefact.split())} words, {note}",
+    )
+
+
 def check_wasted_cycle(record: RunRecord) -> AssertionResult | None:
     """Did any cycle N+1 add no tool call while leaving the draft unchanged?
 
@@ -393,8 +464,21 @@ def check_wasted_cycle(record: RunRecord) -> AssertionResult | None:
         return None
     wasted: list[int] = []
     for prev, curr in zip(record.cycles, record.cycles[1:]):
-        no_new_tool_call = len(curr.tools_called) == 0
-        similarity = difflib.SequenceMatcher(None, prev.draft, curr.draft).ratio()
+        # Evidence calls only. A cycle whose sole call was create_canvas
+        # gathered nothing new, so re-rendering an unchanged document is
+        # exactly the waste this check exists for - counting the render as
+        # "new work" would excuse it. Mirrors RunRecord.tools_called, which
+        # filters the same set.
+        no_new_tool_call = not [t for t in curr.tools_called if t not in NON_EVIDENCE_TOOLS]
+        # Compare the draft AND the artefact, because on an artefact turn the
+        # draft is a short covering note whose wording barely moves between
+        # cycles even when the document underneath was rewritten wholesale.
+        # Diffing the note alone would flag every multi-cycle artefact turn as
+        # wasted; diffing only the artefact would miss the ordinary prose case.
+        # Concatenating scores the cycle on everything it actually emitted.
+        prev_output = f"{prev.draft}\n{prev.artefact}"
+        curr_output = f"{curr.draft}\n{curr.artefact}"
+        similarity = difflib.SequenceMatcher(None, prev_output, curr_output).ratio()
         if no_new_tool_call and similarity > _WASTED_CYCLE_SIMILARITY_THRESHOLD:
             wasted.append(curr.index)
     passed = not wasted
@@ -422,6 +506,7 @@ def evaluate_run(question: EvalQuestion, record: RunRecord) -> QuestionResult:
         check_citation(question, record),
         check_decline(question, record),
         check_content(question, record),
+        check_artefact(question, record),
         check_wasted_cycle(record),
     )
     for res in checks:
