@@ -2,52 +2,37 @@
 Version-controlled record of what each evaluation run showed. Design rationale is
 ADR-0011 (what the pipeline measures) and ADR-0012 (how a sweep is scheduled).
 
-## Latest baseline - 2026-07-29 (post-fix)
-248 runs, live, concurrency 4. `20260729T163541Z_live_reps4_budgets0-1.json`.
+## Latest baseline - 2026-08-03
+248 runs, live, concurrency 4. `20260803T092025Z_live_reps4_budgets0-1.json`.
+Three same-question sweeps, all scored with the corrected metrics (ADR-0013):
 
-| arm | runs | scored | hard pass | prev | cycles=2 |
+| assertion | no cap | cap 3/tool | cap 5/turn | checked | pass |
 |---|---|---|---|---|---|
-| budget0 | 124 | 124 | 76% | 81% | 0 |
-| budget1 | 124 | 124 | 81% | 81% | 4 |
+| redundancy | 59 | 66 | 73 | 248 | 71% |
+| routing | 35 | 42 | 37 | 248 | 85% |
+| decline | 31 | 32 | 33 | 48 | 31% |
+| citation | 7 | 7 | 9 | 248 | 96% |
+| content | 6 | 5 | 5 | 88 | 94% |
+| total | 138 | 152 | 157 | 883 | 82% |
 
-Failing assertions against the same-day pre-fix baseline, both scored with the
-corrected metrics (ADR-0013), so this is like-for-like:
+Hard pass: 81/81, then 76/81, then 77/79. Reliability is unchanged and good
+throughout - 248/248 scored, no timeouts, errors or quota rejections.
 
-| assertion | before | after |
-|---|---|---|
-| redundancy | 59 | 66 |
-| routing | 35 | 42 |
-| decline | 31 | 32 |
-| citation | 7 | 7 |
-| content | 6 | 5 |
-| total | 138 | 152 |
+### The cap has now been tried twice and lost twice
+Counting the turn instead of the tool did what it was meant to: routing 42 to
+37, unexpected-web on `decline-segment-margin` 8/8 to 2/8, worst run 8 calls
+to 6. Closing the sideways exit was right.
 
-Latency, timed phase: budget0 median 9.1s, budget1 10.7s - both inside the 15s
-target. Concurrent phase median 22.9s / 23.1s, down from 25.5s / 28.5s.
-Reliability improved outright: 0 errored, 0 timed out, 0 rate-limited, 248/248
-scored, against 4 lost runs before.
+The number was wrong, and it was wrong in the obvious direction. Per tool the
+allowance was 3; per turn it is 5. Most of the set is single-tool with
+`max_tool_calls: 2`, so those questions had their allowance raised from 3 to
+5 and used it - `decline-segment-margin` and `decline-auditor-fee` at 6.0 mean
+calls, `kb-charges-on-borrowings` 5.9. 54 of 73 redundancy failures sit on
+`max_tool_calls: 2` questions, where a ceiling of 5 barely binds at all.
 
-### The tool-call cap traded one defect for another
-Per-tool call volume fell exactly as intended - `kb-charges-on-borrowings` 6.5
-to 4.1 mean calls, `decline-auditor-fee` 11.4 to 6.6 (and 181-290s to ~80s),
-`web-premise-refuting` 5.0 to 3.9. No run now exceeds 8 tool calls; the old
-worst was 12.
-
-But assertions got worse, for two reasons that are the same reason:
-
-1. The cap is per tool (3), while the eval's `max_tool_calls` bounds the turn
-   in total (1 to 4). A turn making 3 knowledge-base calls and 3 web calls is
-   within the cap and still fails redundancy.
-2. Refusing a `search_documents` call pushes the agent to the web rather than
-   to an answer. `decline-segment-margin` and `decline-headcount-by-country`
-   now go to web on 8 of 8 runs, `decline-auditor-fee` 7 of 8. The refusal text
-   says in terms "do not substitute a different source"; it is ignored, which
-   is the same finding that motivated the cap in the first place.
-
-So the cap bounded the search storm and redirected it across tools instead of
-stopping it. Net: cheaper and faster turns, more assertion failures. The fix
-for this is a per-turn total ceiling rather than a per-tool one - what the
-eval actually asserts - not a firmer refusal message.
+The finding underneath both attempts is ADR-0015's: a ceiling bounds the worst
+case and cannot produce efficiency. It stops the storm; it does not make the
+agent plan. Whatever the ceiling is, the agent spends up to it.
 
 ## Where things live
 | Thing | Path | Tracked |
