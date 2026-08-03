@@ -69,16 +69,22 @@ timed in isolation; `known_defect` (2) marks a question expected to fail today
 against a logged defect, reported apart from fresh regressions.
 
 ## Open defects
-As of the 2026-07-29 baseline. Update this table and the date with each sweep.
+As of the 2026-08-03 20:20 sweep. Update this table and the date with each sweep.
 
 | Defect | Evidence | Status |
 |---|---|---|
-| Falls back to web instead of declining, then answers from the wrong source | 6 questions; routing 35 + decline 37. `decline-fy25-commitments` returns FY24 `31,654` for an FY25 question | open, most serious - one bug behind two assertion keys |
-| Redundant searching | `kb-charges-on-borrowings` up to 10 KB calls for one figure | open |
-| KB answers carry no citation | 40 hits, incl. `kb-net-income` - the attribution fix covered web/financial, not the corpus | open, regression of a "fixed" defect |
-| Premise-refuting search storm | `web-premise-refuting`, up to 12 searches | open, known defect |
+| Falls back to web instead of declining, then answers from the wrong source | decline 40% pass (24/40 failing); `decline-headcount-by-country`, `decline-future-figure` and `fin-coverage-gap` all reach for the web | open, most serious - one bug behind two assertion keys |
+| Redundant searching | 69% pass; `kb-charges-on-borrowings` and `canvas-code-artefact` both hit 6 calls against a max of 2 | open |
+| Premise-refuting search storm | `web-premise-refuting`, up to 6 searches | open, known defect |
+| Critique diagnoses correctly but does not repair | `loop-multipart-mixed` named the missing figure, ran a second cycle, still lacked it - at 3x the latency | open, new - see the Critic Agent section below |
+| News Agent picked for non-news questions | `multi-web-and-financial` delegates on 8 of 8 runs | open, but may be a label decision rather than a defect |
+| A2A timeout raises an unhandled AttributeError | `A2AClientTimeoutError` has no `status_code`; 1 run of 280 died on it | open, in the client library's error path |
 | No turn timeout in production code | the eval harness bounds runs at 300s; the agent does not | open |
-| Loop improvement unmeasured | wasted-cycle detection is deterministic only; "did cycle N+1 improve" needs Tier 3 | not built |
+| Loop improvement barely measurable | 2 second cycles in 140 budget-1 runs, so "did cycle N+1 improve" has almost nothing to score | open |
+
+Closed since the last table: KB answers now carry citations (page numbers and the
+source filename), so citation passes at 98% across 271 checks. That row had been
+carried as an open regression and this sweep does not reproduce it.
 
 <details>
 <summary>Run history</summary>
@@ -318,3 +324,105 @@ instruction the model essentially never justifies continuing. Whether that is
 correctly calibrated or too conservative is the open question, and answering it
 needs questions with a deliberately unanswerable half rather than merely a
 multi-part one.
+
+## 2026-08-03, 20:20 - the final pre-presentation baseline (280 runs, both arms)
+`20260803T202002Z_live_reps4_budgets0-1.json`. All 35 questions x 2 arms x 4
+reps, live, concurrency 4, with the News Agent served on :8001 throughout. 279 of
+280 scored; the one loss is analysed below rather than swept up.
+
+| assertion | failing | checked | pass |
+|---|---|---|---|
+| artefact | 0 | 24 | 100% |
+| citation | 5 | 271 | 98% |
+| content | 11 | 104 | 89% |
+| decline | 24 | 40 | 40% |
+| redundancy | 86 | 279 | 69% |
+| routing | 44 | 279 | 84% |
+| wasted_cycle | 0 | 2 | 100% |
+| total | 170 | 999 | 83% |
+
+Hard pass 76% at budget 0 and 77% at budget 1 - the arms are indistinguishable,
+as they were in the scoped sweep, and for the same structural reason: budget 1
+changes nothing before the critique call.
+
+### The Critic Agent, measured across the whole question set
+The scoped sweep earlier tonight could only say the loop never continued on seven
+knowledge-base questions. The full set is what shows how it behaves where gaps
+genuinely exist.
+
+| arm | critique outcome | n |
+|---|---|---|
+| budget 0 | `skipped` (short-circuit, no LLM call) | 139/139 |
+| budget 1 | `exit` (reviewed, then stopped) | 121 |
+| budget 1 | `skipped` (financial-only short-circuit) | 19 |
+| budget 1 | `continue` (raised a follow-up) | 2 |
+
+Three things are worth separating here.
+
+**The short-circuits both work exactly as designed.** Budget 0 never reaches an
+LLM call, so the pre-phase-4 path is reproduced precisely (ADR-0010). And the 19
+`skipped` at budget 1 are the financial rule firing: a cycle whose only tool call
+was `get_financial_data` has no citation to omit and no sub-question left, so it
+escalates without a critique call at all. That is 19 model calls not made, on the
+route that was already closest to its latency target.
+
+**When it does review, it stops 121 times out of 123 - about 98%.** Two runs in
+140 raised a follow-up. Both diagnoses were legitimate: `web-current-event` was
+asked for the decision plus its citations, and `loop-multipart-mixed` was asked
+for the LTF projects count its draft had not covered.
+
+**The repair is where it breaks, and this is the finding of the sweep.**
+`loop-multipart-mixed` asserts the figure `365`. Seven of its eight runs produced
+it in a single cycle. The eighth is the run the critique caught - it correctly
+named the missing figure, the second cycle ran another `search_documents`, and
+the final answer still did not contain `365`:
+
+| loop-multipart-mixed | cycles | contains `365` | latency |
+|---|---|---|---|
+| budget 0, reps 1-4 | 1 | yes (4/4) | 14.5-19.4s |
+| budget 1, reps 1, 2, 4 | 1 | yes (3/3) | 21.3-23.9s |
+| budget 1, rep 3 | 2 | **no** | **56.7s** |
+
+So the one run that needed refinement is the one that ended up worst, at roughly
+three times the median latency. The critique agent's diagnosis was right and its
+repair did not land. That is a much more specific claim than "the loop rarely
+runs", and it points somewhere different: the follow-up reaches the planner and
+produces a search, but nothing carries the retrieved figure into the final
+answer. Improving the loop means fixing repair, not tuning when it triggers.
+
+The other continuation, `web-current-event`, grew its draft from 2,313 to 3,788
+characters over 89.5s. Whether that is an improvement is not assertable - the
+question is `volatile`, so content is only scored in replay.
+
+**Cost.** Median latency 23.4s at budget 0 against 25.7s at budget 1 across all
+questions (means 24.7s and 28.1s). About +2.3s median, consistent with the +3.1s
+the scoped sweep measured on a narrower, cheaper set.
+
+### The News Agent is being picked for questions that did not ask for news
+`multi-web-and-financial` delegated to `news_agent` on **8 of 8 runs**, and three
+other questions did so once each. The question is "What is the current price of
+Bitcoin, and what has the European Central Bank most recently said about
+regulating crypto assets?", labelled `[financial, web]` before phase 5 existed.
+
+This needs a decision rather than a fix. "What has X most recently said" is
+news-shaped, and delegating it to a specialist news agent is defensible - the
+label predates the tool, exactly like the delegation questions did in the other
+direction after phase 5 landed. Adding `news_agent` to that question's
+`expected_routes` would recover 8 of the 44 routing failures, which is why it
+should be an explicit call and not a quiet edit.
+
+### One run lost, and it is worth naming
+`delegate-news-topic` budget 0 rep 2 died with
+`AttributeError("'A2AClientTimeoutError' object has no attribute 'status_code'")`
+- an unhandled path inside the A2A client's own error handling, where a timeout
+is passed to code expecting an HTTP response. ADR-0018 accepted losing the clean
+unreachable-service error as the cost of addressing the remote as an agent rather
+than an endpoint; this is that cost showing up concretely. The other seven
+delegation runs routed correctly.
+
+### What has not moved
+Redundancy (69%) and decline (40%) are where they have been all along, on the
+same questions. ADR-0015's conclusion continues to hold: a ceiling bounds the
+worst case and cannot produce efficiency. Decline remains the most serious open
+defect and the one with the clearest business consequence - answering from the
+wrong source is worse than saying nothing.

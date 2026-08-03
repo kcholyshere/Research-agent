@@ -26,7 +26,7 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for how the pieces fit together, and
 ## Limitations
 - Not containerised yet; it runs from a local checkout.
 - News questions need the News Agent process running separately.
-- Knowledge-base answers do not yet carry inline citations.
+- Sometimes delegates to the News Agent when only the web is needed.
 - Repeats searches on some questions, up to six calls.
 - Sometimes answers from the web instead of declining cleanly.
 - Web citations are Vertex redirect links, not readable URLs.
