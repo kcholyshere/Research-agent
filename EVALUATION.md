@@ -180,3 +180,41 @@ routing at 80% rather than 87%, because the two delegation questions expect
 `[news_agent]` and that run predates the tool. That is a label change, not a
 regression - a pre-phase-5 run cannot satisfy a post-phase-5 label. Compare
 those two questions only within their own era.
+### 2026-08-03, later: the HTML artefact defect, fixed and re-measured
+The defect above was reproduced first rather than patched from the summary, and
+the mode was not "forgot to call the tool" but "did the tool's job itself". Of
+four pre-fix runs, three hand-wrote a styled page into the answer - their own CSS
+classes, `<div class="card">`, a `<style>` block - and one narrated a review of
+its own stylesheet ("there is a minor bug in the CSS of Section 4, `</>` instead
+of `</style>`"). Routing was correct on all four, so nothing failed but the
+artefact assertion. The answers were also truncated mid-markup, because authoring
+a whole HTML document runs into `max_output_tokens`.
+
+The cause was ambiguous wording, not model waywardness. The tool described
+`output_format: "html"` as "a styled standalone page", which reads as *you supply
+one* rather than *this tool produces one*, and the planner instruction repeated
+the phrasing. On that reading, hand-writing the markup is the obedient
+interpretation. The fix removes the ambiguity rather than adding a fourth
+prohibition to an instruction that already carried three.
+
+| | artefact produced |
+|---|---|
+| before the fix | 1 of 4 runs |
+| after the fix | 5 of 5 completed runs |
+
+Every post-fix run called `create_canvas` exactly once and returned a 4.6-5.3 KB
+HTML artefact with a short covering note, which is the intended shape. Two reps
+across those batches died on OAuth transport errors from a tethered connection
+and are excluded as environment rather than code.
+
+The chain-of-thought leakage noted as a separate defect turned out to be the same
+one. It appears only in the pre-fix run, where the model was reviewing its own
+CSS; all five post-fix answers are clean of it. It was a symptom of the model
+doing Canvas's job, not an independent defect, and needed no separate fix.
+
+`check_artefact` now also fails any answer containing raw block-level or styling
+markup, on every question rather than only artefact ones - writing a document into
+the reply is a defect regardless of what was asked. Inline emphasis tags are
+excluded deliberately, since they appear in quoted source text and would accuse
+correct answers. Calibrated against the 248 stored answers from the 09:20 sweep:
+zero false positives.
