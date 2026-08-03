@@ -185,6 +185,17 @@ def _prose_word_count(text: str) -> int:
     """Words in `text`, excluding URLs and the link targets around them."""
     return len(_URL_WORD_RE.sub(" ", text).split())
 
+# Block-level and styling tags an agent emits when it authors a document, kept
+# deliberately narrow. Inline emphasis (<b>, <strong>, <em>) is excluded: those
+# appear in legitimately-quoted source text often enough that matching them
+# would accuse correct answers, and a document being hand-written always brings
+# structure with it - a div, a section, a style block, a heading or a table.
+_RAW_MARKUP_RE = re.compile(
+    r"</?(?:html|head|body|div|section|article|style|table|thead|tbody|tr|td|th|"
+    r"h1|h2|h3|ul|ol|li|doctype)\b[^>]*>",
+    re.IGNORECASE,
+)
+
 # Wasted-cycle similarity threshold. difflib's SequenceMatcher ratio is a
 # cheap, dependency-free proxy for "did the draft actually change" - it does
 # not understand meaning, but restating the same facts in slightly different
@@ -423,6 +434,31 @@ def check_artefact(question: EvalQuestion, record: RunRecord) -> AssertionResult
     regression the gated synthesise step was designed to avoid, so it needs to
     be measured rather than assumed.
     """
+    # Raw markup in the answer is a failure on ANY question, checked before the
+    # expects_artefact split for that reason. It is the measured failure mode of
+    # the HTML artefact defect (2026-08-03): rather than calling create_canvas,
+    # the agent hand-wrote a styled page into its own reply - `<div
+    # class="card">`, its own CSS classes, and in one run a review of its own
+    # stylesheet ("there is a minor bug in the CSS of Section 4"). The turn still
+    # returned an answer and still routed correctly, so nothing but this fails.
+    #
+    # A tag-shaped substring alone is not enough to accuse: prose legitimately
+    # contains "<" in comparisons, and financial answers say things like
+    # "revenue < 2%". The pattern therefore requires a recognised block-level or
+    # styling tag, which is what an agent authoring a document emits and what
+    # ordinary prose does not.
+    if _RAW_MARKUP_RE.search(record.answer):
+        found = sorted({m.group(0).lower() for m in _RAW_MARKUP_RE.finditer(record.answer)})[:5]
+        return AssertionResult(
+            key="artefact",
+            passed=False,
+            detail=(
+                f"the answer contains raw markup ({', '.join(found)}) - the agent wrote a "
+                "document into its reply instead of calling create_canvas, which produces "
+                "no file and shows the reader tags"
+            ),
+        )
+
     if not question.expects_artefact:
         if not record.artefact:
             return None

@@ -219,7 +219,9 @@ _HTML_TEMPLATE = """\
 {% for heading, body in sections %}
 <section>
 <h2>{{ heading }}</h2>
-<p>{{ body }}</p>
+{% for para in body | paragraphs %}
+<p>{{ para }}</p>
+{% endfor %}
 </section>
 {% endfor %}
 {% if citations %}
@@ -295,6 +297,23 @@ _ENV.autoescape = False
 _HTML_ENV = _ENV.overlay(autoescape=True)
 
 
+def _paragraphs(text: str) -> list[str]:
+    """Split a body on blank lines into paragraphs.
+
+    The HTML template used to wrap a whole body in one `<p>`, which collapsed a
+    multi-paragraph section into a single run-on block - HTML ignores the
+    newlines the model wrote, so prose that read correctly everywhere else
+    rendered as a wall of text only in the html format. Splitting here rather
+    than asking the model for one paragraph per section keeps the section
+    boundary meaning what it means in the other two templates.
+    """
+    return [block.strip() for block in re.split(r"\n\s*\n", text.strip()) if block.strip()]
+
+
+_ENV.filters["paragraphs"] = _paragraphs
+_HTML_ENV.filters["paragraphs"] = _paragraphs
+
+
 def _slug(title: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
     return (s[:60] or "artefact").rstrip("-")
@@ -308,7 +327,13 @@ def create_canvas(
     citations: list[str],
     language: str = "",
 ) -> dict[str, Any]:
-    """Render collected research into a finished artefact: a report, document, or code file.
+    """Generate a finished artefact file - a report, document, or code file - from research you already have.
+
+    This is the ONLY way to produce a file. You cannot write one yourself, and
+    no document exists unless this tool has returned "status": "ok" - so never
+    describe a file you have not created this way, and never write the document
+    out in your reply as a substitute.
+
 
     Call this ONLY when the user asked for a deliverable rather than an answer -
     a report, a document, a write-up, a summary document, a code file, a
@@ -321,13 +346,22 @@ def create_canvas(
 
     Args:
         title: The artefact's title, e.g. "IFC FY24 Financial Performance".
-        output_format: One of "markdown" (a report or document), "html" (a
-            styled standalone page), or "code" (a commented source file).
-        section_headings: One heading per section, in order.
+        output_format: One of "markdown", "html" or "code". This selects which
+            template renders your content; it does NOT ask you to write in that
+            format. THIS TOOL generates the markup: for "html" it produces the
+            complete page - doctype, head, title, stylesheet, layout - so you
+            supply plain prose and it comes back as a styled standalone page.
+            Never hand-write HTML, CSS, or markdown structure yourself; there is
+            no way to pass your own styling and none is needed.
+        section_headings: One heading per section, in order. Plain text, not
+            markup - the template adds the heading tags.
         section_bodies: One body per section, in the SAME order and the SAME
             number as section_headings - the Nth heading titles the Nth body.
-            Each body is the finished prose (or code) for that section, with
-            its facts already cited inline as you would in a normal answer.
+            Each body is finished PROSE for that section (or source code, when
+            output_format is "code"), with its facts already cited inline as you
+            would in a normal answer. Separate paragraphs with a blank line.
+            Do not include tags, CSS or markdown headings in a body: for "html"
+            they are escaped and your reader sees the tags as literal text.
         citations: Every source used, as URLs or document-and-page references.
             These are collected into a Sources section at the end. Pass an
             empty list only if the artefact genuinely rests on no sources.
