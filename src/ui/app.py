@@ -11,6 +11,7 @@ Run with: uv run python -m streamlit run src/ui/app.py
 import asyncio
 import threading
 import time
+from pathlib import Path
 
 import streamlit as st
 from google.adk.runners import InMemoryRunner
@@ -37,9 +38,16 @@ async def _run_turn(
     message: str,
     critique_budget: int,
     web_search_thinking_budget: int,
-) -> str:
+) -> tuple[str, dict[str, str] | None]:
     content = genai_types.Content(role="user", parts=[genai_types.Part(text=message)])
     final_text = "(no response)"
+    # The phase 6 artefact, captured from create_canvas's function RESPONSE
+    # rather than from the answer text. On an artefact turn the answer is a
+    # short covering note by design (see step 4 of research_agent's
+    # instruction), so a UI that rendered only the answer would show the user
+    # "I have written the report to /path/..." and nothing else - the
+    # deliverable would exist on disk and never appear on screen.
+    artefact: dict[str, str] | None = None
     # session_id/user_id group this turn's spans into Langfuse's Sessions/Users
     # views - each chat_input submission is one ADK run, so one Langfuse trace.
     with propagate_attributes(session_id=session_id, user_id=USER_ID, tags=["research_agent"]):
@@ -70,6 +78,21 @@ async def _run_turn(
             # "draft_answer" is not a safe substitute either: it sometimes
             # holds the research agent's planning narration rather than its
             # answer. The research agent's own final response is the answer.
+            if event.author == research_agent.name:
+                # Same capture the evaluation harness does (run_eval._cycles),
+                # for the same reason: the rendered artefact is in the tool
+                # response, and only a successful render counts - an error
+                # return is not a document.
+                for response in event.get_function_responses():
+                    if response.name != "create_canvas":
+                        continue
+                    payload = response.response
+                    if isinstance(payload, dict) and payload.get("status") == "ok":
+                        artefact = {
+                            "text": payload.get("artefact", ""),
+                            "format": payload.get("format", ""),
+                            "path": payload.get("path", ""),
+                        }
             if (
                 event.author == research_agent.name
                 and event.is_final_response()
@@ -81,7 +104,57 @@ async def _run_turn(
     # each turn keeps traces visible promptly rather than waiting on the SDK's
     # background batch export - worth the small per-turn cost here.
     langfuse_client.flush()
-    return final_text
+    return final_text, artefact
+
+
+# Filename extension -> (Streamlit code language, download MIME type). The
+# artefact's own format string drives both, so a fourth Canvas format needs one
+# entry here rather than a new branch.
+_ARTEFACT_MIME = {"markdown": "text/markdown", "html": "text/html", "code": "text/plain"}
+
+
+def _render_artefact(artefact: dict[str, str]) -> None:
+    """Show a Canvas artefact below the answer, with a download.
+
+    Rendered per format rather than uniformly, because the useful view differs:
+
+    - markdown renders as markdown, which is what the document is meant to look
+      like. "$" is escaped for the same reason the answer escapes it - financial
+      artefacts are full of dollar figures, and st.markdown reads a pair of them
+      as a LaTeX span and garbles everything between two unrelated amounts.
+    - html is shown as SOURCE, not rendered. st.html would be the obvious
+      choice and is the wrong one: Canvas emits a complete standalone document
+      (doctype, head, its own <style>), and injecting that into a page that
+      already has both would have the artefact's CSS leak into the app's own
+      layout. The download plus "open the file" is the honest presentation of a
+      standalone page.
+    - code is shown as code. No language is stored on the artefact, so the
+      highlighter is left to infer it rather than guessing wrongly from the
+      title.
+    """
+    text = artefact.get("text", "")
+    if not text:
+        return
+    fmt = artefact.get("format", "")
+    path = artefact.get("path", "")
+    name = Path(path).name if path else f"artefact.{fmt or 'txt'}"
+
+    with st.container(border=True):
+        st.caption(f":material/description: Artefact - {fmt or 'unknown format'} - `{name}`")
+        if fmt == "markdown":
+            st.markdown(text.replace("$", "\\$"))
+        elif fmt == "html":
+            st.code(text, language="html")
+        else:
+            st.code(text)
+        st.download_button(
+            "Download artefact",
+            data=text,
+            file_name=name,
+            mime=_ARTEFACT_MIME.get(fmt, "text/plain"),
+            icon=":material/download:",
+            key=f"download-{name}",
+        )
 
 
 async def _ensure_session(runner: InMemoryRunner) -> str:
@@ -160,6 +233,12 @@ if "history" not in st.session_state:
 for turn in st.session_state["history"]:
     with st.chat_message(turn["role"]):
         st.markdown(turn["content"])
+        # Replayed from history rather than rendered once: Streamlit reruns the
+        # whole script on every interaction, so an artefact shown only in the
+        # branch that produced it disappears the moment the user touches a
+        # slider or sends another message.
+        if turn.get("artefact"):
+            _render_artefact(turn["artefact"])
 
 if prompt := st.chat_input("Ask a question about the knowledge base"):
     # Escape literal "$" - financial answers are full of dollar amounts, and
@@ -173,11 +252,11 @@ if prompt := st.chat_input("Ask a question about the knowledge base"):
     with st.chat_message("assistant"):
         # Run the turn on a background thread so the status label can keep
         # ticking up ("Thinking for x.x seconds...") while asyncio.run blocks.
-        turn_result: dict[str, str] = {}
+        turn_result: dict[str, object] = {}
 
         def _run_turn_sync() -> None:
             try:
-                turn_result["answer"] = asyncio.run(
+                turn_result["answer"], turn_result["artefact"] = asyncio.run(
                     _run_turn(
                         runner,
                         session_id,
@@ -190,6 +269,7 @@ if prompt := st.chat_input("Ask a question about the knowledge base"):
                 # Vertex errors, an empty/missing FAISS index, etc. should read as a
                 # message in the chat, not crash the page.
                 turn_result["answer"] = f"Error: {exc}"
+                turn_result["artefact"] = None
 
         start_time = time.monotonic()
         turn_thread = threading.Thread(target=_run_turn_sync, daemon=True)
@@ -199,6 +279,11 @@ if prompt := st.chat_input("Ask a question about the knowledge base"):
                 status.update(label=f"Thinking for {time.monotonic() - start_time:.1f} seconds...")
                 turn_thread.join(timeout=0.2)
             status.update(label=f"Thought for {time.monotonic() - start_time:.1f} seconds", state="complete")
-        answer = turn_result["answer"].replace("$", "\\$")
+        answer = str(turn_result["answer"]).replace("$", "\\$")
         st.markdown(answer)
-    st.session_state["history"].append({"role": "assistant", "content": answer})
+        artefact = turn_result.get("artefact")
+        if artefact:
+            _render_artefact(artefact)
+    st.session_state["history"].append(
+        {"role": "assistant", "content": answer, "artefact": artefact}
+    )
