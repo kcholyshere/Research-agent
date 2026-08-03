@@ -24,6 +24,7 @@ The series' focus is system architecture and design thinking for agentic systems
 - Optional UI: `src/ui/app.py`, Streamlit, a thin chat client over `root_agent` via `google.adk.runners.InMemoryRunner` (see ADR-0002). Containerisation: Docker (Dockerfile present, build not yet verified).
 
 ## Critical rules
+- Deadline: the project is presented on **2026-08-04 at 11:00**, with phases 5 and 6 still unimplemented as of 2026-08-03. Wall-clock is the binding constraint, not polish - prefer the smallest thing that can be demoed and explained on stage over the most complete implementation, and sequence work so every phase has something demonstrable. The evaluation pipeline is the main sink: a full sweep is about an hour, and phases 5 and 6 will each want new eval components. Never start a full sweep without naming its cost and its hypothesis first. Once the presentation has happened, delete this rule.
 - Markdown: never leave a blank line directly after a heading. The first line of content (or the next heading, where a section is immediately followed by a subsection) goes on the line straight below it. Applies to every `#` level, in every markdown file in this repo.
 - Commit and push at reasonable intervals (per logical step, not one batch at the end).
 - Requirements per phase live in `agent_docs/phase_N_requirements.md`; keep `agent_docs/TODOS.md` current as phases progress.
