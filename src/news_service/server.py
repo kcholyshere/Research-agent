@@ -9,11 +9,15 @@ neither `a2a` nor `a2a_sdk` is installed in this venv
 - it was never pulled in. Per CLAUDE.md's rule to verify any library
 against what is actually installed rather than docs, adding and learning
 an unverified third-party protocol library under this phase's "optional"
-scope was judged worse than a small, explicit HTTP surface built entirely
-on dependencies already present: FastAPI and uvicorn are transitive
-dependencies of google-adk itself (see uv.lock's [[package]] entry for
-google-adk), so nothing new had to be added to pyproject.toml to run this.
-What real A2A adds over this - an agent card for capability discovery,
+scope was judged worse than a small, explicit HTTP surface built on
+dependencies already resolved in this venv: FastAPI, uvicorn and httpx
+(the client tool's side) were already present as transitive dependencies
+of google-adk itself before this phase (see uv.lock's [[package]] entry
+for google-adk), so nothing new had to be resolved to run this. They are
+now declared explicitly in pyproject.toml regardless, on the same
+precedent as that file's pyyaml entry: a shipped-agent-path dependency
+that a future adk release could silently drop should break the build, not
+the A2A demo at runtime. What real A2A adds over this - an agent card for capability discovery,
 standardised task/artifact semantics for a fleet of agents - is not worth
 its complexity for one hardcoded endpoint with one request/response shape;
 revisit if a second external agent joins and that discovery machinery

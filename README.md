@@ -36,3 +36,26 @@ hard-codes the venv's absolute path at `uv sync` time, so it breaks if the proje
 directory is ever renamed/moved without recreating `.venv` (hit this after the
 `ResearchAgent` -> `Research-agent` rename). `python -m` resolves through the
 interpreter instead, so it's rename-proof.
+
+## Phase 5: News Agent (A2A demo)
+A minimal, single-purpose News Agent runs as its own process, reached over a
+plain HTTP endpoint rather than the `a2a` protocol library named in the phase
+1 requirements (not installed in this venv; see `src/news_service/server.py`'s
+docstring for why HTTP was chosen instead). Demonstrates delegation across a
+process boundary: the main agent's `get_latest_news` tool
+(`src/tools/news_agent.py`) never imports the News Agent - it only ever
+speaks to it over the network, and degrades to a clear error dict if that
+service is not running.
+
+```bash
+# terminal 1 - start the News Agent service (binds :8001)
+uv run python -m src.news_service.server
+
+# terminal 2 - demo it directly
+curl -s -X POST http://localhost:8001/news \
+    -H "Content-Type: application/json" \
+    -d '{"topic": "artificial intelligence regulation"}' | python -m json.tool
+
+# or drive it from the main agent (once wired into research_agent/agent.py)
+uv run adk web src
+```

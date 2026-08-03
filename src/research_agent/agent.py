@@ -42,10 +42,15 @@ from langfuse import get_client
 GoogleADKInstrumentor().instrument()
 langfuse_client = get_client()
 
+from typing import Any
+
 from google.adk.agents import Agent, LoopAgent
+from google.adk.tools.base_tool import BaseTool
+from google.adk.tools.tool_context import ToolContext
 from google.genai import types
 
 from src.services import genai_client
+from src.tools.canvas import create_canvas
 from src.tools.document_search import search_documents
 from src.tools.financial_data import get_financial_data
 from src.tools.web_search import web_search_tool
@@ -53,11 +58,50 @@ from src.tools.web_search import web_search_tool
 # Imported after instrument() (see the observability note above) - this
 # module's own import constructs critique_agent = Agent(...) at load time.
 from src.research_agent import tool_budget
-from src.research_agent.critique import critique_agent, reset_turn_state
+from src.research_agent.critique import LAST_ARTEFACT_KEY, critique_agent, reset_turn_state
+
+
+def _record_artefact(
+    tool: BaseTool,
+    args: dict[str, Any],
+    tool_context: ToolContext,
+    tool_response: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Put a rendered artefact into session state for the critique to review.
+
+    Signature verified against the installed google-adk 2.5.0 rather than taken
+    from docs, per CLAUDE.md: `AfterToolCallback` is
+    `Callable[[BaseTool, dict[str, Any], ToolContext, dict], Optional[dict]]`,
+    and the flow invokes it by KEYWORD - `tool=`, `args=`, `tool_context=`,
+    `tool_response=` - so these four parameter names are load-bearing and
+    renaming any of them breaks the call rather than being cosmetic.
+
+    Wired as research_agent's after_tool_callback. Without it the critique
+    reviews `draft_answer`, which on an artefact turn is a short covering note
+    by design (see step 4 of INSTRUCTION) - it would find no substance in the
+    note, conclude the question was barely answered, and raise follow-ups on
+    every single artefact turn. That is a refinement cycle spent re-researching
+    a document that was already complete, on the most expensive turns in the
+    system and the ones most likely to be demonstrated.
+
+    Only successful renders are recorded. An error return is not an artefact,
+    and showing the critique a failed one would have it review a document that
+    does not exist.
+
+    Returns None so ADK keeps the real tool response - returning a value here
+    would replace what the model sees.
+    """
+    if tool.name != "create_canvas":
+        return None
+    if isinstance(tool_response, dict) and tool_response.get("status") == "ok":
+        tool_context.state[LAST_ARTEFACT_KEY] = tool_response.get("artefact", "")
+    return None
 
 INSTRUCTION = """You are a research agent with three sources of evidence: a
 private knowledge base (search_documents), live financial market data
-(get_financial_data), and the public internet (web_search_tool). For every
+(get_financial_data), and the public internet (web_search_tool). You also have
+one output tool, create_canvas, which is not a source and gathers nothing - it
+renders research you have already done into a finished artefact. For every
 question, follow a plan-execute-synthesize flow:
 
 0. Refinement check: {critique_followups?} holds specific follow-up
@@ -77,6 +121,16 @@ question, follow a plan-execute-synthesize flow:
    use multiple sources for a fact if the question genuinely requires
    combining evidence across them - not as a routine double-check of a
    source that already answers the fact on its own. State the plan briefly.
+
+   Also decide, once, what the question wants back. Most questions want an
+   answer: reply in prose and do not call create_canvas. Some ask for a
+   deliverable - a report, a document, a write-up, a briefing, a code file,
+   a template, anything phrased as "write me...", "produce...", "draft...",
+   "generate a ... file". Those end with a create_canvas call. This changes
+   nothing about which sources you consult or how many calls you make: the
+   facts still come from the three evidence tools, and create_canvas only
+   formats what you have gathered. A deliverable request is not a licence to
+   search more widely than the question needs.
 2. Execute: call only the tool(s) you planned for each fact, once each. If a
    result already contains the fact you planned it for, that fact is done -
    never issue another search to "verify", "confirm", or add detail beyond
@@ -127,6 +181,34 @@ question, follow a plan-execute-synthesize flow:
    unsourced "not available" is indistinguishable from not having looked.
 
    State each caveat once; never repeat a sentence, disclaimer, or phrase.
+4. Finalise, ONLY if step 1 decided this question asks for a deliverable. If
+   it does not - and most do not - stop at step 3; your prose answer is the
+   whole output and calling create_canvas would be wrong.
+
+   For a deliverable, do not write the document in your reply and then also
+   pass it to the tool. Take the answer you just synthesized and hand it to
+   create_canvas as structure rather than as prose:
+   - title: what the deliverable is about.
+   - output_format: "markdown" for a report, document or write-up; "html"
+     when a styled standalone page is asked for; "code" for a source file,
+     with `language` set.
+   - section_headings and section_bodies: parallel lists of the SAME length,
+     the Nth heading titling the Nth body. Split the answer along the
+     question's own structure - one section per fact, comparison, or part it
+     asked about - rather than into arbitrary blocks.
+   - Each body carries its facts cited inline, exactly as step 3 requires. The
+     artefact is the deliverable, so a citation that appears only in your
+     reply and not in the body has not been delivered.
+   - citations: every source behind the artefact, as URLs or document-and-page
+     references. These are collected into the artefact's own Sources section.
+
+   If create_canvas returns status "error", read the detail, fix exactly what
+   it names, and call it once more. Do not fall back to answering in prose:
+   the question asked for an artefact, and prose is not one.
+
+   Then reply briefly - say what you produced and where it was written, and
+   let the artefact carry the content. Do not paste the whole document into
+   your reply as well.
 """
 
 # A caveat once is enough (see the synthesize step) - but the last line of
@@ -154,9 +236,14 @@ _GENERATE_CONTENT_CONFIG = types.GenerateContentConfig(
 research_agent = Agent(
     name="research_agent",
     model=config.GEMINI_MODEL,
-    description="Answers questions over a private knowledge base, live financial market data, and the public internet via planned, multi-source search.",
+    description="Answers questions over a private knowledge base, live financial market data, and the public internet via planned, multi-source search, and renders the result as a report, document or code file when one is asked for.",
     instruction=INSTRUCTION,
-    tools=[search_documents, get_financial_data, web_search_tool],
+    # create_canvas is last on purpose - it is the only non-evidence tool here
+    # and the only one that ends a turn rather than informing it. See
+    # src/tools/canvas.py for why it must be exempt from the tool budget and
+    # from the redundancy metric; both exemptions key off its name, so renaming
+    # it means changing tool_budget.OUTPUT_TOOLS and schema.OUTPUT_TOOLS too.
+    tools=[search_documents, get_financial_data, web_search_tool, create_canvas],
     generate_content_config=_GENERATE_CONTENT_CONFIG,
     # A hard per-turn ceiling on calls to each tool. The instruction above
     # already forbids re-searching a fact it has, and the 2026-07-29 baseline
@@ -164,6 +251,7 @@ research_agent = Agent(
     # bound lives in code, for the same reason max_output_tokens does
     # (ADR-0009). See tool_budget.py for the ceiling and the refusal wording.
     before_tool_callback=tool_budget.enforce_tool_budget,
+    after_tool_callback=_record_artefact,
     output_key="draft_answer",
 )
 
