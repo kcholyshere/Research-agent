@@ -39,6 +39,21 @@ _STEP_LABELS = {
     "create_canvas": "Building the artefact",
 }
 
+# One colour per source, so a glance at the expander shows which mix of sources
+# a turn used without reading the labels. Streamlit's markdown supports a fixed
+# set of colour names in `:colour[text]`; these are all from that set.
+_CRITIQUE_KIND = "critique"
+_REFUSED_KIND = "refused"
+_STEP_COLOURS = {
+    "search_documents": "blue",
+    "web_search_agent": "green",
+    "get_financial_data": "orange",
+    "news_agent": "violet",
+    "create_canvas": "primary",
+    _CRITIQUE_KIND: "gray",
+    _REFUSED_KIND: "red",
+}
+
 # exit_loop is the critique agent's loop-termination signal, not research work -
 # it is bookkeeping the user has no use for, and it always takes ~0.0s.
 _HIDDEN_STEPS = frozenset({"exit_loop"})
@@ -63,6 +78,15 @@ def _close_steps(steps: list[dict]) -> None:
             step["ended"] = now
 
 
+def _duration(seconds: float) -> str:
+    """Seconds at one decimal place, without a pointless trailing ".0".
+
+    `:g` drops it: 6.0 renders "6s", 1.6 renders "1.6s". At this precision a
+    ".0" is noise - it implies a resolution the measurement does not have.
+    """
+    return f"{round(seconds, 1):g}s"
+
+
 def _format_steps(steps: list[dict]) -> str:
     """One line per step, for the body of the status expander.
 
@@ -71,14 +95,26 @@ def _format_steps(steps: list[dict]) -> str:
     renders it directly, so both produce exactly one markdown element inside the
     status. Element counts matching between the two paths is what stops the
     previous answer being stranded on screen - see the history loop below.
+
+    Lines are joined with a markdown hard break rather than made a list, because
+    a "-" bullet reads as a dash next to the coloured marker that now carries
+    the same "this is an item" meaning.
     """
     lines = []
     for step in steps:
-        if step["ended"] is None:
-            lines.append(f"- {step['label']}...")
+        colour = _STEP_COLOURS.get(step.get("kind"), "gray")
+        marker = f":{colour}[■]"
+        if step.get("refused"):
+            # No duration: the call was blocked before it ran, so any number
+            # here would be the cost of being refused, not of doing work.
+            lines.append(f"{marker} {step['label']}")
+        elif step["ended"] is None:
+            lines.append(f"{marker} {step['label']}...")
         else:
-            lines.append(f"- {step['label']} - {step['ended'] - step['started']:.1f}s")
-    return "\n".join(lines)
+            lines.append(
+                f"{marker} {step['label']} for {_duration(step['ended'] - step['started'])}"
+            )
+    return "  \n".join(lines)
 
 langfuse_client = get_client()
 
@@ -155,6 +191,7 @@ async def _run_turn(
                 if critique_step is None:
                     critique_step = {
                         "label": "Critiquing the draft",
+                        "kind": _CRITIQUE_KIND,
                         "started": time.monotonic(),
                         "ended": None,
                     }
@@ -168,6 +205,7 @@ async def _run_turn(
                     continue
                 step = {
                     "label": _STEP_LABELS.get(call.name, call.name),
+                    "kind": call.name,
                     "started": time.monotonic(),
                     "ended": None,
                 }
@@ -175,8 +213,26 @@ async def _run_turn(
                 steps.append(step)
             for response in event.get_function_responses():
                 step = open_calls.pop(response.id, None)
-                if step is not None:
-                    step["ended"] = time.monotonic()
+                if step is None:
+                    continue
+                step["ended"] = time.monotonic()
+                # A call the tool budget refused never ran, so reporting it as
+                # "Searching the web for 0s" is actively misleading - it reads
+                # as a search that found nothing rather than one that was
+                # blocked. Relabelling it says what actually happened, and is
+                # the most useful line in the expander when a turn goes wide:
+                # it marks the exact point the agent stopped being allowed to
+                # gather more. Keyed on the error string tool_budget._refusal
+                # returns, not on a zero duration, which would also match a
+                # genuinely instant call.
+                payload = response.response
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("error") == "tool_call_budget_exhausted"
+                ):
+                    step["label"] = f"{step['label']}: refused, turn budget reached"
+                    step["kind"] = _REFUSED_KIND
+                    step["refused"] = True
 
             if event.author == research_agent.name:
                 # Same capture the evaluation harness does (run_eval._cycles),
@@ -358,7 +414,7 @@ for turn_index, turn in enumerate(st.session_state["history"]):
         # side benefit that the timing stays visible instead of vanishing the
         # moment the user sends anything else.
         if turn.get("elapsed") is not None:
-            with st.status(f"Thought for {turn['elapsed']:.1f} seconds", state="complete"):
+            with st.status(f"Thought for {_duration(turn['elapsed'])}", state="complete"):
                 # Unconditional, even when the turn used no tools: the live path
                 # always writes one markdown element in here, so this one must
                 # too or the element counts diverge again.
@@ -412,13 +468,22 @@ if prompt := st.chat_input("Ask a question about the knowledge base"):
         start_time = time.monotonic()
         turn_thread = threading.Thread(target=_run_turn_sync, daemon=True)
         turn_thread.start()
-        with st.status("Thinking...", state="running") as status:
+        # expanded=True while running, and it matters more than it looks.
+        # status.update() re-sends the container's DECLARED expanded value on
+        # every call, and this loop calls it every 0.2s - so a click to open the
+        # expander was being thrown away a tenth of a second later, making the
+        # live steps impossible to read. Declaring it open removes the fight:
+        # the steps are the point while the turn runs, and it is collapsed again
+        # on completion so the finished answer is not buried under the trace.
+        with st.status("Thinking...", state="running", expanded=True) as status:
             # One placeholder, rewritten each tick, rather than a fresh element
             # per tick - otherwise every 0.2s poll would append another copy of
             # the step list to the expander.
             steps_slot = st.empty()
             while turn_thread.is_alive():
-                status.update(label=f"Thinking for {time.monotonic() - start_time:.1f} seconds...")
+                status.update(
+                    label=f"Thinking for {_duration(time.monotonic() - start_time)}..."
+                )
                 steps_slot.markdown(_format_steps(steps))
                 turn_thread.join(timeout=0.2)
             # Captured rather than recomputed inside the label, because it is
@@ -430,7 +495,12 @@ if prompt := st.chat_input("Ask a question about the knowledge base"):
             # so without this the expander would keep a step reading "..." even
             # though the turn is done.
             steps_slot.markdown(_format_steps(steps))
-            status.update(label=f"Thought for {elapsed:.1f} seconds", state="complete")
+            # Collapsed here, and this is the last update the container gets -
+            # so from now on the user's own click sticks, which is the
+            # behaviour they already had once a turn finished.
+            status.update(
+                label=f"Thought for {_duration(elapsed)}", state="complete", expanded=False
+            )
         answer = str(turn_result["answer"]).replace("$", "\\$")
         st.markdown(answer)
         artefact = turn_result.get("artefact")
