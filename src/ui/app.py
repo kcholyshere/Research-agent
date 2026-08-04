@@ -20,9 +20,65 @@ from langfuse import get_client, propagate_attributes
 
 from src import config
 from src.research_agent.agent import research_agent, root_agent  # instruments ADK on import, see agent.py
+from src.research_agent.critique import CRITIQUE_AGENT_NAME
 
 APP_NAME = "research_agent"
 USER_ID = "streamlit-user"
+
+# Tool name -> what the user sees while it runs. Keyed by the name that appears
+# in a real event's `call.name`, which for an AgentTool is the wrapped agent's
+# name rather than the Python variable - "web_search_agent", not
+# "web_search_tool". That distinction is the same one src/evaluation/schema.py's
+# TOOL_TO_ROUTE comment exists to warn about, and getting it wrong here would
+# show raw tool names in the UI rather than fail loudly.
+_STEP_LABELS = {
+    "search_documents": "Searching the knowledge base",
+    "web_search_agent": "Searching the web",
+    "get_financial_data": "Fetching market data",
+    "news_agent": "Talking to the News Agent",
+    "create_canvas": "Building the artefact",
+}
+
+# exit_loop is the critique agent's loop-termination signal, not research work -
+# it is bookkeeping the user has no use for, and it always takes ~0.0s.
+_HIDDEN_STEPS = frozenset({"exit_loop"})
+
+
+def _close_steps(steps: list[dict]) -> None:
+    """Stop the clock on anything still running when a turn ends.
+
+    Called from the UI thread's `finally` rather than from inside the turn,
+    because the usual reason a step never closes is the turn RAISING - an
+    unreachable News Agent surfaces as an ADK-level error rather than as a tool
+    response (see src/tools/news_agent.py), so cleanup written after the event
+    loop would be skipped exactly when it is needed. Every step, tool or
+    critique phase, is in this one list, so a single scan closes them all.
+
+    Without it the expander reads "Talking to the News Agent..." forever on a
+    failed turn instead of giving the duration it actually spent trying.
+    """
+    now = time.monotonic()
+    for step in steps:
+        if step["ended"] is None:
+            step["ended"] = now
+
+
+def _format_steps(steps: list[dict]) -> str:
+    """One line per step, for the body of the status expander.
+
+    Deliberately returns a single markdown string rather than writing several
+    elements: the live path fills a placeholder with this and the history replay
+    renders it directly, so both produce exactly one markdown element inside the
+    status. Element counts matching between the two paths is what stops the
+    previous answer being stranded on screen - see the history loop below.
+    """
+    lines = []
+    for step in steps:
+        if step["ended"] is None:
+            lines.append(f"- {step['label']}...")
+        else:
+            lines.append(f"- {step['label']} - {step['ended'] - step['started']:.1f}s")
+    return "\n".join(lines)
 
 langfuse_client = get_client()
 
@@ -38,6 +94,7 @@ async def _run_turn(
     message: str,
     critique_budget: int,
     web_search_thinking_budget: int,
+    steps: list[dict],
 ) -> tuple[str, dict[str, str] | None]:
     content = genai_types.Content(role="user", parts=[genai_types.Part(text=message)])
     final_text = "(no response)"
@@ -48,6 +105,17 @@ async def _run_turn(
     # "I have written the report to /path/..." and nothing else - the
     # deliverable would exist on disk and never appear on screen.
     artefact: dict[str, str] | None = None
+    # Live progress for the status expander. `steps` is owned by the UI thread
+    # and appended to here: list.append and dict item assignment are atomic
+    # under the GIL, and the reader only ever formats a snapshot, so no lock is
+    # needed for the reader to stay consistent. Open tool calls are tracked by
+    # the function call's `id` rather than its name, because the same tool is
+    # called several times in a turn (the budget allows five) and matching a
+    # response to the wrong call would attribute the wrong duration.
+    open_calls: dict[str, dict] = {}
+    critique_step: dict | None = None
+
+
     # session_id/user_id group this turn's spans into Langfuse's Sessions/Users
     # views - each chat_input submission is one ADK run, so one Langfuse trace.
     with propagate_attributes(session_id=session_id, user_id=USER_ID, tags=["research_agent"]):
@@ -78,6 +146,38 @@ async def _run_turn(
             # "draft_answer" is not a safe substitute either: it sometimes
             # holds the research agent's planning narration rather than its
             # answer. The research agent's own final response is the answer.
+            # The critique agent is not reached through a tool call, so it has
+            # no call/response pair to time. Its phase is bounded by authorship
+            # instead: it opens on the first event the critique agent emits and
+            # closes when any other author speaks again (a second research
+            # cycle) or when the turn ends.
+            if event.author == CRITIQUE_AGENT_NAME:
+                if critique_step is None:
+                    critique_step = {
+                        "label": "Critiquing the draft",
+                        "started": time.monotonic(),
+                        "ended": None,
+                    }
+                    steps.append(critique_step)
+            elif critique_step is not None:
+                critique_step["ended"] = time.monotonic()
+                critique_step = None
+
+            for call in event.get_function_calls():
+                if call.name in _HIDDEN_STEPS:
+                    continue
+                step = {
+                    "label": _STEP_LABELS.get(call.name, call.name),
+                    "started": time.monotonic(),
+                    "ended": None,
+                }
+                open_calls[call.id] = step
+                steps.append(step)
+            for response in event.get_function_responses():
+                step = open_calls.pop(response.id, None)
+                if step is not None:
+                    step["ended"] = time.monotonic()
+
             if event.author == research_agent.name:
                 # Same capture the evaluation harness does (run_eval._cycles),
                 # for the same reason: the rendered artefact is in the tool
@@ -258,7 +358,11 @@ for turn_index, turn in enumerate(st.session_state["history"]):
         # side benefit that the timing stays visible instead of vanishing the
         # moment the user sends anything else.
         if turn.get("elapsed") is not None:
-            st.status(f"Thought for {turn['elapsed']:.1f} seconds", state="complete")
+            with st.status(f"Thought for {turn['elapsed']:.1f} seconds", state="complete"):
+                # Unconditional, even when the turn used no tools: the live path
+                # always writes one markdown element in here, so this one must
+                # too or the element counts diverge again.
+                st.markdown(_format_steps(turn.get("steps") or []))
         st.markdown(turn["content"])
         # Replayed from history rather than rendered once: Streamlit reruns the
         # whole script on every interaction, so an artefact shown only in the
@@ -280,6 +384,10 @@ if prompt := st.chat_input("Ask a question about the knowledge base"):
         # Run the turn on a background thread so the status label can keep
         # ticking up ("Thinking for x.x seconds...") while asyncio.run blocks.
         turn_result: dict[str, object] = {}
+        # Written by the turn thread as events arrive, read by the loop below to
+        # redraw the expander - which is what makes the steps appear live rather
+        # than all at once when the turn finishes.
+        steps: list[dict] = []
 
         def _run_turn_sync() -> None:
             try:
@@ -290,6 +398,7 @@ if prompt := st.chat_input("Ask a question about the knowledge base"):
                         prompt,
                         critique_budget,
                         web_search_thinking_budget,
+                        steps,
                     )
                 )
             except Exception as exc:
@@ -297,19 +406,30 @@ if prompt := st.chat_input("Ask a question about the knowledge base"):
                 # message in the chat, not crash the page.
                 turn_result["answer"] = f"Error: {exc}"
                 turn_result["artefact"] = None
+            finally:
+                _close_steps(steps)
 
         start_time = time.monotonic()
         turn_thread = threading.Thread(target=_run_turn_sync, daemon=True)
         turn_thread.start()
         with st.status("Thinking...", state="running") as status:
+            # One placeholder, rewritten each tick, rather than a fresh element
+            # per tick - otherwise every 0.2s poll would append another copy of
+            # the step list to the expander.
+            steps_slot = st.empty()
             while turn_thread.is_alive():
                 status.update(label=f"Thinking for {time.monotonic() - start_time:.1f} seconds...")
+                steps_slot.markdown(_format_steps(steps))
                 turn_thread.join(timeout=0.2)
             # Captured rather than recomputed inside the label, because it is
             # stored on the turn and replayed by the history loop above - the
             # two renders have to agree on the number or the label would drift
             # by whatever the append costs.
             elapsed = time.monotonic() - start_time
+            # Final redraw: the last few steps close after the loop's last tick,
+            # so without this the expander would keep a step reading "..." even
+            # though the turn is done.
+            steps_slot.markdown(_format_steps(steps))
             status.update(label=f"Thought for {elapsed:.1f} seconds", state="complete")
         answer = str(turn_result["answer"]).replace("$", "\\$")
         st.markdown(answer)
@@ -322,5 +442,11 @@ if prompt := st.chat_input("Ask a question about the knowledge base"):
             # avoids.
             _render_artefact(artefact, key_suffix="live")
     st.session_state["history"].append(
-        {"role": "assistant", "content": answer, "artefact": artefact, "elapsed": elapsed}
+        {
+            "role": "assistant",
+            "content": answer,
+            "artefact": artefact,
+            "elapsed": elapsed,
+            "steps": steps,
+        }
     )
