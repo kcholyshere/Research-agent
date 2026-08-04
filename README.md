@@ -103,6 +103,12 @@ Write me a short markdown report on IFC's FY24 net income and total assets.
 ```
 
 ## Evaluation
+The harness runs from the local checkout, and since ADR-0020 the financial
+questions go through the `mcp-fetch` service - so start it first or every
+financial question fails:
+```bash
+docker compose up -d mcp-fetch news-agent
+```
 ```bash
 # full sweep (about an hour: 35 questions x 2 arms x 4 reps)
 uv run python -m src.evaluation.run_eval --reps 4 --mode live --concurrency 4
