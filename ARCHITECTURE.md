@@ -42,7 +42,7 @@ flowchart TD
 
     subgraph Ext["External services"]
         Vertex["Vertex AI<br/>(chat + embedding models)"]
-        MCP["MCP fetch server<br/>(Docker, spawned per call)"]
+        MCP["MCP fetch server<br/>(own service, streamable HTTP)"]
         Yahoo["Yahoo Finance<br/>(3 hardcoded pages)"]
         GSearch["Google Search grounding"]
         NewsSvc["News Agent service<br/>(own process, A2A + agent card)"]
@@ -98,6 +98,12 @@ Three things in that diagram carry most of the design:
 - **The News Agent is a separate process, reached over A2A.** The main agent never imports
   it - it discovers the agent through its published agent card and calls it across a
   process boundary, which is the whole point of phase 5 (ADR-0018).
+- **Everything outside Vertex and Langfuse is a compose service.** The agent, the UI, the
+  News Agent and the MCP fetch server each run as their own container and address each
+  other by service name (ADR-0020). The MCP server is the one that had to be adapted: the
+  reference image speaks stdio only, so it is fronted by a proxy that exposes it over
+  streamable HTTP. Without that, containerising the agent would have meant giving it the
+  host Docker socket, because it used to spawn the server itself for every call.
 
 | Component | File |
 |---|---|
@@ -114,6 +120,8 @@ Three things in that diagram carry most of the design:
 | News Agent service | [`src/news_service/server.py`](src/news_service/server.py) |
 | Canvas (output tool) | [`src/tools/canvas.py`](src/tools/canvas.py) |
 | Eval schema, metrics, replay | [`src/evaluation/`](src/evaluation) |
+| Deployment (four services) | [`docker-compose.yml`](docker-compose.yml), [`Dockerfile`](Dockerfile) |
+| MCP fetch server + HTTP bridge | [`docker/mcp-fetch-bridge.Dockerfile`](docker/mcp-fetch-bridge.Dockerfile) |
 | Corpus | [`data/raw/`](data/raw) |
 | Parse (Docling) | [`src/ingestion/parse.py`](src/ingestion/parse.py) |
 | Chunk | [`src/ingestion/chunk.py`](src/ingestion/chunk.py) |

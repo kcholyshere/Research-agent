@@ -67,3 +67,17 @@ DEFAULT_WEB_SEARCH_THINKING_BUDGET = 512
 # than hang on - see that tool's docstring.
 NEWS_AGENT_URL = os.getenv("NEWS_AGENT_URL", "http://localhost:8001")
 NEWS_AGENT_TIMEOUT_S = 20.0
+
+# MCP fetch server (phase 3, Financial Data Tool) - the reference `fetch`
+# server fronted by a stdio-to-HTTP proxy so it can be an ordinary compose
+# service rather than a container the agent spawns per call (ADR-0020).
+# The default is the published port of the `mcp-fetch` compose service, which
+# is what a local checkout talks to; inside the compose network the agent
+# overrides this with the service name.
+MCP_FETCH_URL = os.getenv("MCP_FETCH_URL", "http://localhost:8090/mcp")
+
+# Bounds the HTTP hop to that service, for the same reason NEWS_AGENT_TIMEOUT_S
+# bounds the A2A hop: neither is a Vertex call, so genai_client's model-call
+# timeouts never apply to them. Generous relative to the News Agent's 20s
+# because the server's own work is a live page fetch of a third-party site.
+MCP_FETCH_TIMEOUT_S = 30.0

@@ -1,0 +1,30 @@
+# The build context was previously unfiltered, which meant sending ~26M of
+# corpus, index and eval output to the daemon on every build. None of it
+# belongs in the image: data/ and models/ are bind-mounted by compose
+# (ADR-0020), and .venv/ is rebuilt inside the image by `uv sync`.
+
+.venv/
+__pycache__/
+*.py[cod]
+
+# Bind-mounted at runtime, never copied in.
+data/
+models/
+
+.git/
+.github/
+.claude/
+.env
+.DS_Store
+.mypy_cache/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Not part of the running system.
+agent_docs/
+references/
+scripts/
+*.md
+Dockerfile
+docker-compose.yml
+docker/

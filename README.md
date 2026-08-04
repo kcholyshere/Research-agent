@@ -24,8 +24,7 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for how the pieces fit together, and
 - Runs from a chat UI, ADK's dev UI, or the terminal.
 
 ## Limitations
-- Not containerised yet; it runs from a local checkout.
-- News questions need the News Agent process running separately.
+- News and financial questions need their services running; the rest degrades cleanly.
 - Sometimes delegates to the News Agent when only the web is needed.
 - Repeats searches on some questions, up to six calls.
 - Sometimes answers from the web instead of declining cleanly.
@@ -34,8 +33,8 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for how the pieces fit together, and
 - The critique loop nearly always stops after one cycle.
 - Single corpus, rebuilt by hand when documents change.
 
-## Running it locally
-One-time setup:
+## Setup
+One-time, and needed either way you run it:
 ```bash
 uv sync
 cp .env.example .env   # project: gd-gcp-internship-ds
@@ -47,20 +46,42 @@ Build the index (once, and again whenever `data/raw/` changes):
 # drop corpus files (*.txt, *.md, *.pdf) into data/raw/, then:
 uv run python -m src.dataset
 ```
+This is a host-side step in both cases. The image ships no corpus and no index -
+compose bind-mounts `data/` and `models/` instead, so a container started before
+this has run will answer knowledge-base questions from an empty index.
 
-Start the News Agent, which serves as its own A2A process on port 8001:
+## Running it with Docker
+The whole system is four services (see ADR-0020):
 ```bash
-uv run python -m src.news_service.server
+docker compose up --build
 ```
-Leave it running in its own terminal. Every other entrypoint starts fine without
-it, because the agent card is resolved lazily; only news questions fail, and they
-fail by reporting that the specialist was unreachable rather than by quietly
-falling back to a web search. To see what it advertises:
+- <http://localhost:8501> - the Streamlit chat UI
+- <http://localhost:8000> - ADK's dev UI
+- `news-agent` on 8001 and `mcp-fetch` on 8090, which the agent reaches by
+  service name and you can reach on those ports for debugging
+
+Your `~/.config/gcloud` is mounted read-only for Application Default
+Credentials, so no key material goes into the image or into `docker-compose.yml`.
+
+## Running it locally
+Start the two services the agent depends on, then the agent itself. Both are
+containers, and you can start them without the rest of the stack:
+```bash
+docker compose up -d mcp-fetch news-agent
+```
+`mcp-fetch` is Anthropic's reference MCP fetch server fronted by a stdio-to-HTTP
+proxy - the financial route needs it, and without it financial questions report
+the server as unreachable rather than answering from another source.
+
+`news-agent` serves the A2A agent card on 8001. Every entrypoint starts fine
+without it, because the card is resolved lazily; only news questions fail, and
+they fail by reporting the specialist unreachable rather than quietly falling
+back to a web search. To see what it advertises:
 ```bash
 curl -s http://localhost:8001/.well-known/agent-card.json | python -m json.tool
 ```
 
-Then start the agent, in a second terminal, whichever way suits:
+Then start the agent, whichever way suits:
 ```bash
 uv run python -m streamlit run src/ui/app.py   # chat UI, recommended
 uv run adk web src                             # ADK's own dev UI
