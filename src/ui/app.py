@@ -243,6 +243,22 @@ if "history" not in st.session_state:
 
 for turn_index, turn in enumerate(st.session_state["history"]):
     with st.chat_message(turn["role"]):
+        # Replayed for the same reason the artefact is, plus one specific to
+        # Streamlit's rendering model. Streamlit diffs the element tree
+        # positionally between runs, so a container whose children differ in
+        # COUNT between the live render and the history render cannot be
+        # matched up - the previous run's elements are left stranded on screen,
+        # dimmed, until the new run happens to overwrite that position.
+        #
+        # That is exactly what a live-only status caused: the live assistant
+        # block was [status, markdown], the history replay of the same turn was
+        # [markdown], and the leftover showed as a greyed-out duplicate of the
+        # last answer for as long as the next turn took to think. Rendering the
+        # status here too keeps both paths structurally identical, and has the
+        # side benefit that the timing stays visible instead of vanishing the
+        # moment the user sends anything else.
+        if turn.get("elapsed") is not None:
+            st.status(f"Thought for {turn['elapsed']:.1f} seconds", state="complete")
         st.markdown(turn["content"])
         # Replayed from history rather than rendered once: Streamlit reruns the
         # whole script on every interaction, so an artefact shown only in the
@@ -289,7 +305,12 @@ if prompt := st.chat_input("Ask a question about the knowledge base"):
             while turn_thread.is_alive():
                 status.update(label=f"Thinking for {time.monotonic() - start_time:.1f} seconds...")
                 turn_thread.join(timeout=0.2)
-            status.update(label=f"Thought for {time.monotonic() - start_time:.1f} seconds", state="complete")
+            # Captured rather than recomputed inside the label, because it is
+            # stored on the turn and replayed by the history loop above - the
+            # two renders have to agree on the number or the label would drift
+            # by whatever the append costs.
+            elapsed = time.monotonic() - start_time
+            status.update(label=f"Thought for {elapsed:.1f} seconds", state="complete")
         answer = str(turn_result["answer"]).replace("$", "\\$")
         st.markdown(answer)
         artefact = turn_result.get("artefact")
@@ -301,5 +322,5 @@ if prompt := st.chat_input("Ask a question about the knowledge base"):
             # avoids.
             _render_artefact(artefact, key_suffix="live")
     st.session_state["history"].append(
-        {"role": "assistant", "content": answer, "artefact": artefact}
+        {"role": "assistant", "content": answer, "artefact": artefact, "elapsed": elapsed}
     )
