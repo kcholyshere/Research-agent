@@ -30,6 +30,7 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for how the pieces fit together, and
 - Sometimes answers from the web instead of declining cleanly.
 - Web citations are Vertex redirect links, not readable URLs.
 - No turn timeout outside the evaluation harness; a turn can hang.
+- A session stops answering at 200,000 cumulative tokens (`MAX_SESSION_TOKENS`); history is not trimmed, so each turn costs more than the last.
 - The critique loop nearly always stops after one cycle.
 - Single corpus, rebuilt by hand when documents change.
 
@@ -80,6 +81,10 @@ back to a web search. To see what it advertises:
 ```bash
 curl -s http://localhost:8001/.well-known/agent-card.json | python -m json.tool
 ```
+The RPC address in that card is derived from the `Host` header you reached it
+on, so the same service tells this shell `localhost:8001` and tells the agent
+container `news-agent:8001` - a local checkout and a container get an address
+that works for each. See ADR-0022 for why, and for where that stops being safe.
 
 Then start the agent, whichever way suits:
 ```bash
