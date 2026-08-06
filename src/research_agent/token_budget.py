@@ -69,6 +69,12 @@ The wording follows tool_budget.py's lesson: a returned value is read by the
 model (and, here, shown to the user) as the response itself, not as an error,
 so it has to say both that the budget is spent and what to do instead - start
 a new session. A limit that does not name its own remedy gets one invented.
+
+One consequence that looks like a bug and is not: research_agent has
+`output_key="draft_answer"`, so the refusal becomes that turn's draft answer.
+That is intended. It is what every caller reads (research_agent's last final
+response, per CLAUDE.md's rule) and therefore what the user sees, which is the
+point. The escalate above means critique_agent never runs to read it.
 """
 
 from google.adk.agents.callback_context import CallbackContext
