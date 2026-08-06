@@ -61,7 +61,7 @@ from src.tools.web_search import web_search_tool
 
 # Imported after instrument() (see the observability note above) - this
 # module's own import constructs critique_agent = Agent(...) at load time.
-from src.research_agent import token_budget, tool_budget, turn_deadline
+from src.research_agent import history_trim, token_budget, tool_budget, turn_deadline
 from src.research_agent.critique import LAST_ARTEFACT_KEY, critique_agent, reset_turn_state
 
 
@@ -339,11 +339,15 @@ research_agent = Agent(
     # only bound in this project that reaches adk run/adk web as well as
     # Streamlit, since all three share this module.
     before_agent_callback=turn_deadline.enforce_turn_deadline,
-    # A cumulative token ceiling for the whole session, not just this turn.
-    # Wired on all three model-calling agents (here, critique_agent, and the
-    # web_search_agent sub-agent) because the counter is only a bound if
-    # nothing calls the model outside it - see token_budget.py.
-    before_model_callback=token_budget.enforce_session_token_budget,
+    # Two before-model callbacks, run in order (same list pattern and same
+    # reasoning as web_search.py's): the session ceiling first, so a spent
+    # session is refused without bothering to trim a request that will not be
+    # sent, then the history trim, which only research_agent needs (see
+    # history_trim.py for why critique_agent and web_search_agent do not).
+    before_model_callback=[
+        token_budget.enforce_session_token_budget,
+        history_trim.trim_history,
+    ],
     after_model_callback=token_budget.accumulate_token_usage,
     output_key="draft_answer",
 )

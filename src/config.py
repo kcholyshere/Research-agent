@@ -73,6 +73,39 @@ DEFAULT_WEB_SEARCH_THINKING_BUDGET = 512
 # left open cannot run indefinitely.
 MAX_SESSION_TOKENS = 200_000
 
+# Conversation history window for research_agent (src/research_agent/history_trim.py,
+# the ADR-0021 follow-up TODOS.md named: "trim conversation history to the last
+# N turns"). Bounds each turn's OWN cost, which MAX_SESSION_TOKENS does not -
+# that caps the sum across a session, so it says nothing about how expensive
+# turn 8 is compared to turn 2. Every model call resends the full transcript,
+# and ADR-0021 measured that transcript costing ~7.1k tokens of resent history
+# just from turn 1 by the time turn 2 starts.
+#
+# 3, from a direct measurement (scripts/verify_history_trim.py) of the same
+# request, before and after the trim, inside one session - not a comparison
+# across two separate live runs, which turned out to be too noisy to trust:
+# an earlier draft compared prompt_token_count across a trimmed and an
+# untrimmed session and got DIFFERENT numbers on turns neither session had
+# reason to differ on yet, because each session's own live web_search_agent
+# calls return their own live grounding results. Counting
+# llm_request.contents (via the model's own count_tokens) immediately either
+# side of the trim callback removes that source of noise entirely: on one
+# real run, turn 5's first call dropped from 31 to 24 contents and 10,226 to
+# 8,749 tokens - a real 1,477 tokens off that one request, for turns 1-4
+# untouched.
+#
+# The per-turn cost is too tool-dependent for a fixed per-turn TOKEN budget
+# to be the unit (a search_documents turn is cheap, a web_search_agent
+# turn's grounded results are not - the same run's turns ranged from ~200 to
+# ~3,000 tokens each), which is why this bounds the COUNT of retained turns
+# instead. 3 keeps every later turn's resent history to at most 3 turns'
+# worth rather than all of them, while still covering the common real
+# follow-up ("what about the year before?" references the turn immediately
+# prior) with headroom for one or two hops further back before a question
+# has to be re-searched instead of read from history. The turn in progress
+# is never counted against this - see history_trim.py.
+MAX_HISTORY_TURNS = 3
+
 # News Agent service (phase 5, Agent-to-Agent demo) - a separate process
 # reached over plain HTTP, not an in-process import; see
 # src/news_service/server.py and src/tools/news_agent.py for why. A
