@@ -55,6 +55,7 @@ from src.tools.canvas import create_canvas
 from src.tools.document_search import search_documents
 from src.tools.financial_data import get_financial_data
 from src.tools.news_agent import news_agent_tool
+from src.tools.report_gap import report_gap
 from src.tools.web_search import web_search_tool
 
 # Imported after instrument() (see the observability note above) - this
@@ -104,8 +105,10 @@ private knowledge base (search_documents), live financial market data
 (get_financial_data), the latest news on a topic from an independent News Agent
 you delegate to over A2A (news_agent), and the public internet
 (web_search_tool).
-You also have one output tool, create_canvas, which is not a source and gathers
-nothing - it renders research you have already done into a finished artefact.
+You also have two tools that are not evidence sources and gather nothing:
+create_canvas, which renders research you have already done into a finished
+artefact, and report_gap, which you call to record that a fact you checked is
+not covered by the source that is authoritative for it - see step 2.
 For every question, follow a plan-execute-synthesize flow:
 
 0. Refinement check: {critique_followups?} holds specific follow-up
@@ -155,7 +158,10 @@ For every question, follow a plan-execute-synthesize flow:
    IFC's own financial reporting, get_financial_data for market prices - its
    not having the answer IS the answer, and searching elsewhere for a
    substitute produces a figure from somewhere that was never authoritative
-   for the question. Report the gap instead.
+   for the question. Report the gap instead: call report_gap with the fact
+   and the source you checked, then continue to step 3 and write the prose
+   decline - report_gap records the gap, it does not answer the question
+   for you.
 3. Synthesize: answer strictly from the retrieved passages/results, citing the
    source of each fact. A citation must identify something a reader could go
    and check, and each tool gives you one - use what it gives you rather than
@@ -269,17 +275,20 @@ research_agent = Agent(
     model=config.GEMINI_MODEL,
     description="Answers questions over a private knowledge base, live financial market data, and the public internet via planned, multi-source search, and renders the result as a report, document or code file when one is asked for.",
     instruction=INSTRUCTION,
-    # create_canvas is last on purpose - it is the only non-evidence tool here
-    # and the only one that ends a turn rather than informing it. See
-    # src/tools/canvas.py for why it must be exempt from the tool budget and
-    # from the redundancy metric; both exemptions key off its name, so renaming
-    # it means changing tool_budget.OUTPUT_TOOLS and schema.OUTPUT_TOOLS too.
+    # create_canvas and report_gap are last on purpose - they are the only
+    # non-evidence tools here. create_canvas ends a turn that asked for a
+    # deliverable; report_gap does not end anything, but like create_canvas it
+    # gathers no evidence and must be exempt from the tool budget and the
+    # redundancy metric (see src/tools/canvas.py and src/tools/report_gap.py).
+    # Both exemptions key off tool name, so renaming either tool means
+    # changing tool_budget.OUTPUT_TOOLS and schema.OUTPUT_TOOLS too.
     tools=[
         search_documents,
         get_financial_data,
         web_search_tool,
         news_agent_tool,
         create_canvas,
+        report_gap,
     ],
     generate_content_config=_GENERATE_CONTENT_CONFIG,
     # A hard per-turn ceiling on calls to each tool. The instruction above

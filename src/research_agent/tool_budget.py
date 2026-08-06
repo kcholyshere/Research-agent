@@ -96,8 +96,8 @@ from google.adk.tools.tool_context import ToolContext
 # see ADR-0015.
 MAX_TOOL_CALLS_PER_TURN = 5
 
-# Tools that produce output rather than gather evidence, and are therefore
-# neither counted against the ceiling nor refusable by it.
+# Tools that are not evidence-gathering, and are therefore neither counted
+# against the ceiling nor refusable by it.
 #
 # create_canvas (phase 6) is terminal: it contributes no fact, nothing is
 # planned after it, and it runs precisely once at the end of a turn that was
@@ -110,12 +110,22 @@ MAX_TOOL_CALLS_PER_TURN = 5
 # prose answer. That is invisible from the outside: no error, no missing
 # response, just a deliverable that quietly became a paragraph.
 #
+# report_gap is exempt for the same underlying reason, not because it is also
+# terminal - it isn't, the turn continues to the prose decline after it - but
+# because it retrieves nothing and a spent search budget has no bearing on
+# recording an outcome about evidence already gathered. The failure mode is
+# the mirror image of create_canvas's: `decline-*` questions are exactly the
+# ones most likely to have already spent their budget on a reformulation and
+# a stray extra search by the time the gap is confirmed, so a budget that
+# could refuse report_gap would take away the one action this project added
+# specifically to stop that pattern, on precisely the turns that need it.
+#
 # Deliberately a name-keyed set rather than a flag on the tool object: ADK's
 # auto-wrapped function tools carry no field this project controls, and
 # matching on the name is what `src/evaluation/schema.py` already does for
-# CONTROL_TOOLS and OUTPUT_TOOLS. The two lists must agree - if a fourth
-# evidence tool or a second output tool is added, both change together.
-OUTPUT_TOOLS: frozenset[str] = frozenset({"create_canvas"})
+# CONTROL_TOOLS and OUTPUT_TOOLS. The two lists must agree - if a further
+# evidence tool or non-evidence tool is added, both change together.
+OUTPUT_TOOLS: frozenset[str] = frozenset({"create_canvas", "report_gap"})
 
 # Session-state key holding {tool_name: calls_so_far} for the current turn.
 # Reset by critique.reset_turn_state, which is the LoopAgent's own
@@ -135,8 +145,9 @@ def _refusal(used: int, breakdown: dict[str, int]) -> dict[str, Any]:
             f"You have used all {used} evidence-gathering tool calls available for this "
             f"turn ({spent}). No further evidence-gathering tool can be called for this "
             "question - not this one, not a different one. Answer now from what you have "
-            "already retrieved. If it does not contain what was asked for, say so plainly "
-            "and name the source you checked. If this question asked for a report, "
+            "already retrieved. If it does not contain what was asked for, call report_gap "
+            "with the fact and the source you checked, then say so plainly in your answer - "
+            "report_gap gathers nothing new either. If this question asked for a report, "
             "document or code file, you may still call create_canvas to produce it - that "
             "formats what you have and gathers nothing new."
         ),

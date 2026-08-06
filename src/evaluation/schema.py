@@ -90,8 +90,9 @@ TOOL_TO_ROUTE: dict[str, RouteTarget] = {
 # stream as real tool calls and would otherwise be counted as routing.
 CONTROL_TOOLS: frozenset[str] = frozenset({"exit_loop"})
 
-# Output-producing calls, not evidence-gathering. Excluded from `tools_called`
-# for the same reason CONTROL_TOOLS is, but the consequence is sharper here.
+# Non-evidence calls that are not loop control either. Excluded from
+# `tools_called` for the same reason CONTROL_TOOLS is, but the consequence is
+# sharper here.
 #
 # `check_redundancy` compares len(tools_called) against the question's
 # `max_tool_calls`, a bound written to police *searching*. create_canvas
@@ -100,7 +101,16 @@ CONTROL_TOOLS: frozenset[str] = frozenset({"exit_loop"})
 # each of them one over its own bound. Every one would read as a redundancy
 # regression on a turn that behaved perfectly, and the bounds could not be
 # raised to compensate without also loosening the real search budget they
-# exist to enforce.
+# exist to enforce. report_gap (phase 6 follow-up) is exempt on the same
+# reasoning though not the same shape of turn: it records an outcome about
+# evidence already gathered rather than gathering any itself, so counting it
+# would make every correct decline read as one call over budget purely for
+# having named the gap explicitly instead of only writing it in prose.
+#
+# Kept named OUTPUT_TOOLS rather than renamed for report_gap's addition - it
+# is still exactly the set of tools this project has decided are not evidence
+# sources, which is what both consumers below actually key off; "output" was
+# always shorthand for that, not a claim that every member produces a file.
 #
 # Must stay in step with `src/research_agent/tool_budget.py`'s OUTPUT_TOOLS,
 # which exempts the same names from the runtime ceiling. Two lists rather than
@@ -108,7 +118,7 @@ CONTROL_TOOLS: frozenset[str] = frozenset({"exit_loop"})
 # without importing the agent (and therefore without triggering Langfuse
 # instrumentation and a Vertex client) - but they are one concept, and a change
 # to either is a change to both.
-OUTPUT_TOOLS: frozenset[str] = frozenset({"create_canvas"})
+OUTPUT_TOOLS: frozenset[str] = frozenset({"create_canvas", "report_gap"})
 
 # Everything that is not evidence-gathering. `tools_called` filters on this.
 NON_EVIDENCE_TOOLS: frozenset[str] = CONTROL_TOOLS | OUTPUT_TOOLS
@@ -183,16 +193,17 @@ class EvalQuestion:
     # calibration: every other critique_loop question is fully answerable, so
     # a critic that always exits scores identically to one that correctly
     # judged nothing was missing - there was no question in the set whose
-    # correct behaviour was to NOT exit on cycle 1. This label is descriptive
-    # only; nothing in metrics.py reads it yet. The record already carries
-    # what a check would need (RunRecord.cycle_count, CycleRecord.
-    # critique_outcome), so today this is read by hand from the stored run.
-    # The smallest companion check would be something like
-    # `check_critique_calibration`, asserting
-    # `record.cycle_count >= 2 if question.expects_second_cycle else True`
-    # (skipped entirely at budget 0, where no critique call happens at all) -
-    # deliberately not added here, since metrics.py beyond check_routing is
-    # out of scope for the change this field was written for.
+    # correct behaviour was to NOT exit on cycle 1.
+    #
+    # Now read by `metrics.check_critique_calibration`, asserting
+    # `record.cycle_count >= 2 if question.expects_second_cycle else True`.
+    # Skipped (returns None, not a failure) whenever no real critique
+    # judgement happened at all in the record - detected from
+    # CycleRecord.critique_outcome rather than from the record's arm/budget,
+    # so it covers both ways a critique call can fail to happen: a spent
+    # `critique_budget` (the "budget 0" case this field's original note named)
+    # and the financial-only shortcut in `critique.py`'s
+    # `_skip_critique_llm_call`. See metrics.py for the check itself.
     expects_second_cycle: bool = False
 
     # Assertions this question is expected to fail today against a known,
@@ -209,7 +220,7 @@ class EvalQuestion:
     # which is the opposite of what this field exists for.
     #
     # Recognised keys: routing, redundancy, citation, decline, content,
-    # wasted_cycle, artefact.
+    # wasted_cycle, artefact, critique_calibration.
     known_defects: dict[str, str] = field(default_factory=dict)
 
     notes: str = ""
