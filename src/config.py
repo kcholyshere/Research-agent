@@ -58,6 +58,21 @@ DEFAULT_CRITIQUE_BUDGET = 1
 # DEFAULT_CRITIQUE_BUDGET is.
 DEFAULT_WEB_SEARCH_THINKING_BUDGET = 512
 
+# Cumulative token ceiling for one session (src/research_agent/token_budget.py).
+# The third bound in this project and the only session-scoped one:
+# max_output_tokens caps a response (ADR-0009), MAX_TOOL_CALLS_PER_TURN caps a
+# turn's searching (ADR-0015), and neither caps a conversation.
+#
+# 200,000 comes from measurement, not from the model's context window. Two
+# plain knowledge-base questions in one session cost about 16.9k and 18.5k
+# tokens (2026-08-06) - and the second is dearer than the first only because
+# every turn re-sends the transcript, so per-turn cost climbs for the whole
+# session. 200,000 is therefore roughly 8-12 real turns rather than the ~11
+# that dividing by the first turn would suggest. Generous for the demo
+# sessions this project actually runs, and low enough that an unattended chat
+# left open cannot run indefinitely.
+MAX_SESSION_TOKENS = 200_000
+
 # News Agent service (phase 5, Agent-to-Agent demo) - a separate process
 # reached over plain HTTP, not an in-process import; see
 # src/news_service/server.py and src/tools/news_agent.py for why. A
@@ -67,3 +82,17 @@ DEFAULT_WEB_SEARCH_THINKING_BUDGET = 512
 # than hang on - see that tool's docstring.
 NEWS_AGENT_URL = os.getenv("NEWS_AGENT_URL", "http://localhost:8001")
 NEWS_AGENT_TIMEOUT_S = 20.0
+
+# MCP fetch server (phase 3, Financial Data Tool) - the reference `fetch`
+# server fronted by a stdio-to-HTTP proxy so it can be an ordinary compose
+# service rather than a container the agent spawns per call (ADR-0020).
+# The default is the published port of the `mcp-fetch` compose service, which
+# is what a local checkout talks to; inside the compose network the agent
+# overrides this with the service name.
+MCP_FETCH_URL = os.getenv("MCP_FETCH_URL", "http://localhost:8090/mcp")
+
+# Bounds the HTTP hop to that service, for the same reason NEWS_AGENT_TIMEOUT_S
+# bounds the A2A hop: neither is a Vertex call, so genai_client's model-call
+# timeouts never apply to them. Generous relative to the News Agent's 20s
+# because the server's own work is a live page fetch of a third-party site.
+MCP_FETCH_TIMEOUT_S = 30.0

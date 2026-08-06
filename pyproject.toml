@@ -38,4 +38,11 @@ dependencies = [
     "fastapi>=0.139.2,<1",
     "uvicorn>=0.51.0,<1",
     "httpx>=0.28.1,<1",
+    # Same reasoning again, one level down: src/news_service/server.py imports
+    # starlette directly for CardHostMiddleware, rather than only receiving a
+    # Starlette app back from ADK's to_a2a. A direct import of a package we
+    # only get transitively (via fastapi) is exactly what this block exists to
+    # stop being invisible. The bound matches google-adk's own so this
+    # declaration records the dependency without narrowing what adk can resolve.
+    "starlette>=1.3.1,<2",
 ]

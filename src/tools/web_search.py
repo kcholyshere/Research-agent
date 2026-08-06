@@ -21,6 +21,7 @@ from google.adk.tools.agent_tool import AgentTool
 from google.genai import types
 
 from src import config
+from src.research_agent import token_budget
 
 
 def _append_grounding_sources(callback_context: CallbackContext) -> types.Content | None:
@@ -171,7 +172,22 @@ relevant facts you find. State each fact once; never repeat a sentence or
 phrase.""",
     tools=[google_search],
     generate_content_config=_GENERATE_CONTENT_CONFIG,
-    before_model_callback=_apply_thinking_budget,
+    # Two before-model callbacks, run in order: the budget check first, so a
+    # session that is already over its ceiling is refused without the second
+    # one bothering to configure a request that will not be sent. ADK accepts
+    # a list here and runs them until one returns a response (verified against
+    # google-adk 2.5.0's canonical_before_model_callbacks).
+    #
+    # The session token ceiling reaches into this sub-agent through session
+    # state, which AgentTool copies in and forwards back out. Counting it here
+    # matters more than anywhere else: ADR-0014 measured this one call at a
+    # median 3,310 thinking tokens, the most expensive single call in the
+    # system. See src/research_agent/token_budget.py.
+    before_model_callback=[
+        token_budget.enforce_session_token_budget,
+        _apply_thinking_budget,
+    ],
+    after_model_callback=token_budget.accumulate_token_usage,
     after_agent_callback=_append_grounding_sources,
 )
 

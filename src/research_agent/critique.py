@@ -63,7 +63,7 @@ from google.adk.tools import ToolContext
 from google.genai import types
 
 from src import config
-from src.research_agent import tool_budget
+from src.research_agent import token_budget, tool_budget
 from src.services import genai_client
 
 CRITIQUE_AGENT_NAME = "critique_agent"
@@ -149,6 +149,12 @@ def reset_turn_state(callback_context: CallbackContext) -> None:
     # refilled each cycle would not bound a loop that re-runs the same
     # searches - see tool_budget.py's module docstring.
     state[tool_budget.STATE_KEY] = {}
+    # Deliberately NOT reset here: token_budget.STATE_KEY. It is the one
+    # counter in this system that is session-scoped rather than turn-scoped,
+    # and clearing it on this hook - the hook that exists to make things
+    # turn-scoped - would quietly turn a session ceiling into a per-turn one
+    # that can never be reached. No error, no warning, just a bound that never
+    # fires. See src/research_agent/token_budget.py.
 
 
 def _tools_used_this_cycle(callback_context: CallbackContext) -> set[str]:
@@ -303,5 +309,10 @@ critique_agent = Agent(
     tools=[exit_loop],
     output_key="critique_followups",
     before_agent_callback=_skip_critique_llm_call,
+    # The session token ceiling, same pair as research_agent's - this agent
+    # calls the model too, and a bound with a hole in it is not a bound.
+    # See src/research_agent/token_budget.py.
+    before_model_callback=token_budget.enforce_session_token_budget,
+    after_model_callback=token_budget.accumulate_token_usage,
     generate_content_config=_GENERATE_CONTENT_CONFIG,
 )

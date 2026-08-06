@@ -2982,6 +2982,7 @@ dependencies = [
     { name = "openinference-instrumentation-google-adk" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
+    { name = "starlette" },
     { name = "streamlit" },
     { name = "uvicorn" },
 ]
@@ -3005,6 +3006,7 @@ requires-dist = [
     { name = "openinference-instrumentation-google-adk", specifier = ">=0.1.17" },
     { name = "python-dotenv", specifier = ">=1.2.2,<2" },
     { name = "pyyaml", specifier = ">=6.0.3,<7" },
+    { name = "starlette", specifier = ">=1.3.1,<2" },
     { name = "streamlit", specifier = ">=1.51.0,<2" },
     { name = "uvicorn", specifier = ">=0.51.0,<1" },
 ]

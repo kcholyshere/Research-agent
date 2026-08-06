@@ -1,0 +1,93 @@
+# The full system as four services (ADR-0020). Everything the agent talks to
+# that is not Vertex or Langfuse runs here, so `docker compose up` is the whole
+# stack rather than a container plus a list of things to start by hand.
+#
+#   mcp-fetch   phase 3 - Anthropic's reference MCP fetch server, fronted by a
+#               stdio-to-HTTP proxy so it can be a service instead of a
+#               container the agent spawns per call
+#   news-agent  phase 5 - the independent News Agent, reached over A2A
+#   agent       the research agent itself, on ADK's dev UI
+#   ui          the optional Streamlit chat UI, same image, different command
+name: research-agent
+
+# The three Python services share an image and an auth story, so the common
+# setup lives here rather than three times over.
+x-app: &app
+  build: .
+  env_file: [.env]
+  restart: unless-stopped
+
+# Application Default Credentials. The project authenticates to Vertex with ADC
+# and no API keys, and `gcloud auth application-default login` writes a user
+# credential (an authorized_user refresh token, not a service account key) to
+# this directory - so mounting it read-only is the whole of the auth story. The
+# container runs as root, hence /root.
+x-adc-mount: &adc-mount
+  - ${HOME}/.config/gcloud:/root/.config/gcloud:ro
+
+# The same, plus the knowledge base, for the two services that answer questions.
+# Neither is baked into the image (see the Dockerfile header). data/ is
+# read-write because the phase 6 Canvas tool writes artefacts into
+# data/processed/artefacts; models/ is read-only because the FAISS index is only
+# ever read at runtime - rebuilding it is a host-side `python -m src.dataset`,
+# which should not be something a container can do to you.
+x-app-mounts: &app-mounts
+  - ${HOME}/.config/gcloud:/root/.config/gcloud:ro
+  - ./data:/app/data
+  - ./models:/app/models:ro
+
+# Where the agent finds the other two services. These override the localhost
+# defaults in src/config.py, which are correct for a local checkout and wrong
+# inside the compose network.
+x-service-urls: &service-urls
+  MCP_FETCH_URL: http://mcp-fetch:8090/mcp
+  NEWS_AGENT_URL: http://news-agent:8001
+
+services:
+  mcp-fetch:
+    build:
+      context: .
+      dockerfile: docker/mcp-fetch-bridge.Dockerfile
+    restart: unless-stopped
+    # Published so a local checkout (eval sweeps, `adk run`, a bare `uv run`)
+    # talks to the same server the containers do, which is why config.py
+    # defaults MCP_FETCH_URL to localhost:8090.
+    ports: ["8090:8090"]
+
+  news-agent:
+    <<: *app
+    command: ["python", "-m", "src.news_service.server"]
+    # Published so a local checkout reaches the same News Agent the agent
+    # container does, for the same one-transport reason mcp-fetch is published.
+    # No NEWS_AGENT_ADVERTISED_HOST here on purpose: the card used to be pinned
+    # to `news-agent`, which is right for this network and unresolvable from the
+    # host, so local news questions failed. The service now derives the card's
+    # address from each request's Host header instead, which is correct for both
+    # callers at once - see CardHostMiddleware in src/news_service/server.py.
+    ports: ["8001:8001"]
+    volumes: *adc-mount
+
+  agent:
+    <<: *app
+    depends_on: [mcp-fetch, news-agent]
+    ports: ["8000:8000"]
+    volumes: *app-mounts
+    environment: *service-urls
+
+  ui:
+    <<: *app
+    depends_on: [mcp-fetch, news-agent]
+    command:
+      - python
+      - -m
+      - streamlit
+      - run
+      - src/ui/app.py
+      - --server.address=0.0.0.0
+      - --server.port=8501
+      # Streamlit's first run otherwise blocks on an interactive email prompt,
+      # which in a container means a service that never finishes starting.
+      - --server.headless=true
+    ports: ["8501:8501"]
+    volumes: *app-mounts
+    environment: *service-urls
