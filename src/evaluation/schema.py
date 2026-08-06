@@ -130,6 +130,17 @@ class EvalQuestion:
     expected_routes: list[RouteTarget]
     tags: list[str] = field(default_factory=list)
 
+    # Alternative route sets that are equally correct, each a full substitute
+    # for `expected_routes` rather than a per-route swap. Exists for exactly
+    # one case so far: a question whose correct routing genuinely has more
+    # than one right answer, because two different tools legitimately serve
+    # the same half of the question and which one a live planner picks is not
+    # itself a defect. `check_routing` passes if the routes used match
+    # `expected_routes` OR any one set here, exactly - it does not mix and
+    # match individual routes across sets. Empty for every other question, so
+    # their routing semantics are unchanged.
+    acceptable_routes: list[list[RouteTarget]] = field(default_factory=list)
+
     # Redundancy bound. Distinct from len(expected_routes): a question may
     # legitimately need two calls to one source (reformulation after a miss),
     # while five calls to it is the known premise-refuting defect.
@@ -166,6 +177,24 @@ class EvalQuestion:
     # and latency alone.
     volatile: bool = False
 
+    # True when a genuinely unaddressed sub-question should make the critique
+    # agent continue past cycle 1 - i.e. cycle_count is expected to be >= 2
+    # under a budget that allows it. Exists for the open TODO on critique
+    # calibration: every other critique_loop question is fully answerable, so
+    # a critic that always exits scores identically to one that correctly
+    # judged nothing was missing - there was no question in the set whose
+    # correct behaviour was to NOT exit on cycle 1. This label is descriptive
+    # only; nothing in metrics.py reads it yet. The record already carries
+    # what a check would need (RunRecord.cycle_count, CycleRecord.
+    # critique_outcome), so today this is read by hand from the stored run.
+    # The smallest companion check would be something like
+    # `check_critique_calibration`, asserting
+    # `record.cycle_count >= 2 if question.expects_second_cycle else True`
+    # (skipped entirely at budget 0, where no critique call happens at all) -
+    # deliberately not added here, since metrics.py beyond check_routing is
+    # out of scope for the change this field was written for.
+    expects_second_cycle: bool = False
+
     # Assertions this question is expected to fail today against a known,
     # logged defect, as {assertion key: short defect reference}. The run still
     # records the failure - it is not suppressed - but it is reported apart
@@ -189,6 +218,9 @@ class EvalQuestion:
     def from_dict(cls, raw: dict[str, Any]) -> EvalQuestion:
         data = dict(raw)
         data["expected_routes"] = [RouteTarget(r) for r in data.get("expected_routes", [])]
+        data["acceptable_routes"] = [
+            [RouteTarget(r) for r in alt] for alt in data.get("acceptable_routes", [])
+        ]
         return cls(**data)
 
 

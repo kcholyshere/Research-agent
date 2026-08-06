@@ -269,27 +269,36 @@ class QuestionResult:
 
 
 def check_routing(question: EvalQuestion, record: RunRecord) -> AssertionResult:
-    """Did the run consult exactly `expected_routes`?
+    """Did the run consult exactly `expected_routes`, or one full alternative?
 
     Missing and unexpected are reported separately (not just "routing
     failed") because they are different defects: missing is under-research,
     unexpected is the redundancy-adjacent failure the web-question set exists
     to catch (a search_documents call on a question that sounds like it
     belongs to the corpus but does not).
+
+    `acceptable_routes` (empty for almost every question) lists whole
+    alternative route sets that are equally correct - not routes swapped in
+    individually, but complete substitutes for `expected_routes`. A pass
+    requires an exact match against `expected_routes` or exactly one of
+    those alternatives; there is no partial credit for mixing routes across
+    sets. When it fails, the detail is reported against whichever candidate
+    set is closest (fewest routes different), since that is the most useful
+    diagnostic even though it played no part in the pass/fail decision.
     """
-    expected = set(question.expected_routes)
     used = set(record.routes_used)
-    missing = expected - used
-    unexpected = used - expected
-    passed = not missing and not unexpected
+    candidates = [set(question.expected_routes), *(set(alt) for alt in question.acceptable_routes)]
+    if used in candidates:
+        return AssertionResult(key="routing", passed=True, detail="routes matched exactly")
+    closest = min(candidates, key=lambda c: len(used ^ c))
+    missing = closest - used
+    unexpected = used - closest
     parts = []
     if missing:
         parts.append(f"missing={sorted(r.value for r in missing)}")
     if unexpected:
         parts.append(f"unexpected={sorted(r.value for r in unexpected)}")
-    return AssertionResult(
-        key="routing", passed=passed, detail="; ".join(parts) or "routes matched exactly"
-    )
+    return AssertionResult(key="routing", passed=False, detail="; ".join(parts))
 
 
 def check_redundancy(question: EvalQuestion, record: RunRecord) -> AssertionResult:
