@@ -447,16 +447,44 @@ if prompt := st.chat_input("Ask a question about the knowledge base"):
 
         def _run_turn_sync() -> None:
             try:
+                # config.TURN_TIMEOUT_S (agent_docs/TODOS.md): the whole-turn
+                # bound. research_agent's before_agent_callback
+                # (turn_deadline.enforce_turn_deadline) also stamps and checks
+                # this same budget so adk run/adk web get a coarse version of
+                # it too, but only this wait_for can actually cut off a single
+                # slow cycle already in progress - the callback can only
+                # refuse to START a new one. Wrapping asyncio.run's own
+                # coroutine, not run_async's loop from the outside, so
+                # cancellation reaches every await point inside _run_turn
+                # (the model call, a tool call) rather than just the
+                # boundary between events.
                 turn_result["answer"], turn_result["artefact"] = asyncio.run(
-                    _run_turn(
-                        runner,
-                        session_id,
-                        prompt,
-                        critique_budget,
-                        web_search_thinking_budget,
-                        steps,
+                    asyncio.wait_for(
+                        _run_turn(
+                            runner,
+                            session_id,
+                            prompt,
+                            critique_budget,
+                            web_search_thinking_budget,
+                            steps,
+                        ),
+                        timeout=config.TURN_TIMEOUT_S,
                     )
                 )
+            except TimeoutError:
+                # Report plainly rather than surfacing a partial answer: a
+                # cancelled turn is cut off mid-await, possibly between
+                # research_agent finishing a cycle and critique_agent
+                # reviewing it - exactly the half-written state CLAUDE.md's
+                # answer-reading rule exists to protect against. There is no
+                # event here that safely stands in for "the answer", so
+                # this says what actually happened instead of guessing.
+                turn_result["answer"] = (
+                    f"This turn exceeded its {config.TURN_TIMEOUT_S:g}s time budget and "
+                    "was stopped. No answer was produced - please try again, or split "
+                    "the question into smaller parts."
+                )
+                turn_result["artefact"] = None
             except Exception as exc:
                 # Vertex errors, an empty/missing FAISS index, etc. should read as a
                 # message in the chat, not crash the page.

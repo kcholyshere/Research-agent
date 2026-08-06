@@ -25,6 +25,7 @@ from google.genai import types
 
 from src import config
 from src.research_agent import token_budget
+from src.services import genai_client
 
 # Bounds each redirect-resolution request (see _resolve_redirect below). Lives
 # in config alongside MCP_FETCH_TIMEOUT_S/NEWS_AGENT_TIMEOUT_S because it is
@@ -213,6 +214,16 @@ async def _append_grounding_sources(callback_context: CallbackContext) -> types.
 _GENERATE_CONTENT_CONFIG = types.GenerateContentConfig(
     max_output_tokens=4096,
     frequency_penalty=0.4,
+    # ADR-0013 bounded "every agent model call" at 120s, and this one was
+    # missed: research_agent and critique_agent both carried the timeout,
+    # this sub-agent did not, so its model call had no ceiling at all. ADK
+    # builds its own client and sets no timeout of its own (see
+    # genai_client.MODEL_CALL_TIMEOUT_MS), which is exactly why the bound has
+    # to be set here rather than assumed from the environment. Found while
+    # adding the turn-level deadline: a turn ceiling is only as good as the
+    # hops underneath it, and an unbounded hop makes the coarse deadline the
+    # only thing standing between a hung call and an endless turn.
+    http_options=types.HttpOptions(timeout=genai_client.MODEL_CALL_TIMEOUT_MS),
     thinking_config=types.ThinkingConfig(
         thinking_budget=config.DEFAULT_WEB_SEARCH_THINKING_BUDGET
     ),

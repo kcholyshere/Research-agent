@@ -61,7 +61,7 @@ from src.tools.web_search import web_search_tool
 
 # Imported after instrument() (see the observability note above) - this
 # module's own import constructs critique_agent = Agent(...) at load time.
-from src.research_agent import token_budget, tool_budget
+from src.research_agent import token_budget, tool_budget, turn_deadline
 from src.research_agent.critique import LAST_ARTEFACT_KEY, critique_agent, reset_turn_state
 
 
@@ -331,6 +331,14 @@ research_agent = Agent(
     # docstring, "declare_plan as a third, independent gate".
     before_tool_callback=tool_budget.enforce_tool_budget,
     after_tool_callback=_after_tool,
+    # A coarse, whole-turn wall-clock ceiling (agent_docs/TODOS.md) - fires at
+    # the start of every cycle, including a refinement cycle a critique pass
+    # earns, and refuses to start one once the turn's time is up. It cannot
+    # interrupt a cycle already running (see turn_deadline.py's module
+    # docstring for exactly what that does and does not cover), but it is the
+    # only bound in this project that reaches adk run/adk web as well as
+    # Streamlit, since all three share this module.
+    before_agent_callback=turn_deadline.enforce_turn_deadline,
     # A cumulative token ceiling for the whole session, not just this turn.
     # Wired on all three model-calling agents (here, critique_agent, and the
     # web_search_agent sub-agent) because the counter is only a bound if
@@ -367,5 +375,11 @@ root_agent = LoopAgent(
     description="Runs the research agent, critiques its draft, and either ends the turn or feeds follow-up questions back for another research cycle.",
     sub_agents=[research_agent, critique_agent],
     max_iterations=config.MAX_CRITIQUE_ITERATIONS,
-    before_agent_callback=reset_turn_state,
+    # A list, not just reset_turn_state, as of the turn_deadline addition
+    # (agent_docs/TODOS.md) - ADK runs every callback in this list on the
+    # same before_agent_callback firing (once per turn, before the loop's
+    # first cycle - see reset_turn_state's own docstring for why that
+    # placement is what makes "once per turn" true), so stamping this turn's
+    # deadline rides the same hook rather than needing a second one.
+    before_agent_callback=[reset_turn_state, turn_deadline.stamp_turn_deadline],
 )

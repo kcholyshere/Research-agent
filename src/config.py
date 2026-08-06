@@ -97,6 +97,28 @@ MCP_FETCH_URL = os.getenv("MCP_FETCH_URL", "http://localhost:8090/mcp")
 # because the server's own work is a live page fetch of a third-party site.
 MCP_FETCH_TIMEOUT_S = 30.0
 
+# Wall-clock ceiling on a whole turn (src/research_agent/turn_deadline.py) -
+# the bound TODOS.md flagged as missing: every timeout above this line stops
+# ONE hop (a model call, an HTTP call to a service), and MAX_CRITIQUE_ITERATIONS
+# stops the loop after a fixed COUNT of cycles, but nothing stops the sum of
+# several hops across up to that many cycles from running for as long as each
+# hop is willing to take. Under `InMemoryRunner` (adk run/adk web/Streamlit),
+# ADK's own client sets no such ceiling - see genai_client.MODEL_CALL_TIMEOUT_MS.
+#
+# Picked from the same evidence EVALUATION.md's latency sections give, not
+# invented: the 2026-08-03 20:20 final baseline (280 live runs) measured
+# median latency 23.4s at critique budget 0 / 25.7s at budget 1, and its worst
+# real, successfully-completed run - a genuine second critique cycle, not a
+# hang - was 89.5s. 240s is a little under 2.7x that worst observed case,
+# enough headroom for a legitimate third cycle (MAX_CRITIQUE_ITERATIONS allows
+# one, and the Streamlit slider lets a user request it) without being sized
+# for the eval harness's different purpose: run_eval.py's own
+# DEFAULT_TIMEOUT_S=300s is deliberately generous enough to let even a known,
+# ~100s-costing defect run to completion so the sweep still captures full
+# data - a live UI should give up sooner than that and say so, not wait out a
+# pathological run on the user's behalf.
+TURN_TIMEOUT_S = 240.0
+
 # Bounds a single grounding-redirect resolution in src/tools/web_search.py.
 # Gemini's google_search returns opaque vertexaisearch redirect links rather
 # than destination URLs, and the sub-agent's after_agent_callback resolves
