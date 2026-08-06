@@ -59,7 +59,7 @@ from src.tools.web_search import web_search_tool
 
 # Imported after instrument() (see the observability note above) - this
 # module's own import constructs critique_agent = Agent(...) at load time.
-from src.research_agent import tool_budget
+from src.research_agent import token_budget, tool_budget
 from src.research_agent.critique import LAST_ARTEFACT_KEY, critique_agent, reset_turn_state
 
 
@@ -289,6 +289,12 @@ research_agent = Agent(
     # (ADR-0009). See tool_budget.py for the ceiling and the refusal wording.
     before_tool_callback=tool_budget.enforce_tool_budget,
     after_tool_callback=_record_artefact,
+    # A cumulative token ceiling for the whole session, not just this turn.
+    # Wired on all three model-calling agents (here, critique_agent, and the
+    # web_search_agent sub-agent) because the counter is only a bound if
+    # nothing calls the model outside it - see token_budget.py.
+    before_model_callback=token_budget.enforce_session_token_budget,
+    after_model_callback=token_budget.accumulate_token_usage,
     output_key="draft_answer",
 )
 
