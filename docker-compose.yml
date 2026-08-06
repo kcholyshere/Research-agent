@@ -57,20 +57,15 @@ services:
   news-agent:
     <<: *app
     command: ["python", "-m", "src.news_service.server"]
+    # Published so a local checkout reaches the same News Agent the agent
+    # container does, for the same one-transport reason mcp-fetch is published.
+    # No NEWS_AGENT_ADVERTISED_HOST here on purpose: the card used to be pinned
+    # to `news-agent`, which is right for this network and unresolvable from the
+    # host, so local news questions failed. The service now derives the card's
+    # address from each request's Host header instead, which is correct for both
+    # callers at once - see CardHostMiddleware in src/news_service/server.py.
     ports: ["8001:8001"]
     volumes: *adc-mount
-    environment:
-      # The agent card advertises this as the service's own dialable address,
-      # and the client dials whatever the card says. Inside the compose network
-      # that has to be the service name: the default of `localhost` would send
-      # the agent container to itself. This env var exists for exactly this
-      # case (see src/news_service/server.py).
-      #
-      # Known limitation: the card is then only correct for callers on this
-      # network. Fetching it from the host shows an RPC URL the host cannot
-      # resolve. Compose-internal correctness wins because the only client is
-      # the agent container.
-      NEWS_AGENT_ADVERTISED_HOST: news-agent
 
   agent:
     <<: *app
