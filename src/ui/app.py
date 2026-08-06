@@ -437,8 +437,8 @@ if prompt := st.chat_input("Ask a question about the knowledge base"):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        # Run the turn on a background thread so the status label can keep
-        # ticking up ("Thinking for x.x seconds...") while asyncio.run blocks.
+        # Run the turn on a background thread so the elapsed counter and the
+        # step list can keep updating while asyncio.run blocks.
         turn_result: dict[str, object] = {}
         # Written by the turn thread as events arrive, read by the loop below to
         # redraw the expander - which is what makes the steps appear live rather
@@ -468,23 +468,26 @@ if prompt := st.chat_input("Ask a question about the knowledge base"):
         start_time = time.monotonic()
         turn_thread = threading.Thread(target=_run_turn_sync, daemon=True)
         turn_thread.start()
-        # expanded=True while running, and it matters more than it looks.
-        # status.update() re-sends the container's DECLARED expanded value on
-        # every call, and this loop calls it every 0.2s - so a click to open the
-        # expander was being thrown away a tenth of a second later, making the
-        # live steps impossible to read. Declaring it open removes the fight:
-        # the steps are the point while the turn runs, and it is collapsed again
-        # on completion so the finished answer is not buried under the trace.
+        # The container is written ONCE, on creation, and not touched again
+        # until the turn is over. That is the fix for the expander folding
+        # itself shut the moment it was clicked: expanding is frontend-only
+        # state, and re-sending the block every 0.2s - which a ticking label
+        # requires - disturbs it. Nothing here can win that race, so the race is
+        # removed instead of tuned.
+        #
+        # The cost is that the elapsed counter cannot live in the label while
+        # running, because the label is part of the block. It moves into the
+        # body, which is a child element and can be rewritten freely. Declared
+        # expanded so the steps and the counter are visible without a click;
+        # collapsing it is then the user's decision and nothing overrides it.
         with st.status("Thinking...", state="running", expanded=True) as status:
             # One placeholder, rewritten each tick, rather than a fresh element
             # per tick - otherwise every 0.2s poll would append another copy of
             # the step list to the expander.
             steps_slot = st.empty()
             while turn_thread.is_alive():
-                status.update(
-                    label=f"Thinking for {_duration(time.monotonic() - start_time)}..."
-                )
-                steps_slot.markdown(_format_steps(steps))
+                ticker = f"**Thinking for {_duration(time.monotonic() - start_time)}**"
+                steps_slot.markdown(f"{ticker}  \n{_format_steps(steps)}")
                 turn_thread.join(timeout=0.2)
             # Captured rather than recomputed inside the label, because it is
             # stored on the turn and replayed by the history loop above - the
