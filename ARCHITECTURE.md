@@ -19,7 +19,7 @@ flowchart TD
         Critique["critique_agent<br/>names one gap, or calls exit_loop"]
     end
 
-    Budget["tool_budget<br/>per-turn ceiling on evidence calls"]
+    Budget["tool_budget - three gates<br/>1. per-turn ceiling on evidence calls<br/>2. nothing undeclared by declare_plan<br/>3. nothing at all after report_gap"]
 
     subgraph Evidence["Evidence tools - answer 'what is true'"]
         DocTool["Document Search Tool"]
@@ -28,7 +28,9 @@ flowchart TD
         NewsTool["News Agent Tool<br/>(A2A client)"]
     end
 
-    subgraph Output["Output tool - terminal, gathers nothing"]
+    subgraph NonEvidence["Non-evidence tools - gather nothing, exempt from the ceiling"]
+        Plan["declare_plan<br/>opens the turn: one source per fact"]
+        Gap["report_gap<br/>closes it: source checked, fact absent"]
         Canvas["Canvas<br/>markdown / html / code"]
     end
 
@@ -63,8 +65,12 @@ flowchart TD
     Agent --> FinTool --> MCP --> Yahoo
     Agent --> WebTool --> GSearch
     Agent --> NewsTool --> NewsSvc --> GSearch
+    Agent --> Plan
+    Agent --> Gap
     Agent --> Canvas
     Agent --> Vertex
+    Plan -. declared sources gate the rest of the turn .-> Budget
+    Gap -. ends evidence gathering .-> Budget
     NewsSvc --> Vertex
 
     Raw --> Parse --> Chunk --> Embed --> Index
@@ -74,11 +80,13 @@ flowchart TD
     click Eval "src/evaluation/run_eval.py" "evaluation runner"
     click Agent "src/research_agent/agent.py" "research_agent: instruction + tool wiring"
     click Critique "src/research_agent/critique.py" "critique agent and loop control"
-    click Budget "src/research_agent/tool_budget.py" "per-turn tool-call ceiling"
+    click Budget "src/research_agent/tool_budget.py" "the three tool gates"
     click DocTool "src/tools/document_search.py" "Document Search Tool"
     click FinTool "src/tools/financial_data.py" "Financial Data Tool"
     click WebTool "src/tools/web_search.py" "Web Search Tool"
     click NewsTool "src/tools/news_agent.py" "A2A client tool"
+    click Plan "src/tools/declare_plan.py" "declared plan, gated against"
+    click Gap "src/tools/report_gap.py" "explicit stop action"
     click Canvas "src/tools/canvas.py" "Canvas output tool"
     click NewsSvc "src/news_service/server.py" "News Agent A2A service"
     click Index "src/retrieval/faiss_store.py" "FAISS build/load"
@@ -91,10 +99,20 @@ Three things in that diagram carry most of the design:
   `[research_agent, critique_agent]`, and `research_agent` is the LLM that holds the
   instruction and the tools. This matters whenever a turn's output is read: each agent
   emits its own "final response", and the answer is `research_agent`'s.
-- **Evidence tools and the output tool are different kinds of thing.** The four evidence
-  tools answer "what is true" and count against the per-turn ceiling. Canvas produces
-  rather than retrieves, is terminal, and is therefore exempt from that ceiling and from
-  the redundancy metric (ADR-0016).
+- **Evidence tools and non-evidence tools are different kinds of thing.** The four
+  evidence tools answer "what is true" and count against the per-turn ceiling. The other
+  three gather nothing and are exempt from that ceiling and from the redundancy metric:
+  Canvas produces rather than retrieves (ADR-0016), `report_gap` records that a checked
+  source does not cover a fact (ADR-0023), and `declare_plan` states what will be searched
+  before any searching happens (ADR-0024). Counting any of them would put a well-behaved
+  turn over its own bound for having followed the instruction.
+- **Two of those non-evidence tools exist to gate the evidence ones**, which is why they
+  point back at `tool_budget` in the diagram. `declare_plan` opens a turn by naming one
+  authoritative source per fact, and an evidence tool no declared fact names is refused.
+  `report_gap` closes it, and after it nothing further may be gathered. Both came from the
+  same repeated finding: an instruction describes what to do, but only a tool determines
+  what can be done - see ADR-0009, ADR-0015, ADR-0023 and ADR-0024, which reach that
+  conclusion from four different directions.
 - **The News Agent is a separate process, reached over A2A.** The main agent never imports
   it - it discovers the agent through its published agent card and calls it across a
   process boundary, which is the whole point of phase 5 (ADR-0018).
@@ -112,13 +130,18 @@ Three things in that diagram carry most of the design:
 | Entrypoints (evaluation) | [`src/evaluation/run_eval.py`](src/evaluation/run_eval.py) |
 | root_agent (the loop) + research_agent | [`src/research_agent/agent.py`](src/research_agent/agent.py) |
 | critique_agent, loop control, per-turn state | [`src/research_agent/critique.py`](src/research_agent/critique.py) |
-| Tool-call ceiling | [`src/research_agent/tool_budget.py`](src/research_agent/tool_budget.py) |
+| The three tool gates (ceiling, declared plan, reported gap) | [`src/research_agent/tool_budget.py`](src/research_agent/tool_budget.py) |
+| Session token ceiling | [`src/research_agent/token_budget.py`](src/research_agent/token_budget.py) |
+| Turn wall-clock deadline | [`src/research_agent/turn_deadline.py`](src/research_agent/turn_deadline.py) |
+| Conversation history trim | [`src/research_agent/history_trim.py`](src/research_agent/history_trim.py) |
 | Document Search Tool | [`src/tools/document_search.py`](src/tools/document_search.py) |
 | Financial Data Tool | [`src/tools/financial_data.py`](src/tools/financial_data.py) |
 | Web Search Tool | [`src/tools/web_search.py`](src/tools/web_search.py) |
 | News Agent Tool (A2A client) | [`src/tools/news_agent.py`](src/tools/news_agent.py) |
 | News Agent service | [`src/news_service/server.py`](src/news_service/server.py) |
-| Canvas (output tool) | [`src/tools/canvas.py`](src/tools/canvas.py) |
+| Declared plan (non-evidence) | [`src/tools/declare_plan.py`](src/tools/declare_plan.py) |
+| Reported gap (non-evidence) | [`src/tools/report_gap.py`](src/tools/report_gap.py) |
+| Canvas (non-evidence, output) | [`src/tools/canvas.py`](src/tools/canvas.py) |
 | Eval schema, metrics, replay | [`src/evaluation/`](src/evaluation) |
 | Deployment (four services) | [`docker-compose.yml`](docker-compose.yml), [`Dockerfile`](Dockerfile) |
 | MCP fetch server + HTTP bridge | [`docker/mcp-fetch-bridge.Dockerfile`](docker/mcp-fetch-bridge.Dockerfile) |

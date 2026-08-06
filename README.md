@@ -141,10 +141,15 @@ src/
 ├── tools/financial_data.py    <- Financial Data Tool over MCP
 ├── tools/news_agent.py        <- A2A client for the News Agent
 ├── tools/canvas.py            <- Canvas: renders research into an artefact
+├── tools/declare_plan.py      <- one authoritative source per fact, gated against
+├── tools/report_gap.py        <- explicit stop: source checked, fact absent
 ├── news_service/              <- the News Agent, served as its own A2A process
 ├── research_agent/agent.py    <- research_agent + root_agent (the critique loop)
 ├── research_agent/critique.py <- the critique agent and loop control
-├── research_agent/tool_budget.py <- per-turn ceiling on evidence calls
+├── research_agent/tool_budget.py <- the three tool gates: ceiling, plan, gap
+├── research_agent/token_budget.py <- cumulative token ceiling for a session
+├── research_agent/turn_deadline.py <- wall-clock bound on a turn
+├── research_agent/history_trim.py <- keeps a turn from re-sending the whole chat
 ├── evaluation/                <- question set, runner, metrics, replay layer
 └── ui/app.py                  <- Streamlit chat UI over root_agent
 ```
