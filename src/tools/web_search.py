@@ -12,6 +12,9 @@ avoid provisioning a third-party search API key under time pressure; revisit
 if we need more control over the search provider or result format later.
 """
 
+import asyncio
+
+import httpx
 from google.adk.agents import Agent
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.models.llm_request import LlmRequest
@@ -23,8 +26,93 @@ from google.genai import types
 from src import config
 from src.research_agent import token_budget
 
+# Bounds each redirect-resolution request (see _resolve_redirect below). Lives
+# in config alongside MCP_FETCH_TIMEOUT_S/NEWS_AGENT_TIMEOUT_S because it is
+# the same kind of knob: a bound on a non-Vertex HTTP hop that this agent must
+# degrade around rather than hang on.
+_REDIRECT_RESOLVE_TIMEOUT_S = config.REDIRECT_RESOLVE_TIMEOUT_S
 
-def _append_grounding_sources(callback_context: CallbackContext) -> types.Content | None:
+# Resolved redirect -> destination URL, for the process lifetime. The same
+# source is commonly cited by several grounding chunks across turns, and a
+# resolution that succeeded once will not change, so paying the network hop
+# again is pure waste. A FAILED resolution is deliberately NOT cached (see
+# _resolve_redirect) so a transient timeout gets a fresh attempt next time
+# rather than permanently degrading that source for the rest of the process.
+_RESOLVED_URL_CACHE: dict[str, str] = {}
+
+
+async def _resolve_redirect(client: httpx.AsyncClient, uri: str) -> str:
+    """Resolve one opaque vertexaisearch grounding redirect to its real destination.
+
+    Verified empirically against a live grounding URL (see module-level
+    comment above `_REDIRECT_RESOLVE_TIMEOUT_S`): a HEAD request is honoured
+    by the redirector and lands on the true destination (e.g.
+    worldbank.org/.../ajay-banga) in ~0.3s with no body downloaded, so HEAD
+    is the primary path. GET is a fallback for any redirect chain that
+    refuses HEAD (405/501), and is streamed rather than awaited-to-body so
+    the fallback never pays for a page download either - only the response
+    headers (the resolved `.url`) are read before the stream is closed.
+
+    Never raises: any transport error, timeout, or non-2xx HEAD response
+    falls back to the original opaque `uri`, either directly or via the GET
+    retry below. A degraded citation (still a working, if ugly, link) beats
+    a dropped one, and both beat failing the turn.
+
+    The GET retry is deliberately NOT reached on `httpx.TimeoutException`.
+    That exception is a subclass of `httpx.HTTPError`, so an earlier version
+    of this function caught it too broadly - a HEAD that stalled and timed
+    out at `_REDIRECT_RESOLVE_TIMEOUT_S` fell through to a GET that then
+    paid the same timeout a second time, doubling the worst case for a host
+    that was never going to answer either verb (measured: ~6.1s against a
+    real stalling host). A stall is a property of the HOST, not the verb -
+    retrying a request that already timed out with a different method buys
+    nothing. So a HEAD timeout now returns the raw `uri` immediately.
+
+    The retry is kept for the other `httpx.HTTPError` cases - a non-2xx HEAD
+    status (405/501, a host that rejects HEAD specifically but may well
+    serve GET) and other FAST transport errors (e.g. a refused connection,
+    a protocol error) - because those fail quickly rather than stalling, so
+    a second attempt is worth its cost and can recover a source HEAD alone
+    would have lost.
+
+    Worst-case bound per URI, with this split: a HEAD timeout returns
+    immediately at ~1 x `_REDIRECT_RESOLVE_TIMEOUT_S`. A HEAD that fails
+    FAST (non-2xx or a quick transport error) and is then followed by a GET
+    that itself times out is bounded at ~1 x `_REDIRECT_RESOLVE_TIMEOUT_S`
+    plus the HEAD's (small) fast-failure time - not 2x. The only path that
+    can still approach 2x is a HEAD that fails via a non-timeout transport
+    error just before its own timeout would otherwise have fired; that
+    requires the transport to actively error out late rather than merely
+    stall, which is a narrower condition than the stalled-host case this
+    change targets.
+    """
+    if uri in _RESOLVED_URL_CACHE:
+        return _RESOLVED_URL_CACHE[uri]
+
+    try:
+        response = await client.head(uri, follow_redirects=True)
+    except httpx.TimeoutException:
+        return uri  # The host stalled - a GET would just stall the same way.
+    except httpx.HTTPError:
+        pass  # A fast, non-timeout failure - worth a GET retry below.
+    else:
+        if response.status_code < 400:
+            resolved = str(response.url)
+            _RESOLVED_URL_CACHE[uri] = resolved
+            return resolved
+        # Non-2xx HEAD (e.g. 405) - fall through to the GET retry below.
+
+    try:
+        async with client.stream("GET", uri, follow_redirects=True) as response:
+            resolved = str(response.url)
+    except httpx.HTTPError:
+        return uri  # Both attempts failed - the raw redirect is still a valid link.
+
+    _RESOLVED_URL_CACHE[uri] = resolved
+    return resolved
+
+
+async def _append_grounding_sources(callback_context: CallbackContext) -> types.Content | None:
     """Append the grounding sources to this sub-agent's answer text.
 
     This exists because of a measured, non-obvious defect: the agent was
@@ -41,10 +129,24 @@ def _append_grounding_sources(callback_context: CallbackContext) -> types.Conten
     still exist, rather than by asking either agent more firmly.
 
     Both the domain and the URL are emitted ("worldbank.org (https://...)").
-    The raw grounding URI is an opaque vertexaisearch redirect that tells a
-    reader nothing, and the domain alone is not a URL and so cannot satisfy a
-    strict attribution check - only the pair is both honest to a human and
-    machine-checkable.
+    The domain alone is not a URL and so cannot satisfy a strict attribution
+    check, so the pair was always required - but the URL half used to be the
+    raw grounding URI, an opaque vertexaisearch redirect that told a human
+    reader nothing and, per src/evaluation/metrics.py's
+    `_URL_WORD_RE`/`_prose_word_count` comment, bloated answers badly (one
+    redirect is a ~200-character "word"; one decline answer was roughly half
+    URL by word count). This now resolves each redirect to its real
+    destination (`_resolve_redirect` above) before emitting it, concurrently
+    across a turn's distinct URIs via `asyncio.gather` - this callback is in
+    the hot path of every web-search answer, so resolving one-by-one would
+    multiply, not just add, latency.
+
+    This callback is `async def` deliberately, to do that resolution without
+    blocking the event loop: confirmed against the installed google-adk
+    2.5.0 by reading base_agent.py's `_handle_after_agent_callback` (not
+    docs) - it calls the callback, checks `inspect.isawaitable(...)` on the
+    result, and awaits it if so, so an async `after_agent_callback` is
+    natively supported, no thread pool needed.
 
     Returning Content rather than mutating in place because that is what ADK
     honours here, and it carries the ORIGINAL answer text forward with the
@@ -76,7 +178,19 @@ def _append_grounding_sources(callback_context: CallbackContext) -> types.Conten
         # inventing a source here would be worse than having none.
         return None
 
-    lines = "\n".join(f"- {domain} ({uri})" for domain, uri in sources)
+    # One shared client for every distinct URI in this turn, resolved
+    # concurrently rather than in a loop - see the docstring above on why
+    # this callback is async and why one-by-one resolution is not
+    # acceptable in this hot path.
+    async with httpx.AsyncClient(timeout=_REDIRECT_RESOLVE_TIMEOUT_S) as client:
+        resolved_uris = await asyncio.gather(
+            *(_resolve_redirect(client, uri) for _, uri in sources)
+        )
+
+    lines = "\n".join(
+        f"- {domain} ({resolved})"
+        for (domain, _), resolved in zip(sources, resolved_uris)
+    )
     return types.Content(
         role="model",
         parts=[types.Part(text=f"{answer}\n\nSources:\n{lines}")],

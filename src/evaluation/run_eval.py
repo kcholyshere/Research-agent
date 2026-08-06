@@ -91,6 +91,7 @@ from google.genai import types
 from src import config
 from src.evaluation.langfuse_sync import link_run_to_dataset, push_question_set
 from src.evaluation.metrics import print_summary, summarise
+from src.evaluation.preflight import run_preflight
 from src.evaluation.replay import FixtureMissError, FixtureMode, ToolFixtureSweep
 from src.evaluation.schema import CycleRecord, EvalQuestion, EvalRun, RunRecord
 from src.research_agent.agent import langfuse_client, research_agent, root_agent
@@ -286,6 +287,7 @@ async def run_once(
     fixtures_dir: Path,
     timeout_s: float,
     contended: bool = False,
+    web_search_thinking_budget: int | None = None,
 ) -> RunRecord:
     """One question, once, against one arm, in its own fresh session.
 
@@ -304,6 +306,17 @@ async def run_once(
     per-turn dispatch context, which is what makes it safe to call this
     concurrently for several questions at once (see replay.py's module
     docstring, "Concurrent sweeps").
+
+    `web_search_thinking_budget` follows `budget`'s own path exactly: both are
+    just extra keys in the same `state_delta` handed to `runner.run_async` on
+    this turn's fresh session, which is how `critique_budget` already reaches
+    `critique.py` and how the Streamlit UI already reaches
+    `web_search.py`'s `_apply_thinking_budget` (see that module's docstring -
+    AgentTool copies the parent session's state into the sub-agent's own
+    session, so nothing extra is needed on the web_search_agent side).
+    `None` (the CLI flag's default) omits the key entirely rather than writing
+    `None` into state, so an unset flag reproduces today's behaviour exactly:
+    `_apply_thinking_budget` falls back to `config.DEFAULT_WEB_SEARCH_THINKING_BUDGET`.
     """
     record = RunRecord(
         question_id=question.id,
@@ -316,6 +329,10 @@ async def run_once(
     events: list = []
     fixture_path = fixtures_dir / f"{question.id}.json"
 
+    state_delta: dict[str, int] = {"critique_budget": budget}
+    if web_search_thinking_budget is not None:
+        state_delta["web_search_thinking_budget"] = web_search_thinking_budget
+
     async def _inner() -> None:
         runner = InMemoryRunner(agent=root_agent, app_name=APP_NAME)
         session = await runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
@@ -324,7 +341,7 @@ async def run_once(
             user_id=USER_ID,
             session_id=session.id,
             new_message=content,
-            state_delta={"critique_budget": budget},
+            state_delta=state_delta,
         ):
             events.append(event)
             # Cheap and non-blocking by construction (a contextvar read, no
@@ -433,6 +450,7 @@ async def run_sweep(
     fixtures_dir: Path,
     timeout_s: float,
     concurrency: int = DEFAULT_CONCURRENCY,
+    web_search_thinking_budget: int | None = None,
 ) -> list[RunRecord]:
     """Every question through every arm, interleaved, `reps` times each.
 
@@ -452,6 +470,22 @@ async def run_sweep(
     `contended` rather than pretended away. Concurrency also subsumes what
     interleaving was doing for this phase: arms run literally simultaneously,
     so live-world drift cannot land on one arm rather than the other.
+
+    `web_search_thinking_budget`, unlike `budgets`, is a single value applied
+    to every run in the sweep rather than an arm dimension. Decision: the two
+    knobs are not symmetric. `budgets` names the arms this whole harness
+    exists to compare (`_plan_runs` builds one arm per value, multiplying run
+    count) - that is Tier 1's actual subject. The thinking budget is a
+    tuning knob for a sub-agent one level down, orthogonal to what a "run" of
+    this harness studies; multiplying every existing sweep by N thinking-budget
+    values would blow up an already ~1-hour sweep for a question this harness
+    was not designed to ask across the whole matrix. A single flag lets one
+    invocation answer "does this budget change latency/content for a given
+    critique-budget arm" without inventing a second cross-product - and a
+    caller who does want the A/B can already get it by running this script
+    twice with different `--web-search-thinking-budget` values and diffing the
+    two `EvalRun` files, which is cheaper to build and reason about than a
+    second arm dimension baked into `_plan_runs`.
 
     Concurrency is no longer restricted by mode. `replay.ToolFixtureSweep`
     installs the tool patch exactly once for this whole sweep (below), and
@@ -482,7 +516,16 @@ async def run_sweep(
             done += 1
             print(f"[{done}/{total}] timed rep={rep} arm={arm} question={question.id!r}...", end=" ", flush=True)
             record = await run_once(
-                question, arm, budget, rep, mode, fixture_sweep, fixtures_dir, timeout_s, contended=False
+                question,
+                arm,
+                budget,
+                rep,
+                mode,
+                fixture_sweep,
+                fixtures_dir,
+                timeout_s,
+                contended=False,
+                web_search_thinking_budget=web_search_thinking_budget,
             )
             results.append(record)
             print(_status(record), flush=True)
@@ -497,7 +540,16 @@ async def run_sweep(
             rep, arm, budget, question = item
             async with semaphore:
                 record = await run_once(
-                    question, arm, budget, rep, mode, fixture_sweep, fixtures_dir, timeout_s, contended=contended
+                    question,
+                    arm,
+                    budget,
+                    rep,
+                    mode,
+                    fixture_sweep,
+                    fixtures_dir,
+                    timeout_s,
+                    contended=contended,
+                    web_search_thinking_budget=web_search_thinking_budget,
                 )
             nonlocal done
             done += 1
@@ -596,6 +648,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--budgets", type=str, default="0,1", help="Comma-separated critique budgets, one arm per value."
     )
+    parser.add_argument(
+        "--web-search-thinking-budget",
+        type=int,
+        default=None,
+        dest="web_search_thinking_budget",
+        help="Override web_search_agent's thinking budget (tokens; 0 disables, -1 is Gemini's automatic "
+        "budget) for every run in this sweep - see src/tools/web_search.py's _apply_thinking_budget and "
+        "config.DEFAULT_WEB_SEARCH_THINKING_BUDGET (512). Applied to the whole sweep, not as a per-arm "
+        "dimension - see run_sweep's docstring for why. Unset reproduces today's default exactly.",
+    )
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S, dest="timeout_s")
     parser.add_argument("--fixtures-dir", type=Path, default=DEFAULT_FIXTURES_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
@@ -625,6 +687,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Skip the sweep entirely: load an existing EvalRun JSON file from PATH and sync it to "
         "Langfuse (implies --sync-langfuse). Lets a sync be fixed or retried without re-running a sweep.",
     )
+    parser.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="Skip the pre-sweep check that mcp-fetch/news-agent are reachable (see src/evaluation/"
+        "preflight.py). Always skipped automatically for --mode replay, which makes no live service "
+        "calls; this flag is for the remaining live/record cases where the check should not block "
+        "(e.g. a deliberate negative test against a service that is intentionally down).",
+    )
     return parser
 
 
@@ -649,6 +719,15 @@ async def main_async(argv: list[str] | None = None) -> EvalRun:
     if not questions:
         raise SystemExit("No questions matched --questions/--tags filters - nothing to run.")
 
+    # Fail fast, before any run executes, rather than deep inside a long sweep
+    # (see preflight.py's module docstring). Skipped for --mode replay
+    # automatically: replay.ToolFixtureSweep never invokes a real tool call
+    # (replay.py's own docstring, "Replay: real_call is never invoked, by
+    # construction"), so nothing in a replay run depends on either service
+    # being up, and blocking it would fail a mode that cannot fail this way.
+    if args.mode != "replay" and not args.skip_preflight:
+        await run_preflight(questions)
+
     print(
         f"Running {len(questions)} question(s) x {len(budgets)} arm(s) x {args.reps} rep(s) "
         f"= {len(questions) * len(budgets) * args.reps} runs, mode={args.mode}",
@@ -664,6 +743,7 @@ async def main_async(argv: list[str] | None = None) -> EvalRun:
         fixtures_dir=args.fixtures_dir,
         timeout_s=args.timeout_s,
         concurrency=args.concurrency,
+        web_search_thinking_budget=args.web_search_thinking_budget,
     )
     finished_at = dt.datetime.now(dt.timezone.utc)
 
@@ -674,6 +754,7 @@ async def main_async(argv: list[str] | None = None) -> EvalRun:
         "reps": args.reps,
         "mode": args.mode,
         "budgets": budgets,
+        "web_search_thinking_budget": args.web_search_thinking_budget,
         "timeout_s": args.timeout_s,
         # Recorded so a stored run is self-describing about how it was
         # measured - latency from a concurrency>1 sweep is only comparable

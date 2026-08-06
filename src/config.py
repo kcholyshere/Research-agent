@@ -96,3 +96,14 @@ MCP_FETCH_URL = os.getenv("MCP_FETCH_URL", "http://localhost:8090/mcp")
 # timeouts never apply to them. Generous relative to the News Agent's 20s
 # because the server's own work is a live page fetch of a third-party site.
 MCP_FETCH_TIMEOUT_S = 30.0
+
+# Bounds a single grounding-redirect resolution in src/tools/web_search.py.
+# Gemini's google_search returns opaque vertexaisearch redirect links rather
+# than destination URLs, and the sub-agent's after_agent_callback resolves
+# them so a citation is checkable by a reader. That resolution sits in the hot
+# path of every web-search answer, so it must degrade to the raw link rather
+# than stall the turn. Measured against live grounding redirects (2026-08-06):
+# HEAD resolves in 0.3-0.4s, so 3s is generous headroom while capping what one
+# stuck host can cost. Resolutions run concurrently, so a turn pays the slowest
+# single source, not the sum.
+REDIRECT_RESOLVE_TIMEOUT_S = 3.0
