@@ -477,10 +477,14 @@ if prompt := st.chat_input("Ask a question about the knowledge base"):
         #
         # The cost is that the elapsed counter cannot live in the label while
         # running, because the label is part of the block. It moves into the
-        # body, which is a child element and can be rewritten freely. Declared
-        # expanded so the steps and the counter are visible without a click;
-        # collapsing it is then the user's decision and nothing overrides it.
-        with st.status("Thinking...", state="running", expanded=True) as status:
+        # body, which is a child element and can be rewritten freely.
+        #
+        # Collapsed by default: this is a detail view, not the turn's output,
+        # and it should not cost vertical space until asked for. Expanding it is
+        # the user's decision, and because nothing rewrites the block, that
+        # decision is never overridden - not while the turn runs, and not when
+        # it finishes.
+        with st.status("Thinking...", state="running") as status:
             # One placeholder, rewritten each tick, rather than a fresh element
             # per tick - otherwise every 0.2s poll would append another copy of
             # the step list to the expander.
@@ -498,12 +502,13 @@ if prompt := st.chat_input("Ask a question about the knowledge base"):
             # so without this the expander would keep a step reading "..." even
             # though the turn is done.
             steps_slot.markdown(_format_steps(steps))
-            # Collapsed here, and this is the last update the container gets -
-            # so from now on the user's own click sticks, which is the
-            # behaviour they already had once a turn finished.
-            status.update(
-                label=f"Thought for {_duration(elapsed)}", state="complete", expanded=False
-            )
+            # No `expanded` argument, deliberately. update() calls ClearField on
+            # that field when it is None, which means "leave it as the user left
+            # it" - so someone who opened the expander to watch the steps still
+            # has it open when the answer lands, instead of having it snap shut
+            # under them. It starts collapsed anyway, so there is nothing to
+            # tidy away here.
+            status.update(label=f"Thought for {_duration(elapsed)}", state="complete")
         answer = str(turn_result["answer"]).replace("$", "\\$")
         st.markdown(answer)
         artefact = turn_result.get("artefact")
