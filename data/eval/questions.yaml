@@ -487,7 +487,6 @@ questions:
     tags: [kb, multi_part, critique_loop, unanswerable]
     max_tool_calls: 4
     must_contain: ["1,485"]
-    expects_second_cycle: true
     notes: >-
       Built for the open TODO on critique calibration, not on routing: every
       other critique_loop question is fully answerable, so 28 of 28 budget-1
@@ -508,13 +507,22 @@ questions:
       FY24 own account") surfaced only portfolio-by-region tables and NOTE
       S's aggregate segment income, never a per-region margin.
 
-      expects_second_cycle asserts the discriminator itself: a correct critic
-      should see the margin as a distinct, unaddressed sub-question - ADR-
-      0010's continuation rule - and NOT exit on cycle 1, where a reflexive
-      critic exits regardless. Nothing in metrics.py scores this field yet
-      (see its definition in schema.py for the smallest check that would);
-      today it is read by hand from cycle_count and critique_outcome on the
-      stored run. Deliberately not expects_decline: check_decline assumes the
+      expects_second_cycle was set here and has been REMOVED, which is worth
+      recording rather than quietly deleting. It asserted the discriminator
+      directly: a correct critic should see the margin as a distinct,
+      unaddressed sub-question and not exit on cycle 1. That premise was
+      overtaken the same day by ADR-0023/0024. A fact the draft explicitly
+      declines, naming and citing the source it checked, is answered - the
+      source's not having it IS the answer - and critique.py now says so in
+      its own grounds-to-continue list. So a correct critic MUST exit here,
+      and the label asserted the opposite: it failed 0 of 4 in the 2026-08-06
+      sweep and would have failed every future sweep too, dragging hard pass
+      down for asserting behaviour the design deliberately rejects. That is
+      the same defect class as the decline word count it replaced, so it goes
+      the same way. The field survives in schema.py with its check, for a
+      question that genuinely needs a second cycle; this is not that question.
+      What this question still measures is whether the answerable half
+      survives alongside a declined half - see must_contain. Deliberately not expects_decline: check_decline assumes the
       whole answer is a decline and scores word-count padding against that,
       but this answer is half a real figure and half a decline, which is a
       shape that check was never written for - must_contain on the answerable
