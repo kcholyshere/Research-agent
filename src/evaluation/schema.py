@@ -90,8 +90,9 @@ TOOL_TO_ROUTE: dict[str, RouteTarget] = {
 # stream as real tool calls and would otherwise be counted as routing.
 CONTROL_TOOLS: frozenset[str] = frozenset({"exit_loop"})
 
-# Output-producing calls, not evidence-gathering. Excluded from `tools_called`
-# for the same reason CONTROL_TOOLS is, but the consequence is sharper here.
+# Non-evidence calls that are not loop control either. Excluded from
+# `tools_called` for the same reason CONTROL_TOOLS is, but the consequence is
+# sharper here.
 #
 # `check_redundancy` compares len(tools_called) against the question's
 # `max_tool_calls`, a bound written to police *searching*. create_canvas
@@ -100,7 +101,16 @@ CONTROL_TOOLS: frozenset[str] = frozenset({"exit_loop"})
 # each of them one over its own bound. Every one would read as a redundancy
 # regression on a turn that behaved perfectly, and the bounds could not be
 # raised to compensate without also loosening the real search budget they
-# exist to enforce.
+# exist to enforce. report_gap (phase 6 follow-up) is exempt on the same
+# reasoning though not the same shape of turn: it records an outcome about
+# evidence already gathered rather than gathering any itself, so counting it
+# would make every correct decline read as one call over budget purely for
+# having named the gap explicitly instead of only writing it in prose.
+#
+# Kept named OUTPUT_TOOLS rather than renamed for report_gap's addition - it
+# is still exactly the set of tools this project has decided are not evidence
+# sources, which is what both consumers below actually key off; "output" was
+# always shorthand for that, not a claim that every member produces a file.
 #
 # Must stay in step with `src/research_agent/tool_budget.py`'s OUTPUT_TOOLS,
 # which exempts the same names from the runtime ceiling. Two lists rather than
@@ -108,7 +118,12 @@ CONTROL_TOOLS: frozenset[str] = frozenset({"exit_loop"})
 # without importing the agent (and therefore without triggering Langfuse
 # instrumentation and a Vertex client) - but they are one concept, and a change
 # to either is a change to both.
-OUTPUT_TOOLS: frozenset[str] = frozenset({"create_canvas"})
+# declare_plan is exempt on the same reasoning again, and the most clearly so
+# of the three: it states which source is authoritative for each fact before
+# any searching happens, so it is the opposite of a retrieval call. Counting
+# it would put every well-behaved turn exactly one call over its own bound,
+# and it would do so most reliably on the turns that followed the instruction.
+OUTPUT_TOOLS: frozenset[str] = frozenset({"create_canvas", "report_gap", "declare_plan"})
 
 # Everything that is not evidence-gathering. `tools_called` filters on this.
 NON_EVIDENCE_TOOLS: frozenset[str] = CONTROL_TOOLS | OUTPUT_TOOLS
@@ -129,6 +144,17 @@ class EvalQuestion:
     question: str
     expected_routes: list[RouteTarget]
     tags: list[str] = field(default_factory=list)
+
+    # Alternative route sets that are equally correct, each a full substitute
+    # for `expected_routes` rather than a per-route swap. Exists for exactly
+    # one case so far: a question whose correct routing genuinely has more
+    # than one right answer, because two different tools legitimately serve
+    # the same half of the question and which one a live planner picks is not
+    # itself a defect. `check_routing` passes if the routes used match
+    # `expected_routes` OR any one set here, exactly - it does not mix and
+    # match individual routes across sets. Empty for every other question, so
+    # their routing semantics are unchanged.
+    acceptable_routes: list[list[RouteTarget]] = field(default_factory=list)
 
     # Redundancy bound. Distinct from len(expected_routes): a question may
     # legitimately need two calls to one source (reformulation after a miss),
@@ -166,6 +192,25 @@ class EvalQuestion:
     # and latency alone.
     volatile: bool = False
 
+    # True when a genuinely unaddressed sub-question should make the critique
+    # agent continue past cycle 1 - i.e. cycle_count is expected to be >= 2
+    # under a budget that allows it. Exists for the open TODO on critique
+    # calibration: every other critique_loop question is fully answerable, so
+    # a critic that always exits scores identically to one that correctly
+    # judged nothing was missing - there was no question in the set whose
+    # correct behaviour was to NOT exit on cycle 1.
+    #
+    # Now read by `metrics.check_critique_calibration`, asserting
+    # `record.cycle_count >= 2 if question.expects_second_cycle else True`.
+    # Skipped (returns None, not a failure) whenever no real critique
+    # judgement happened at all in the record - detected from
+    # CycleRecord.critique_outcome rather than from the record's arm/budget,
+    # so it covers both ways a critique call can fail to happen: a spent
+    # `critique_budget` (the "budget 0" case this field's original note named)
+    # and the financial-only shortcut in `critique.py`'s
+    # `_skip_critique_llm_call`. See metrics.py for the check itself.
+    expects_second_cycle: bool = False
+
     # Assertions this question is expected to fail today against a known,
     # logged defect, as {assertion key: short defect reference}. The run still
     # records the failure - it is not suppressed - but it is reported apart
@@ -180,7 +225,7 @@ class EvalQuestion:
     # which is the opposite of what this field exists for.
     #
     # Recognised keys: routing, redundancy, citation, decline, content,
-    # wasted_cycle, artefact.
+    # wasted_cycle, artefact, critique_calibration.
     known_defects: dict[str, str] = field(default_factory=dict)
 
     notes: str = ""
@@ -189,6 +234,9 @@ class EvalQuestion:
     def from_dict(cls, raw: dict[str, Any]) -> EvalQuestion:
         data = dict(raw)
         data["expected_routes"] = [RouteTarget(r) for r in data.get("expected_routes", [])]
+        data["acceptable_routes"] = [
+            [RouteTarget(r) for r in alt] for alt in data.get("acceptable_routes", [])
+        ]
         return cls(**data)
 
 

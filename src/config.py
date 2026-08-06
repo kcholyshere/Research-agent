@@ -73,6 +73,39 @@ DEFAULT_WEB_SEARCH_THINKING_BUDGET = 512
 # left open cannot run indefinitely.
 MAX_SESSION_TOKENS = 200_000
 
+# Conversation history window for research_agent (src/research_agent/history_trim.py,
+# the ADR-0021 follow-up TODOS.md named: "trim conversation history to the last
+# N turns"). Bounds each turn's OWN cost, which MAX_SESSION_TOKENS does not -
+# that caps the sum across a session, so it says nothing about how expensive
+# turn 8 is compared to turn 2. Every model call resends the full transcript,
+# and ADR-0021 measured that transcript costing ~7.1k tokens of resent history
+# just from turn 1 by the time turn 2 starts.
+#
+# 3, from a direct measurement (scripts/verify_history_trim.py) of the same
+# request, before and after the trim, inside one session - not a comparison
+# across two separate live runs, which turned out to be too noisy to trust:
+# an earlier draft compared prompt_token_count across a trimmed and an
+# untrimmed session and got DIFFERENT numbers on turns neither session had
+# reason to differ on yet, because each session's own live web_search_agent
+# calls return their own live grounding results. Counting
+# llm_request.contents (via the model's own count_tokens) immediately either
+# side of the trim callback removes that source of noise entirely: on one
+# real run, turn 5's first call dropped from 31 to 24 contents and 10,226 to
+# 8,749 tokens - a real 1,477 tokens off that one request, for turns 1-4
+# untouched.
+#
+# The per-turn cost is too tool-dependent for a fixed per-turn TOKEN budget
+# to be the unit (a search_documents turn is cheap, a web_search_agent
+# turn's grounded results are not - the same run's turns ranged from ~200 to
+# ~3,000 tokens each), which is why this bounds the COUNT of retained turns
+# instead. 3 keeps every later turn's resent history to at most 3 turns'
+# worth rather than all of them, while still covering the common real
+# follow-up ("what about the year before?" references the turn immediately
+# prior) with headroom for one or two hops further back before a question
+# has to be re-searched instead of read from history. The turn in progress
+# is never counted against this - see history_trim.py.
+MAX_HISTORY_TURNS = 3
+
 # News Agent service (phase 5, Agent-to-Agent demo) - a separate process
 # reached over plain HTTP, not an in-process import; see
 # src/news_service/server.py and src/tools/news_agent.py for why. A
@@ -96,3 +129,36 @@ MCP_FETCH_URL = os.getenv("MCP_FETCH_URL", "http://localhost:8090/mcp")
 # timeouts never apply to them. Generous relative to the News Agent's 20s
 # because the server's own work is a live page fetch of a third-party site.
 MCP_FETCH_TIMEOUT_S = 30.0
+
+# Wall-clock ceiling on a whole turn (src/research_agent/turn_deadline.py) -
+# the bound TODOS.md flagged as missing: every timeout above this line stops
+# ONE hop (a model call, an HTTP call to a service), and MAX_CRITIQUE_ITERATIONS
+# stops the loop after a fixed COUNT of cycles, but nothing stops the sum of
+# several hops across up to that many cycles from running for as long as each
+# hop is willing to take. Under `InMemoryRunner` (adk run/adk web/Streamlit),
+# ADK's own client sets no such ceiling - see genai_client.MODEL_CALL_TIMEOUT_MS.
+#
+# Picked from the same evidence EVALUATION.md's latency sections give, not
+# invented: the 2026-08-03 20:20 final baseline (280 live runs) measured
+# median latency 23.4s at critique budget 0 / 25.7s at budget 1, and its worst
+# real, successfully-completed run - a genuine second critique cycle, not a
+# hang - was 89.5s. 240s is a little under 2.7x that worst observed case,
+# enough headroom for a legitimate third cycle (MAX_CRITIQUE_ITERATIONS allows
+# one, and the Streamlit slider lets a user request it) without being sized
+# for the eval harness's different purpose: run_eval.py's own
+# DEFAULT_TIMEOUT_S=300s is deliberately generous enough to let even a known,
+# ~100s-costing defect run to completion so the sweep still captures full
+# data - a live UI should give up sooner than that and say so, not wait out a
+# pathological run on the user's behalf.
+TURN_TIMEOUT_S = 240.0
+
+# Bounds a single grounding-redirect resolution in src/tools/web_search.py.
+# Gemini's google_search returns opaque vertexaisearch redirect links rather
+# than destination URLs, and the sub-agent's after_agent_callback resolves
+# them so a citation is checkable by a reader. That resolution sits in the hot
+# path of every web-search answer, so it must degrade to the raw link rather
+# than stall the turn. Measured against live grounding redirects (2026-08-06):
+# HEAD resolves in 0.3-0.4s, so 3s is generous headroom while capping what one
+# stuck host can cost. Resolutions run concurrently, so a turn pays the slowest
+# single source, not the sum.
+REDIRECT_RESOLVE_TIMEOUT_S = 3.0

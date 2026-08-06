@@ -48,6 +48,7 @@ docstring for the ADK defect that made this necessary rather than merely nice.
 
 from collections.abc import AsyncGenerator
 
+from a2a.client.errors import A2AClientTimeoutError
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.agents.remote_a2a_agent import RemoteA2aAgent
 from google.adk.events.event import Event
@@ -113,6 +114,53 @@ class _ReachableRemoteA2aAgent(RemoteA2aAgent):
 
     Both are handled, and both produce the same thing: an event with real text.
 
+    ## The third shape: a timeout is not "not running"
+
+    `A2AClientTimeoutError` raises through the exact same `status_code` bug -
+    it too subclasses `A2AClientError` without adding a `status_code`
+    attribute - so it no longer kills the turn either; it lands in the
+    `except Exception` below like the RPC-failure case above. That much is
+    true by class hierarchy alone. But "does not crash" is not the same as
+    "usable by the planner": the generic recovery text below says the service
+    "must be running - start it with `docker compose up -d news-agent`",
+    which is actively wrong for a timeout. The service accepted the
+    connection and answered late (the case the 2026-08-03 sweep hit was 1
+    slow run in 280, not a down service); telling the planner to restart a
+    service that is already up is a false diagnosis it would otherwise repeat
+    to the user.
+
+    So the timeout case gets its own wording, still built by `_unreachable`
+    rather than a parallel Event-construction path. The discriminator has to
+    recover the original `A2AClientTimeoutError`, because by the time it
+    reaches this class's `except Exception`, what is actually caught is the
+    `AttributeError` raised while ADK's own handler was reading
+    `e.status_code` - not the timeout itself. Python's implicit exception
+    chaining puts the original on `AttributeError.__context__` (confirmed
+    against the real generator, not assumed from the language spec - see
+    `scripts/verify_news_agent_error_handling.py`), so that is what
+    `_run_async_impl` inspects below.
+
+    This covers the RPC-fails shape specifically - a card that resolved and
+    then timed out on the actual request. A timeout during card resolution
+    itself (the first shape above, same 20s `httpx.Timeout`, service just
+    slow rather than down) still reports as "must be running": that path
+    only has ADK's own `error_message` string to work with, not an exception
+    object to inspect for `A2AClientTimeoutError`, so there is nothing to
+    discriminate on without fragile string-matching on the message text. Left
+    as a known remaining case rather than fixed here - it was not what the
+    2026-08-03 sweep hit, and the fix on offer (parsing "timed out" out of an
+    error string) trades a real discriminator for a brittle one.
+
+    Verified empirically against the installed packages throughout: the
+    script injects a bare `A2AClientError` and a fresh `A2AClientTimeoutError`
+    at the real `_compat.send_message` call site, confirms each one crashes a
+    plain `RemoteA2aAgent` with the `status_code` `AttributeError`, and then
+    confirms this class recovers each into distinct, readable text - the
+    generic "not running" wording for the bare error, the "did not respond in
+    time" wording below for the timeout. This closes the `agent_docs/TODOS.md`
+    item logged from the 2026-08-03 sweep ("Handle `A2AClientTimeoutError` -
+    it has no `status_code` and killed 1 run of 280").
+
     ## The fix, and why it is shaped like this
 
     Delegate to `super()` and repair what comes back. Nothing is reimplemented
@@ -127,7 +175,19 @@ class _ReachableRemoteA2aAgent(RemoteA2aAgent):
     response.
     """
 
-    def _unreachable(self, ctx: InvocationContext, detail: str) -> Event:
+    def _unreachable(
+        self,
+        ctx: InvocationContext,
+        *,
+        problem: str,
+        remedy: str,
+    ) -> Event:
+        # Shared scaffolding (URL-less on purpose - callers already fold the
+        # address into `problem` where it is relevant) and the closing
+        # instruction stay identical across callers; only the diagnosis
+        # (`problem`) and what to do about it (`remedy`) vary, which is what
+        # lets the timeout case below say something true instead of reusing
+        # the "not running" wording.
         return Event(
             author=self.name,
             invocation_id=ctx.invocation_id,
@@ -137,15 +197,44 @@ class _ReachableRemoteA2aAgent(RemoteA2aAgent):
                 parts=[
                     types.Part(
                         text=(
-                            "The News Agent service could not be reached at "
-                            f"{config.NEWS_AGENT_URL} ({detail}). It is a separate "
-                            "service and must be running - start it with "
-                            "`docker compose up -d news-agent`. No news was retrieved "
-                            "for this request; report that the news delegation failed "
+                            f"{problem} {remedy} No news was retrieved for this "
+                            "request; report that the news delegation failed "
                             "rather than answering from another source."
                         )
                     )
                 ],
+            ),
+        )
+
+    def _not_running(self, ctx: InvocationContext, detail: str) -> Event:
+        return self._unreachable(
+            ctx,
+            problem=(
+                "The News Agent service could not be reached at "
+                f"{config.NEWS_AGENT_URL} ({detail})."
+            ),
+            remedy=(
+                "It is a separate service and must be running - start it with "
+                "`docker compose up -d news-agent`."
+            ),
+        )
+
+    def _timed_out(self, ctx: InvocationContext) -> Event:
+        return self._unreachable(
+            ctx,
+            problem=(
+                "The News Agent did not respond within "
+                # This agent's own configured timeout, not the module-level
+                # default it was constructed with - the two are the same
+                # value for the production `news_remote_agent` singleton, but
+                # reading `self._timeout` keeps the message honest for any
+                # other instance, including the ones this module's regression
+                # script builds with a shorter timeout for speed.
+                f"{self._timeout:.0f} seconds."
+            ),
+            remedy=(
+                "The service may be running but slow or overloaded - this is "
+                "not the same as it being down, so do not suggest restarting it."
             ),
         )
 
@@ -157,11 +246,19 @@ class _ReachableRemoteA2aAgent(RemoteA2aAgent):
                 # An error event with no content would reach the planner as an
                 # empty tool result - substitute one that says what went wrong.
                 if event.error_message and not event.content:
-                    yield self._unreachable(ctx, event.error_message)
+                    yield self._not_running(ctx, event.error_message)
                 else:
                     yield event
         except Exception as exc:  # noqa: BLE001 - see class docstring
-            yield self._unreachable(ctx, f"{type(exc).__name__}: {exc}")
+            # What lands here for a timeout is not the A2AClientTimeoutError
+            # itself but the AttributeError ADK raises while reading
+            # `e.status_code` on it (see class docstring) - the original is
+            # recovered from implicit exception chaining, not from `exc`'s own
+            # type, which is AttributeError either way.
+            if isinstance(exc.__context__, A2AClientTimeoutError):
+                yield self._timed_out(ctx)
+            else:
+                yield self._not_running(ctx, f"{type(exc).__name__}: {exc}")
 
 
 news_remote_agent = _ReachableRemoteA2aAgent(

@@ -52,51 +52,65 @@ from google.genai import types
 
 from src.services import genai_client
 from src.tools.canvas import create_canvas
+from src.tools.declare_plan import declare_plan
 from src.tools.document_search import search_documents
 from src.tools.financial_data import get_financial_data
 from src.tools.news_agent import news_agent_tool
+from src.tools.report_gap import report_gap
 from src.tools.web_search import web_search_tool
 
 # Imported after instrument() (see the observability note above) - this
 # module's own import constructs critique_agent = Agent(...) at load time.
-from src.research_agent import token_budget, tool_budget
+from src.research_agent import history_trim, token_budget, tool_budget, turn_deadline
 from src.research_agent.critique import LAST_ARTEFACT_KEY, critique_agent, reset_turn_state
 
 
-def _record_artefact(
+def _after_tool(
     tool: BaseTool,
     args: dict[str, Any],
     tool_context: ToolContext,
     tool_response: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Put a rendered artefact into session state for the critique to review.
+    """Dispatch on tool name to the two callbacks that need to see a tool's own response.
 
     Signature verified against the installed google-adk 2.5.0 rather than taken
     from docs, per CLAUDE.md: `AfterToolCallback` is
     `Callable[[BaseTool, dict[str, Any], ToolContext, dict], Optional[dict]]`,
     and the flow invokes it by KEYWORD - `tool=`, `args=`, `tool_context=`,
     `tool_response=` - so these four parameter names are load-bearing and
-    renaming any of them breaks the call rather than being cosmetic.
+    renaming any of them breaks the call rather than being cosmetic. ADK
+    wires exactly one after_tool_callback per agent, so both jobs below live
+    in this single dispatcher rather than as two separately-registered
+    callbacks.
 
-    Wired as research_agent's after_tool_callback. Without it the critique
-    reviews `draft_answer`, which on an artefact turn is a short covering note
-    by design (see step 4 of INSTRUCTION) - it would find no substance in the
-    note, conclude the question was barely answered, and raise follow-ups on
-    every single artefact turn. That is a refinement cycle spent re-researching
-    a document that was already complete, on the most expensive turns in the
-    system and the ones most likely to be demonstrated.
+    create_canvas: puts a rendered artefact into session state for the
+    critique to review. Without it the critique reviews `draft_answer`, which
+    on an artefact turn is a short covering note by design (see step 4 of
+    INSTRUCTION) - it would find no substance in the note, conclude the
+    question was barely answered, and raise follow-ups on every single
+    artefact turn. That is a refinement cycle spent re-researching a document
+    that was already complete, on the most expensive turns in the system and
+    the ones most likely to be demonstrated. Only successful renders are
+    recorded - an error return is not an artefact, and showing the critique a
+    failed one would have it review a document that does not exist.
 
-    Only successful renders are recorded. An error return is not an artefact,
-    and showing the critique a failed one would have it review a document that
-    does not exist.
+    declare_plan: hands a successfully-validated plan to
+    tool_budget.record_declared_plan, which is what makes the rest of the
+    turn's evidence calls checkable against it (see tool_budget.py's
+    docstring, "declare_plan as a third, independent gate"). Recording only
+    happens here, after the real tool has run and validated its own input,
+    not in the before_tool_callback - a plan that failed validation
+    (mismatched list lengths, an unknown source name) must not overwrite
+    whatever plan was already in force.
 
-    Returns None so ADK keeps the real tool response - returning a value here
-    would replace what the model sees.
+    Returns None in both cases so ADK keeps the real tool response -
+    returning a value here would replace what the model sees.
     """
-    if tool.name != "create_canvas":
-        return None
-    if isinstance(tool_response, dict) and tool_response.get("status") == "ok":
-        tool_context.state[LAST_ARTEFACT_KEY] = tool_response.get("artefact", "")
+    if tool.name == "create_canvas":
+        if isinstance(tool_response, dict) and tool_response.get("status") == "ok":
+            tool_context.state[LAST_ARTEFACT_KEY] = tool_response.get("artefact", "")
+    elif tool.name == "declare_plan":
+        tool_budget.record_declared_plan(tool_context, tool_response)
     return None
 
 INSTRUCTION = """You are a research agent with four sources of evidence: a
@@ -104,8 +118,10 @@ private knowledge base (search_documents), live financial market data
 (get_financial_data), the latest news on a topic from an independent News Agent
 you delegate to over A2A (news_agent), and the public internet
 (web_search_tool).
-You also have one output tool, create_canvas, which is not a source and gathers
-nothing - it renders research you have already done into a finished artefact.
+You also have two tools that are not evidence sources and gather nothing:
+create_canvas, which renders research you have already done into a finished
+artefact, and report_gap, which you call to record that a fact you checked is
+not covered by the source that is authoritative for it - see step 2.
 For every question, follow a plan-execute-synthesize flow:
 
 0. Refinement check: {critique_followups?} holds specific follow-up
@@ -130,7 +146,19 @@ For every question, follow a plan-execute-synthesize flow:
    up". Only plan to
    use multiple sources for a fact if the question genuinely requires
    combining evidence across them - not as a routine double-check of a
-   source that already answers the fact on its own. State the plan briefly.
+   source that already answers the fact on its own. State the plan by
+   calling declare_plan once, with every fact and its declared source as
+   parallel lists - see its docstring for the exact source names to use.
+   Only a tool declare_plan named will be callable for the rest of this
+   turn; if a fact turns out to need a different source than you first
+   declared, call declare_plan again to amend the plan before you try that
+   source, not after.
+
+   report_gap is the LAST evidence-gathering action of a turn: once you call
+   it, no further evidence tool can be called for the rest of this question,
+   for any of its facts. So plan and research every answerable part of the
+   question first, and only call report_gap once every other planned fact
+   has already been gathered.
 
    Also decide, once, what the question wants back. Most questions want an
    answer: reply in prose and do not call create_canvas. Some ask for a
@@ -155,7 +183,10 @@ For every question, follow a plan-execute-synthesize flow:
    IFC's own financial reporting, get_financial_data for market prices - its
    not having the answer IS the answer, and searching elsewhere for a
    substitute produces a figure from somewhere that was never authoritative
-   for the question. Report the gap instead.
+   for the question. Report the gap instead: call report_gap with the fact
+   and the source you checked, then continue to step 3 and write the prose
+   decline - report_gap records the gap, it does not answer the question
+   for you.
 3. Synthesize: answer strictly from the retrieved passages/results, citing the
    source of each fact. A citation must identify something a reader could go
    and check, and each tool gives you one - use what it gives you rather than
@@ -269,17 +300,26 @@ research_agent = Agent(
     model=config.GEMINI_MODEL,
     description="Answers questions over a private knowledge base, live financial market data, and the public internet via planned, multi-source search, and renders the result as a report, document or code file when one is asked for.",
     instruction=INSTRUCTION,
-    # create_canvas is last on purpose - it is the only non-evidence tool here
-    # and the only one that ends a turn rather than informing it. See
-    # src/tools/canvas.py for why it must be exempt from the tool budget and
-    # from the redundancy metric; both exemptions key off its name, so renaming
-    # it means changing tool_budget.OUTPUT_TOOLS and schema.OUTPUT_TOOLS too.
+    # declare_plan, create_canvas and report_gap are the only non-evidence
+    # tools here. declare_plan is listed first, ahead of the four evidence
+    # tools, because it is the first tool call a well-behaved turn makes.
+    # create_canvas ends a turn that asked for a deliverable; report_gap does
+    # not end the turn, but it does end the turn's evidence gathering
+    # (tool_budget.enforce_tool_budget refuses every evidence tool once it
+    # has been called - see tool_budget.py). All three gather no evidence
+    # themselves and must be exempt from the numeric tool budget and the
+    # redundancy metric (see src/tools/declare_plan.py, src/tools/canvas.py
+    # and src/tools/report_gap.py). All three exemptions key off tool name,
+    # so renaming any of them means changing tool_budget.OUTPUT_TOOLS and
+    # schema.OUTPUT_TOOLS too.
     tools=[
+        declare_plan,
         search_documents,
         get_financial_data,
         web_search_tool,
         news_agent_tool,
         create_canvas,
+        report_gap,
     ],
     generate_content_config=_GENERATE_CONTENT_CONFIG,
     # A hard per-turn ceiling on calls to each tool. The instruction above
@@ -287,13 +327,27 @@ research_agent = Agent(
     # measured up to 10 search_documents calls for one figure anyway - so the
     # bound lives in code, for the same reason max_output_tokens does
     # (ADR-0009). See tool_budget.py for the ceiling and the refusal wording.
+    # declare_plan (2026-08-06) is now gated here too - see tool_budget.py's
+    # docstring, "declare_plan as a third, independent gate".
     before_tool_callback=tool_budget.enforce_tool_budget,
-    after_tool_callback=_record_artefact,
-    # A cumulative token ceiling for the whole session, not just this turn.
-    # Wired on all three model-calling agents (here, critique_agent, and the
-    # web_search_agent sub-agent) because the counter is only a bound if
-    # nothing calls the model outside it - see token_budget.py.
-    before_model_callback=token_budget.enforce_session_token_budget,
+    after_tool_callback=_after_tool,
+    # A coarse, whole-turn wall-clock ceiling (agent_docs/TODOS.md) - fires at
+    # the start of every cycle, including a refinement cycle a critique pass
+    # earns, and refuses to start one once the turn's time is up. It cannot
+    # interrupt a cycle already running (see turn_deadline.py's module
+    # docstring for exactly what that does and does not cover), but it is the
+    # only bound in this project that reaches adk run/adk web as well as
+    # Streamlit, since all three share this module.
+    before_agent_callback=turn_deadline.enforce_turn_deadline,
+    # Two before-model callbacks, run in order (same list pattern and same
+    # reasoning as web_search.py's): the session ceiling first, so a spent
+    # session is refused without bothering to trim a request that will not be
+    # sent, then the history trim, which only research_agent needs (see
+    # history_trim.py for why critique_agent and web_search_agent do not).
+    before_model_callback=[
+        token_budget.enforce_session_token_budget,
+        history_trim.trim_history,
+    ],
     after_model_callback=token_budget.accumulate_token_usage,
     output_key="draft_answer",
 )
@@ -325,5 +379,11 @@ root_agent = LoopAgent(
     description="Runs the research agent, critiques its draft, and either ends the turn or feeds follow-up questions back for another research cycle.",
     sub_agents=[research_agent, critique_agent],
     max_iterations=config.MAX_CRITIQUE_ITERATIONS,
-    before_agent_callback=reset_turn_state,
+    # A list, not just reset_turn_state, as of the turn_deadline addition
+    # (agent_docs/TODOS.md) - ADK runs every callback in this list on the
+    # same before_agent_callback firing (once per turn, before the loop's
+    # first cycle - see reset_turn_state's own docstring for why that
+    # placement is what makes "once per turn" true), so stamping this turn's
+    # deadline rides the same hook rather than needing a second one.
+    before_agent_callback=[reset_turn_state, turn_deadline.stamp_turn_deadline],
 )

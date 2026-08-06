@@ -426,3 +426,47 @@ same questions. ADR-0015's conclusion continues to hold: a ceiling bounds the
 worst case and cannot produce efficiency. Decline remains the most serious open
 defect and the one with the clearest business consequence - answering from the
 wrong source is worse than saying nothing.
+
+## 2026-08-06 - the declared-plan sweep (288 runs, both arms)
+`data/processed/eval_runs/20260806T200001Z_live_reps4_budgets0-1.json`. 36 questions x 2 critique budgets x 4 reps, concurrency 3, live. 288 runs, 288 scored, 0 timed out, 0 rate limited, 0 errored.
+
+Four mechanisms landed between this sweep and the last one: `report_gap` and its rewritten decline assertion (ADR-0023), the `declare_plan` gate (ADR-0024), grounding-redirect resolution, and a critique rule that stops the critic chasing a fact the draft already declined.
+
+### Read the hard pass rate carefully, or not at all
+Hard pass is 78% at budget 0 and 75% at budget 1, against 84% recorded on 2026-08-03. That is not a regression and the two numbers are not comparable: the decline assertion was rewritten to be strictly stronger, a new question was added, and a new assertion (`critique_calibration`) was added that currently fails by construction.
+
+The comparison that means something is the old sweep rescored on tonight's instrument, so both columns are measured the same way:
+
+| assertion | 2026-08-03, rescored | 2026-08-06 |
+|---|---|---|
+| routing | 87% | **92%** |
+| decline | 0% | **68%** |
+| citation | 98% | 99% |
+| content | 89% | 91% |
+| redundancy | 69% | **61%** |
+| artefact | 100% | 100% |
+
+Decline's 0% in the left column is an artefact and should not be read as a 68-point gain: `report_gap` did not exist when those runs were recorded, so every one of them fails the first of the new check's three conditions automatically. The honest decline progression is the one measured on the same five questions under the same instrument: 45% before any behaviour change, 62% after the `declare_plan` gate, 68% here.
+
+### Routing is the best it has ever been, and the mechanism is identifiable
+92% is the highest routing figure this project has recorded, up from 87% on the same instrument and 91% on the looser one. `declare_plan` is the only change that could have moved it, and its effect is visible per question: `multi-kb-and-web` leaked to `news_agent` on 1 of 8 runs before and 0 of 8 now, and the decline questions stop reaching for the web once their declared source comes back empty. `fin-coverage-gap` went from 50% to 100% redundancy at 2.2 evidence calls down to 1.0 - it now consults the financial tool once, finds no coverage, and stops.
+
+### Redundancy regressed, and the cause is the new mechanism
+69% to 61%, and this is a real cost rather than a measurement artefact. Mean evidence calls per turn barely moved (2.59 to 2.77), so the regression is concentrated rather than general:
+
+| question | old | new | old calls | new calls |
+|---|---|---|---|---|
+| `kb-cur-definition` | 100% | 0% | 1.5 | 3.5 |
+| `canvas-not-requested` | 100% | 38% | 1.8 | 2.8 |
+| `multi-kb-and-web` | 50% | 12% | 3.8 | 5.1 |
+
+The obvious explanation is wrong and was checked rather than assumed. The theory was that `declare_plan` closes the sideways exit, so search pressure that used to leak out as a wrong-source call now stays on the right source as extra calls - the mirror image of what ADR-0015 saw when it moved from per-tool to per-turn budgets. `kb-cur-definition` refutes it: it routed to `knowledge_base` on 8 of 8 runs both before and after, so there was no routing failure to convert. It simply searches more, going from 1-2 calls to 3-5.
+
+The actual cause is decomposition. `declare_plan` asks the planner to enumerate the distinct facts a question needs, and a fact that has been written down as its own line invites its own search. A definitional question whose answer is "Capital Required divided by Capital Available" now declares two facts and searches for each, where before it asked once. The mechanism improved which source gets consulted and made the agent more granular about what it asks that source for.
+
+This is the agent being wasteful rather than the label being wrong: `kb-cur-definition` allows 2 calls for a single definition, and 3-5 is not defensible. The fix belongs in how coarsely the instruction asks for facts to be declared, not in raising the bound.
+
+### What has not moved
+`critique_calibration` fails 0 of 4, exactly as `loop-half-absent` predicted when it was added: the critic exits at cycle 1 because the draft explicitly declines the absent half, which the critic's own rules correctly treat as addressed. The assertion's premise - that a good critic keeps searching for an absent fact - is now in tension with the decided design, in which a correctly declined fact is answered rather than missing. The field needs redefining or retiring; it is not measuring what it was added to measure.
+
+Over-searching a correctly declared single source is untouched, as ADR-0024 said it would be. That remains ADR-0015's territory and ADR-0015's stated limit.

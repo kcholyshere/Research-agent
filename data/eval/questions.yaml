@@ -339,6 +339,8 @@ questions:
   - id: multi-web-and-financial
     question: What is the current price of Bitcoin, and what has the European Central Bank most recently said about regulating crypto assets?
     expected_routes: [financial, web]
+    acceptable_routes:
+      - [financial, news_agent]
     tags: [multi_source, volatile]
     max_tool_calls: 3
     volatile: true
@@ -348,6 +350,19 @@ questions:
       question does not drag search_documents in by reflex. It also splits the
       "financial-sounding" boundary down the middle: the price belongs to
       get_financial_data and the policy statement does not, in one question.
+
+      expected_routes predates the News Agent (phase 5). Since it landed, "what
+      has the ECB most recently said" reads as exactly the kind of query the
+      News Agent exists for, and the planner delegates to news_agent on 8 of 8
+      runs rather than calling web_search_agent - a strict [financial, web]
+      match then scores every run as a routing failure. Krzysztof's call:
+      news_agent is accepted as a second, equally valid way to serve the
+      policy half, not a replacement for web - the question's real assertion is
+      that the knowledge base stays out, and both web and news_agent
+      legitimately discharge the other half. Hard-coding
+      [financial, news_agent] instead would over-fit to today's behaviour and
+      break the day the planner picks web again, so acceptable_routes carries
+      the alternative rather than replacing expected_routes.
 
   - id: multi-all-three
     question: What was IFC's net income in FY24, what is the current EUR to USD exchange rate, and who is the current President of the World Bank Group?
@@ -465,6 +480,56 @@ questions:
       check_wasted_cycle's 0.95 similarity threshold is actually at risk of
       missing. Fully answerable in one cycle, so cycle count should match across
       the budget 0 and budget 1 arms.
+
+  - id: loop-half-absent
+    question: What was IFC's net income in FY24, and what was its net profit margin on its Africa portfolio in FY24?
+    expected_routes: [knowledge_base]
+    tags: [kb, multi_part, critique_loop, unanswerable]
+    max_tool_calls: 4
+    must_contain: ["1,485"]
+    notes: >-
+      Built for the open TODO on critique calibration, not on routing: every
+      other critique_loop question is fully answerable, so 28 of 28 budget-1
+      runs critiquing and exiting at cycles=1 cannot separate "the critic
+      correctly saw nothing was missing" from "the critic exits reflexively" -
+      a reflexive critic scores identically to a perfect one when nothing is
+      ever actually missing. This question is deliberately asymmetric: net
+      income is trivially in the corpus (same figure as kb-net-income and
+      loop-multipart), and the Africa portfolio margin is decline-segment-
+      margin's fact, absent by construction - IFC reports the portfolio by
+      region and reports income in aggregate, but never derives a per-region
+      margin, and no public source does either. Re-verified directly against
+      the rebuilt index rather than trusted from that question's label
+      (data/eval/questions.yaml's own decline-auditor-fee shows a previously
+      "absent" label turning out to be wrong): four direct queries ("Africa
+      portfolio net profit margin", "net profit margin by region segment",
+      "return on Africa investments profitability", "IFC total commitments
+      FY24 own account") surfaced only portfolio-by-region tables and NOTE
+      S's aggregate segment income, never a per-region margin.
+
+      expects_second_cycle was set here and has been REMOVED, which is worth
+      recording rather than quietly deleting. It asserted the discriminator
+      directly: a correct critic should see the margin as a distinct,
+      unaddressed sub-question and not exit on cycle 1. That premise was
+      overtaken the same day by ADR-0023/0024. A fact the draft explicitly
+      declines, naming and citing the source it checked, is answered - the
+      source's not having it IS the answer - and critique.py now says so in
+      its own grounds-to-continue list. So a correct critic MUST exit here,
+      and the label asserted the opposite: it failed 0 of 4 in the 2026-08-06
+      sweep and would have failed every future sweep too, dragging hard pass
+      down for asserting behaviour the design deliberately rejects. That is
+      the same defect class as the decline word count it replaced, so it goes
+      the same way. The field survives in schema.py with its check, for a
+      question that genuinely needs a second cycle; this is not that question.
+      What this question still measures is whether the answerable half
+      survives alongside a declined half - see must_contain. Deliberately not expects_decline: check_decline assumes the
+      whole answer is a decline and scores word-count padding against that,
+      but this answer is half a real figure and half a decline, which is a
+      shape that check was never written for - must_contain on the answerable
+      half is the content assertion that fits instead. max_tool_calls is 4,
+      not the single-fact norm of 2, because an honest cycle 1 may spend a KB
+      search on each half plus one reformulation, and a genuine cycle 2 adds
+      at least one more call on top of that.
 
   # --- Phase 5 forward compatibility --------------------------------------
   # Delegation cases, present from the outset as the plan requires so that

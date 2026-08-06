@@ -9,13 +9,14 @@ poor test-retest reliability the brainstorm explicitly rejected, for
 assertions that do not need one.
 
 Layout: one `check_*` function per assertion in the brief (routing,
-redundancy, citation, decline, content, wasted_cycle) plus `artefact`, added
-for phase 6's Canvas tool on the same terms, each returning an
-`AssertionResult` or `None` when the assertion does not apply to this
-question (e.g. a content check on a question with no must_contain/
-must_not_contain). `evaluate_run` runs all of them for one (question, run)
-pair and cross-references `question.known_defects`; `summarise` rolls a
-whole `EvalRun`'s records up per arm.
+redundancy, citation, decline, content, wasted_cycle), plus `artefact` (added
+for phase 6's Canvas tool) and `critique_calibration` (added to close the open
+TODO on `EvalQuestion.expects_second_cycle` - see schema.py) on the same
+terms - each returning an `AssertionResult` or `None` when the assertion does
+not apply to this question (e.g. a content check on a question with no
+must_contain/must_not_contain). `evaluate_run` runs all of them for one
+(question, run) pair and cross-references `question.known_defects`;
+`summarise` rolls a whole `EvalRun`'s records up per arm.
 """
 
 from __future__ import annotations
@@ -35,7 +36,16 @@ from src.evaluation.schema import NON_EVIDENCE_TOOLS, EvalQuestion, RunRecord
 #"don't let a naming mismatch masquerade as a real result" concern schema.py
 # already flags for TOOL_TO_ROUTE.
 ASSERTION_KEYS = frozenset(
-    {"routing", "redundancy", "citation", "decline", "content", "wasted_cycle", "artefact"}
+    {
+        "routing",
+        "redundancy",
+        "citation",
+        "decline",
+        "content",
+        "wasted_cycle",
+        "artefact",
+        "critique_calibration",
+    }
 )
 
 # 2026-07-28 measured baseline: 15s for single-cycle, single-tool turns only
@@ -112,6 +122,24 @@ _BRACKETED_DOC_RE = re.compile(
 # agent to name the source it checked, and naming a source pulls the verb
 # towards "report"/"disclose"/"publish" rather than the source-less "not
 # available" this list was originally built from.
+#
+# A third gap, measured on `check_decline`'s own first live run after it
+# became a report_gap-gated check (2026-08-06): decline-not-listed's answers
+# ("IFC is not a publicly traded company and does not have a stock ticker
+# symbol") matched nothing here, on the same category error twice over. "does
+# not have" is the same do/does-not-VERB shape every entry above already
+# covers, just missing "have" from the verb list - added there rather than as
+# a standalone phrase, for the same reason "have" belongs next to "report",
+# "disclose" and "publish": it is a verb this shape can take, not a fact
+# specific to stock listings. "is not publicly"/"are not publicly" had
+# already anticipated the listing case, but as a fixed "is"/"are" prefix that
+# "is not A publicly traded company" narrowly misses on the inserted
+# article - generalised to bare "not publicly" so the subject and any
+# determiner between "not" and "publicly" no longer matter. Both changes
+# widen an existing shape rather than add a phrase tuned to this one
+# question's exact wording, which is the failure mode this list keeps
+# re-learning: a fixed phrase list needs a strong verb tier, not a strong
+# memory for wordings already seen.
 _DECLINE_PHRASES = (
     "does not contain",
     "do not contain",
@@ -141,49 +169,32 @@ _DECLINE_PHRASES = (
     "does not cover",
     "does not break down",
     "do not break down",
-    "is not publicly",
-    "are not publicly",
+    "does not have",
+    "do not have",
+    "not publicly",
 )
 
-# Padding threshold for the decline check. decline-headcount-by-country's
-# known defect (questions.yaml) is specifically "declines correctly but pads
-# with tangentially related results rather than stopping" - a clean decline
-# in this agent's own traces runs to a sentence or two, so a generous word
-# count catches "kept going" without trying to judge prose quality.
+# A padding threshold used to sit here: decline-headcount-by-country's known
+# defect (questions.yaml) is "declines correctly but pads with tangentially
+# related results rather than stopping", and the original check flagged it by
+# counting non-URL words in the answer, raised from 80 to 200 on 2026-08-03
+# after reading 19 padded failures showed the synthesize instruction's new
+# requirement to name and cite the source it checked had made a correct
+# decline structurally longer - the target moved, the check did not, and by
+# 200 words length had largely stopped separating a padded decline from a
+# thorough one (some of the best answers in the set ran 189-197 words).
 #
-# Raised from 80 to 200 on 2026-08-03, from reading all 19 padded failures in
-# the 2026-08-03 sweep rather than from taste. 80 was calibrated when a clean
-# decline "runs to a sentence or two". The synthesize instruction has since
-# been changed to REQUIRE a decline to name and cite the source it checked,
-# which makes a correct decline structurally longer - so the target moved and
-# the check did not, the same way _DECLINE_PHRASES and the citation marker test
-# both did before it. Every one of the 92-197 word answers reads as a model
-# decline: it leads with "not reported", names the source, cites pages, then
-# says what IS reported instead. The 189-197 word ones are among the best
-# answers the agent produces anywhere in the set.
-#
-# Honest limitation, recorded rather than hidden: length has largely stopped
-# separating a padded decline from a thorough one, so 200 buys a trustworthy
-# baseline for this sweep and not much more. The real fix is to stop inferring
-# the behaviour from prose shape - a `report_gap(fact, source_checked)` tool
-# makes declining a first-class action and the assertion deterministic
-# ("did it call the tool"), the same move `exit_loop` made for loop
-# termination. Deferred, see references/evaluation_improvements.md.
-_DECLINE_PADDING_WORD_LIMIT = 200
-
-# URLs are stripped before the decline word count. Measured cause, not
-# tidiness: web answers carry raw Vertex grounding-redirect URLs
-# (vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQ...), each of
-# which is a single ~200-character "word". The 297-word decline-not-listed
-# answer is roughly half URL by word count, so it scored as the worst padding
-# case in the sweep on the strength of its citations. Counting an opaque
-# redirect token as padding prose measures the citation style, not the defect.
-_URL_WORD_RE = re.compile(r"\S*https?://\S+")
-
-
-def _prose_word_count(text: str) -> int:
-    """Words in `text`, excluding URLs and the link targets around them."""
-    return len(_URL_WORD_RE.sub(" ", text).split())
+# Replaced below by `report_gap` (src/tools/report_gap.py): declining is now
+# a tool call the event stream either contains or does not, the same move
+# `exit_loop` made for loop termination, rather than something inferred from
+# how long the resulting prose happened to run. See `check_decline`'s own
+# docstring for what replaced the word count and, explicitly, what that
+# trade gave up: a decline that pads with tangential content pulled from the
+# SAME authorised source (no extra tool call, so nothing here would see it)
+# now passes, where the word count would have failed it. A decline padded
+# with results from an UNAUTHORISED source - the shape decline-headcount-by-
+# country's own known defect actually takes - is still caught, by the
+# routing half of the new check instead.
 
 # Block-level and styling tags an agent emits when it authors a document, kept
 # deliberately narrow. Inline emphasis (<b>, <strong>, <em>) is excluded: those
@@ -269,27 +280,36 @@ class QuestionResult:
 
 
 def check_routing(question: EvalQuestion, record: RunRecord) -> AssertionResult:
-    """Did the run consult exactly `expected_routes`?
+    """Did the run consult exactly `expected_routes`, or one full alternative?
 
     Missing and unexpected are reported separately (not just "routing
     failed") because they are different defects: missing is under-research,
     unexpected is the redundancy-adjacent failure the web-question set exists
     to catch (a search_documents call on a question that sounds like it
     belongs to the corpus but does not).
+
+    `acceptable_routes` (empty for almost every question) lists whole
+    alternative route sets that are equally correct - not routes swapped in
+    individually, but complete substitutes for `expected_routes`. A pass
+    requires an exact match against `expected_routes` or exactly one of
+    those alternatives; there is no partial credit for mixing routes across
+    sets. When it fails, the detail is reported against whichever candidate
+    set is closest (fewest routes different), since that is the most useful
+    diagnostic even though it played no part in the pass/fail decision.
     """
-    expected = set(question.expected_routes)
     used = set(record.routes_used)
-    missing = expected - used
-    unexpected = used - expected
-    passed = not missing and not unexpected
+    candidates = [set(question.expected_routes), *(set(alt) for alt in question.acceptable_routes)]
+    if used in candidates:
+        return AssertionResult(key="routing", passed=True, detail="routes matched exactly")
+    closest = min(candidates, key=lambda c: len(used ^ c))
+    missing = closest - used
+    unexpected = used - closest
     parts = []
     if missing:
         parts.append(f"missing={sorted(r.value for r in missing)}")
     if unexpected:
         parts.append(f"unexpected={sorted(r.value for r in unexpected)}")
-    return AssertionResult(
-        key="routing", passed=passed, detail="; ".join(parts) or "routes matched exactly"
-    )
+    return AssertionResult(key="routing", passed=False, detail="; ".join(parts))
 
 
 def check_redundancy(question: EvalQuestion, record: RunRecord) -> AssertionResult:
@@ -357,29 +377,80 @@ def check_citation(question: EvalQuestion, record: RunRecord) -> AssertionResult
 
 
 def check_decline(question: EvalQuestion, record: RunRecord) -> AssertionResult | None:
+    """Did the run decline as a first-class action, without substituting a figure from elsewhere?
+
+    Three independent halves, all required to pass, reported separately in
+    `detail` because they are different defects with different fixes - the
+    same reasoning check_routing and check_artefact already apply to their
+    own multi-part checks.
+
+    - report_gap called: the model exercised the terminal action added for
+      exactly this case (src/tools/report_gap.py) instead of only writing a
+      decline in prose and hoping the pattern holds at scale. This is what
+      replaces the word-count padding threshold this check used to run (see
+      the comment block above `_DECLINE_PHRASES`) - a tool call is not
+      inferred from prose shape at all, it is either in the event stream or
+      it is not, the same move `exit_loop` made for loop termination.
+    - decline phrasing present in the answer: kept from the check this
+      replaces, and still doing real work on its own - report_gap being
+      called says the model noticed the gap, not that it then told the
+      reader. A run that calls report_gap and then answers confidently from
+      its own memory anyway (the exact substitution decline-future-figure's
+      must_not_contain guards against) would pass the tool-call half alone;
+      requiring decline language in the answer too keeps that failure
+      visible without needing a per-question content guard.
+    - no unauthorised route consulted: the sharp case this half exists for is
+      fin-coverage-gap, whose `expected_routes` is `[financial]` with web
+      deliberately excluded - a run that calls report_gap, writes a clean
+      decline, and ALSO went to the web for a substitute figure must still
+      fail here. Without this half a bare "was report_gap called" check is
+      strictly weaker than the check it replaces, which at least scored the
+      whole answer's length; a long fallback answer padded with a web
+      substitute would still have failed the old word count. Compared
+      against `expected_routes` only, not `acceptable_routes`, because none
+      of the five decline/coverage-gap questions define any.
+
+    What this gives up, stated rather than hidden: a decline that pads with
+    tangential content pulled from the SAME authorised source - no extra
+    tool call, so nothing here sees it - now passes, where the word count
+    would have failed it. decline-headcount-by-country's own known defect is
+    padding with "tangentially related WEB results", which is the
+    unauthorised-route shape and is still caught; a same-source padding
+    defect would not be, and there is no known defect of that shape in the
+    question set today to say whether it occurs in practice.
+    """
     if not question.expects_decline:
         return None
+
     answer_lower = record.answer.lower()
-    declined = any(phrase in answer_lower for phrase in _DECLINE_PHRASES)
-    if not declined:
-        return AssertionResult(
-            key="decline",
-            passed=False,
-            detail="no decline phrasing found - the agent may have fabricated an answer instead of declining",
-        )
-    word_count = _prose_word_count(record.answer)
-    padded = word_count > _DECLINE_PADDING_WORD_LIMIT
-    passed = not padded
-    return AssertionResult(
-        key="decline",
-        passed=passed,
-        detail=(
-            f"declined plainly, {word_count} words (padding threshold {_DECLINE_PADDING_WORD_LIMIT})"
-            if passed
-            else f"declined but padded the answer to {word_count} words "
-            f"(over the {_DECLINE_PADDING_WORD_LIMIT}-word threshold) with tangential content"
-        ),
+    has_decline_phrase = any(phrase in answer_lower for phrase in _DECLINE_PHRASES)
+    gap_reported = any(
+        name == "report_gap" for cycle in record.cycles for name in cycle.tools_called
     )
+    unauthorised_routes = sorted(
+        r.value for r in (set(record.routes_used) - set(question.expected_routes))
+    )
+
+    problems: list[str] = []
+    if not gap_reported:
+        problems.append("report_gap was not called")
+    if not has_decline_phrase:
+        problems.append("no decline phrasing found in the answer")
+    if unauthorised_routes:
+        expected = sorted(r.value for r in question.expected_routes)
+        problems.append(
+            f"consulted {unauthorised_routes} outside expected_routes {expected} - a gap "
+            "report does not excuse substituting a figure from a non-authoritative source"
+        )
+
+    passed = not problems
+    detail = (
+        "reported the gap via report_gap, declined in prose, and consulted no "
+        "unauthorised source"
+        if passed
+        else "; ".join(problems)
+    )
+    return AssertionResult(key="decline", passed=passed, detail=detail)
 
 
 def check_content(question: EvalQuestion, record: RunRecord) -> AssertionResult | None:
@@ -543,6 +614,45 @@ def check_wasted_cycle(record: RunRecord) -> AssertionResult | None:
     return AssertionResult(key="wasted_cycle", passed=passed, detail=detail)
 
 
+def check_critique_calibration(question: EvalQuestion, record: RunRecord) -> AssertionResult | None:
+    """Did a genuinely unaddressed sub-question make the critique continue past cycle 1?
+
+    Implements the check `EvalQuestion.expects_second_cycle`'s docstring
+    names (schema.py): `record.cycle_count >= 2 if question.expects_second_cycle
+    else True`. Built for `loop-half-absent` (questions.yaml), whose whole
+    point is that every OTHER critique_loop question is fully answerable in
+    one cycle - so a critique that exits reflexively on cycle 1 scores
+    identically to one that correctly judged nothing was missing, on every
+    question except this one.
+
+    Skipped (returns None, not a failure) whenever no real critique judgement
+    happened in this record at all - a spent `critique_budget` short-circuits
+    `critique_agent`'s own LLM call before it can decide anything
+    (critique.py's `_skip_critique_llm_call`), and scoring cycle_count against
+    a record whose loop could never have continued regardless of what the
+    critique concluded would penalise the harness's arm choice, not a
+    miscalibrated critique. Detected from `CycleRecord.critique_outcome`
+    ("skipped" on every cycle) rather than by parsing `record.arm` for a
+    budget number: that covers both ways a critique call can fail to happen -
+    a spent budget (the "budget 0" case this field's docstring names) and the
+    financial-only shortcut in the same callback - without coupling this
+    check to run_eval.py's "budget{N}" arm-naming convention, which nothing
+    else in this module depends on.
+    """
+    if not question.expects_second_cycle:
+        return None
+    if not record.cycles or all(c.critique_outcome == "skipped" for c in record.cycles):
+        return None
+    passed = record.cycle_count >= 2
+    detail = (
+        f"continued past cycle 1 ({record.cycle_count} cycles), as this question expects"
+        if passed
+        else "critique exited after cycle 1 despite a genuinely unaddressed sub-question "
+        "this question expects it to catch - reflexive termination, not calibrated judgement"
+    )
+    return AssertionResult(key="critique_calibration", passed=passed, detail=detail)
+
+
 def evaluate_run(question: EvalQuestion, record: RunRecord) -> QuestionResult:
     """Run every applicable check for one (question, run) pair.
 
@@ -560,6 +670,7 @@ def evaluate_run(question: EvalQuestion, record: RunRecord) -> QuestionResult:
         check_content(question, record),
         check_artefact(question, record),
         check_wasted_cycle(record),
+        check_critique_calibration(question, record),
     )
     for res in checks:
         if res is None:
