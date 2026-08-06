@@ -118,7 +118,12 @@ CONTROL_TOOLS: frozenset[str] = frozenset({"exit_loop"})
 # without importing the agent (and therefore without triggering Langfuse
 # instrumentation and a Vertex client) - but they are one concept, and a change
 # to either is a change to both.
-OUTPUT_TOOLS: frozenset[str] = frozenset({"create_canvas", "report_gap"})
+# declare_plan is exempt on the same reasoning again, and the most clearly so
+# of the three: it states which source is authoritative for each fact before
+# any searching happens, so it is the opposite of a retrieval call. Counting
+# it would put every well-behaved turn exactly one call over its own bound,
+# and it would do so most reliably on the turns that followed the instruction.
+OUTPUT_TOOLS: frozenset[str] = frozenset({"create_canvas", "report_gap", "declare_plan"})
 
 # Everything that is not evidence-gathering. `tools_called` filters on this.
 NON_EVIDENCE_TOOLS: frozenset[str] = CONTROL_TOOLS | OUTPUT_TOOLS

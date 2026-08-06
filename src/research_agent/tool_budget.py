@@ -88,6 +88,36 @@ because a multi-part question can legitimately report more than one gap, and
 to render the sections it did answer. Both are already exempt from the
 numeric ceiling for the same reason (see OUTPUT_TOOLS below); this gate does
 not touch that exemption, it only ever refuses evidence tools.
+
+## declare_plan as a third, independent gate (2026-08-06)
+
+The two gates above bound HOW MUCH a turn searches and WHEN it must stop.
+Neither bounds WHICH tool it is allowed to search with, and that turned out
+to be the actual shape of the decline defect: across the 32 turns in the
+2026-08-06 baseline that called `report_gap`, an evidence tool that was never
+authoritative for the fact ran BEFORE `report_gap` in 32 of 32 - the agent
+consults a source that was never right for the question, and only then
+reports that the right one is empty. Neither the numeric ceiling nor the
+report_gap gate can see this, because the turn was never over budget and
+report_gap was never called too late - the tool call itself was simply never
+supposed to happen.
+
+`src/tools/declare_plan.py` lets the model commit, once per turn (or amended,
+see below), to which tool is authoritative for which fact. Once a plan has
+been declared, `enforce_tool_budget` refuses any evidence tool whose name was
+not named as a source anywhere in that plan - see `_plan_refusal` and
+`declare_plan.py`'s module docstring for the full reasoning, including why an
+undeclared source is refused rather than merely discouraged, why the model
+may amend the plan before a declared source has actually been called but not
+after, and why `sources` values must be the tool's runtime `tool.name`
+(`web_search_agent`) rather than the name it goes by in the INSTRUCTION prose
+(`web_search_tool`).
+
+This gate fails open: a turn that never calls `declare_plan` is checked
+against no plan at all, and every evidence tool behaves exactly as it did
+before this gate existed. That is deliberate (see `declare_plan.py`) and its
+cost is real - skipping the declaration is a complete escape from the gate -
+so declaration uptake has to be read off every sweep, not assumed.
 """
 
 from __future__ import annotations
@@ -153,7 +183,14 @@ MAX_TOOL_CALLS_PER_TURN = 5
 # matching on the name is what `src/evaluation/schema.py` already does for
 # CONTROL_TOOLS and OUTPUT_TOOLS. The two lists must agree - if a further
 # evidence tool or non-evidence tool is added, both change together.
-OUTPUT_TOOLS: frozenset[str] = frozenset({"create_canvas", "report_gap"})
+#
+# declare_plan added 2026-08-06: it gathers nothing either, for the same
+# reason create_canvas and report_gap don't count against the ceiling - see
+# this module's docstring, "declare_plan as a third, independent gate". NOTE:
+# schema.py's own OUTPUT_TOOLS is owned by the evaluation code, not this
+# change, and has not been updated here - it needs "declare_plan" added to it
+# too, or check_redundancy will fail every question that declares a plan.
+OUTPUT_TOOLS: frozenset[str] = frozenset({"create_canvas", "report_gap", "declare_plan"})
 
 # Session-state key holding {tool_name: calls_so_far} for the current turn.
 # Reset by critique.reset_turn_state, which is the LoopAgent's own
@@ -171,6 +208,18 @@ STATE_KEY = "tool_calls_this_turn"
 # against a different question entirely.
 STATE_KEY_GAP_REPORTED = "report_gap_called_this_turn"
 
+# Session-state key holding the current turn's declared plan, as a sorted
+# list of the distinct tool names named anywhere in the plan's `sources` (see
+# src/tools/declare_plan.py). Written by record_declared_plan below, once
+# declare_plan itself has validated the call and returned "status": "ok" -
+# not written here directly, because a before_tool_callback runs before the
+# real tool executes and cannot yet know whether that call was even valid.
+# Absent or empty means no plan was declared this turn, which is what makes
+# the gate fail open (see this module's docstring). Same turn-scoping
+# requirement as STATE_KEY and STATE_KEY_GAP_REPORTED, reset alongside them
+# in critique.reset_turn_state.
+STATE_KEY_DECLARED_SOURCES = "declared_plan_sources_this_turn"
+
 
 def _gap_refusal() -> dict[str, Any]:
     return {
@@ -185,6 +234,39 @@ def _gap_refusal() -> dict[str, Any]:
             "the question, answer from what you already have. If this question asked for "
             "a report, document or code file, you may still call create_canvas to produce "
             "it - that formats what you have and gathers nothing new."
+        ),
+    }
+
+
+def _amendment_refusal(locked: list[str]) -> dict[str, Any]:
+    locked_text = ", ".join(locked)
+    return {
+        "status": "error",
+        "detail": (
+            f"This plan was not recorded: {locked_text} {'was' if len(locked) == 1 else 'were'} "
+            "declared as a source and has already been called this turn, and an amendment "
+            "cannot drop a source once it has actually run. Declaring the wrong source before "
+            f"calling it is a mis-plan and can be corrected; {locked_text} coming back without "
+            "the fact is a gap, not a mis-plan - call report_gap for it instead of re-declaring "
+            f"away from it. Keep {locked_text} in `sources` and call declare_plan again, or "
+            "call report_gap now."
+        ),
+    }
+
+
+def _plan_refusal(tool_name: str, declared: list[str]) -> dict[str, Any]:
+    declared_text = ", ".join(declared)
+    return {
+        "error": "tool_not_in_declared_plan",
+        "detail": (
+            f"{tool_name} was not declared as a source in your plan (declare_plan), so this "
+            f"call is refused. The source(s) your plan declared are: {declared_text} - call "
+            "one of those for the outstanding work instead. If the declared source has "
+            "already been called and did not contain the fact, that is the gap: call "
+            "report_gap with the fact and that source, then write the prose decline - do not "
+            "substitute an undeclared source instead. If your plan genuinely named the wrong "
+            "source for this fact and you have not yet called it, call declare_plan again to "
+            "amend the plan before trying this tool."
         ),
     }
 
@@ -226,6 +308,15 @@ def enforce_tool_budget(
     check runs before the numeric one so a turn that reported a gap early
     cannot spend the rest of its five-call ceiling on an unauthorised source.
 
+    declare_plan sets a third, independent gate (see this module's docstring,
+    "declare_plan as a third, independent gate"): once a plan has been
+    declared, an evidence tool whose name is not in it is refused, also
+    independent of the numeric ceiling. declare_plan's own call is
+    intercepted here too, before the real tool runs, to enforce that an
+    amendment cannot drop a source that has already been called this turn
+    (see _amendment_refusal) - the real tool has no session state to check
+    that against, so this callback is the only place that check can happen.
+
     The per-tool breakdown is still recorded, because it is the useful thing
     to see in a trace and in the refusal text - but it is the TOTAL that is
     compared against the ceiling. That distinction is the whole fix: counting
@@ -237,6 +328,26 @@ def enforce_tool_budget(
     mutating the nested dict returned by `state.get(...)` would not always be
     recorded as a change.
     """
+    # declare_plan is intercepted before it runs, not because it needs a
+    # ceiling exemption (OUTPUT_TOOLS already covers that below) but because
+    # only this callback can see which of its previously-declared sources
+    # have already been called this turn - the real tool function takes no
+    # ToolContext (see declare_plan.py) and cannot check that itself. A
+    # rejected amendment short-circuits here; the real tool never runs, and
+    # record_declared_plan (called from agent.py's after_tool_callback) never
+    # sees this attempt because there is no tool_response for it.
+    if tool.name == "declare_plan":
+        prior = tool_context.state.get(STATE_KEY_DECLARED_SOURCES) or []
+        if prior:
+            counts = tool_context.state.get(STATE_KEY) or {}
+            already_called = {name for name in prior if counts.get(name, 0) > 0}
+            new_sources = args.get("sources")
+            if isinstance(new_sources, list):
+                dropped = sorted(already_called - set(new_sources))
+                if dropped:
+                    return _amendment_refusal(dropped)
+        return None
+
     # report_gap sets the second gate and is otherwise unbounded (a
     # multi-part question can legitimately report more than one gap) - so
     # this branch returns before either exemption or ceiling logic runs.
@@ -244,10 +355,13 @@ def enforce_tool_budget(
         tool_context.state[STATE_KEY_GAP_REPORTED] = True
         return None
 
-    # Output tools (create_canvas) bypass the ceiling entirely - not counted,
-    # never refused. Checked before the counter is even read, so a spent
-    # budget cannot block the artefact that the turn was asked for (see
-    # OUTPUT_TOOLS above).
+    # Output tools (create_canvas, declare_plan) bypass the ceiling entirely -
+    # not counted, never refused. declare_plan already returned above, so
+    # this only ever matches create_canvas in practice; it stays in
+    # OUTPUT_TOOLS anyway so schema.py and this module keep agreeing on what
+    # counts as non-evidence (see OUTPUT_TOOLS above). Checked before the
+    # counter is even read, so a spent budget cannot block the artefact that
+    # the turn was asked for.
     if tool.name in OUTPUT_TOOLS:
         return None
 
@@ -258,6 +372,15 @@ def enforce_tool_budget(
     if tool_context.state.get(STATE_KEY_GAP_REPORTED):
         return _gap_refusal()
 
+    # The declared-plan gate: refuses an evidence tool that no declared fact
+    # named as its source. Fails open when declared is empty (no plan was
+    # ever recorded this turn) - see this module's docstring, "declare_plan
+    # as a third, independent gate", and declare_plan.py for why that is a
+    # deliberate property rather than an oversight.
+    declared = tool_context.state.get(STATE_KEY_DECLARED_SOURCES) or []
+    if declared and tool.name not in declared:
+        return _plan_refusal(tool.name, declared)
+
     counts = dict(tool_context.state.get(STATE_KEY) or {})
     used = sum(counts.values())
     if used >= MAX_TOOL_CALLS_PER_TURN:
@@ -265,3 +388,30 @@ def enforce_tool_budget(
     counts[tool.name] = counts.get(tool.name, 0) + 1
     tool_context.state[STATE_KEY] = counts
     return None
+
+
+def record_declared_plan(tool_context: ToolContext, tool_response: dict[str, Any]) -> None:
+    """Persist a successfully-validated declare_plan call into this turn's gating state.
+
+    Called from research_agent's after_tool_callback (see agent.py) once
+    declare_plan itself has returned - never from the before_tool_callback
+    above, because at that point the real tool has not run yet and may still
+    reject the call (mismatched list lengths, an unknown source name; see
+    declare_plan.py). Only a "status": "ok" response updates the declared
+    plan, so an invalid declare_plan call leaves the previous plan (or no
+    plan) in force rather than clobbering it with something that failed
+    validation.
+
+    Deliberately replaces STATE_KEY_DECLARED_SOURCES with the union of
+    sources from THIS call, not the union with the previous plan: a later
+    declare_plan call is read as the model's corrected, complete plan, not an
+    addition to the old one. The lock in enforce_tool_budget's before_tool_callback
+    is what stops that replacement being used to drop an already-called
+    source - by the time this runs, that check has already passed.
+    """
+    if not isinstance(tool_response, dict) or tool_response.get("status") != "ok":
+        return
+    sources = tool_response.get("sources")
+    if not isinstance(sources, list):
+        return
+    tool_context.state[STATE_KEY_DECLARED_SOURCES] = sorted({s for s in sources if isinstance(s, str)})

@@ -155,6 +155,17 @@ def reset_turn_state(callback_context: CallbackContext) -> None:
     # left set from a prior turn's gap it would refuse that new turn's first
     # evidence call for a question it never reported anything against.
     state[tool_budget.STATE_KEY_GAP_REPORTED] = False
+    # Same turn-scoping requirement again, for declare_plan's gate
+    # (tool_budget.py, "declare_plan as a third, independent gate"). This is
+    # exactly the class of bug ADR-0021's fourth supporting decision names: a
+    # key that must be turn-scoped and is put on the wrong hook fails
+    # silently, with no error and no warning. Left set from a prior turn's
+    # plan, this would refuse a brand-new turn's very first evidence call
+    # against a plan declared for a different question entirely - the same
+    # failure shape STATE_KEY_GAP_REPORTED's comment above describes, and the
+    # reason this line lives on the same hook as that one rather than on
+    # something that only fires once per session.
+    state[tool_budget.STATE_KEY_DECLARED_SOURCES] = []
     # Deliberately NOT reset here: token_budget.STATE_KEY. It is the one
     # counter in this system that is session-scoped rather than turn-scoped,
     # and clearing it on this hook - the hook that exists to make things

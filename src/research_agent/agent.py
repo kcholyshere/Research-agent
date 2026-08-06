@@ -52,6 +52,7 @@ from google.genai import types
 
 from src.services import genai_client
 from src.tools.canvas import create_canvas
+from src.tools.declare_plan import declare_plan
 from src.tools.document_search import search_documents
 from src.tools.financial_data import get_financial_data
 from src.tools.news_agent import news_agent_tool
@@ -64,40 +65,52 @@ from src.research_agent import token_budget, tool_budget
 from src.research_agent.critique import LAST_ARTEFACT_KEY, critique_agent, reset_turn_state
 
 
-def _record_artefact(
+def _after_tool(
     tool: BaseTool,
     args: dict[str, Any],
     tool_context: ToolContext,
     tool_response: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Put a rendered artefact into session state for the critique to review.
+    """Dispatch on tool name to the two callbacks that need to see a tool's own response.
 
     Signature verified against the installed google-adk 2.5.0 rather than taken
     from docs, per CLAUDE.md: `AfterToolCallback` is
     `Callable[[BaseTool, dict[str, Any], ToolContext, dict], Optional[dict]]`,
     and the flow invokes it by KEYWORD - `tool=`, `args=`, `tool_context=`,
     `tool_response=` - so these four parameter names are load-bearing and
-    renaming any of them breaks the call rather than being cosmetic.
+    renaming any of them breaks the call rather than being cosmetic. ADK
+    wires exactly one after_tool_callback per agent, so both jobs below live
+    in this single dispatcher rather than as two separately-registered
+    callbacks.
 
-    Wired as research_agent's after_tool_callback. Without it the critique
-    reviews `draft_answer`, which on an artefact turn is a short covering note
-    by design (see step 4 of INSTRUCTION) - it would find no substance in the
-    note, conclude the question was barely answered, and raise follow-ups on
-    every single artefact turn. That is a refinement cycle spent re-researching
-    a document that was already complete, on the most expensive turns in the
-    system and the ones most likely to be demonstrated.
+    create_canvas: puts a rendered artefact into session state for the
+    critique to review. Without it the critique reviews `draft_answer`, which
+    on an artefact turn is a short covering note by design (see step 4 of
+    INSTRUCTION) - it would find no substance in the note, conclude the
+    question was barely answered, and raise follow-ups on every single
+    artefact turn. That is a refinement cycle spent re-researching a document
+    that was already complete, on the most expensive turns in the system and
+    the ones most likely to be demonstrated. Only successful renders are
+    recorded - an error return is not an artefact, and showing the critique a
+    failed one would have it review a document that does not exist.
 
-    Only successful renders are recorded. An error return is not an artefact,
-    and showing the critique a failed one would have it review a document that
-    does not exist.
+    declare_plan: hands a successfully-validated plan to
+    tool_budget.record_declared_plan, which is what makes the rest of the
+    turn's evidence calls checkable against it (see tool_budget.py's
+    docstring, "declare_plan as a third, independent gate"). Recording only
+    happens here, after the real tool has run and validated its own input,
+    not in the before_tool_callback - a plan that failed validation
+    (mismatched list lengths, an unknown source name) must not overwrite
+    whatever plan was already in force.
 
-    Returns None so ADK keeps the real tool response - returning a value here
-    would replace what the model sees.
+    Returns None in both cases so ADK keeps the real tool response -
+    returning a value here would replace what the model sees.
     """
-    if tool.name != "create_canvas":
-        return None
-    if isinstance(tool_response, dict) and tool_response.get("status") == "ok":
-        tool_context.state[LAST_ARTEFACT_KEY] = tool_response.get("artefact", "")
+    if tool.name == "create_canvas":
+        if isinstance(tool_response, dict) and tool_response.get("status") == "ok":
+            tool_context.state[LAST_ARTEFACT_KEY] = tool_response.get("artefact", "")
+    elif tool.name == "declare_plan":
+        tool_budget.record_declared_plan(tool_context, tool_response)
     return None
 
 INSTRUCTION = """You are a research agent with four sources of evidence: a
@@ -133,7 +146,13 @@ For every question, follow a plan-execute-synthesize flow:
    up". Only plan to
    use multiple sources for a fact if the question genuinely requires
    combining evidence across them - not as a routine double-check of a
-   source that already answers the fact on its own. State the plan briefly.
+   source that already answers the fact on its own. State the plan by
+   calling declare_plan once, with every fact and its declared source as
+   parallel lists - see its docstring for the exact source names to use.
+   Only a tool declare_plan named will be callable for the rest of this
+   turn; if a fact turns out to need a different source than you first
+   declared, call declare_plan again to amend the plan before you try that
+   source, not after.
 
    report_gap is the LAST evidence-gathering action of a turn: once you call
    it, no further evidence tool can be called for the rest of this question,
@@ -281,17 +300,20 @@ research_agent = Agent(
     model=config.GEMINI_MODEL,
     description="Answers questions over a private knowledge base, live financial market data, and the public internet via planned, multi-source search, and renders the result as a report, document or code file when one is asked for.",
     instruction=INSTRUCTION,
-    # create_canvas and report_gap are last on purpose - they are the only
-    # non-evidence tools here. create_canvas ends a turn that asked for a
-    # deliverable; report_gap does not end the turn, but it does end the
-    # turn's evidence gathering (tool_budget.enforce_tool_budget refuses
-    # every evidence tool once it has been called - see tool_budget.py).
-    # Like create_canvas it gathers no evidence itself and must be exempt
-    # from the numeric tool budget and the redundancy metric (see
-    # src/tools/canvas.py and src/tools/report_gap.py). Both exemptions key
-    # off tool name, so renaming either tool means changing
-    # tool_budget.OUTPUT_TOOLS and schema.OUTPUT_TOOLS too.
+    # declare_plan, create_canvas and report_gap are the only non-evidence
+    # tools here. declare_plan is listed first, ahead of the four evidence
+    # tools, because it is the first tool call a well-behaved turn makes.
+    # create_canvas ends a turn that asked for a deliverable; report_gap does
+    # not end the turn, but it does end the turn's evidence gathering
+    # (tool_budget.enforce_tool_budget refuses every evidence tool once it
+    # has been called - see tool_budget.py). All three gather no evidence
+    # themselves and must be exempt from the numeric tool budget and the
+    # redundancy metric (see src/tools/declare_plan.py, src/tools/canvas.py
+    # and src/tools/report_gap.py). All three exemptions key off tool name,
+    # so renaming any of them means changing tool_budget.OUTPUT_TOOLS and
+    # schema.OUTPUT_TOOLS too.
     tools=[
+        declare_plan,
         search_documents,
         get_financial_data,
         web_search_tool,
@@ -305,8 +327,10 @@ research_agent = Agent(
     # measured up to 10 search_documents calls for one figure anyway - so the
     # bound lives in code, for the same reason max_output_tokens does
     # (ADR-0009). See tool_budget.py for the ceiling and the refusal wording.
+    # declare_plan (2026-08-06) is now gated here too - see tool_budget.py's
+    # docstring, "declare_plan as a third, independent gate".
     before_tool_callback=tool_budget.enforce_tool_budget,
-    after_tool_callback=_record_artefact,
+    after_tool_callback=_after_tool,
     # A cumulative token ceiling for the whole session, not just this turn.
     # Wired on all three model-calling agents (here, critique_agent, and the
     # web_search_agent sub-agent) because the counter is only a bound if
