@@ -149,6 +149,12 @@ def reset_turn_state(callback_context: CallbackContext) -> None:
     # refilled each cycle would not bound a loop that re-runs the same
     # searches - see tool_budget.py's module docstring.
     state[tool_budget.STATE_KEY] = {}
+    # Same turn-scoping requirement as STATE_KEY directly above, and the same
+    # reason: report_gap's stop condition (tool_budget.py, "report_gap as a
+    # second, independent stop condition") must not leak into the next turn -
+    # left set from a prior turn's gap it would refuse that new turn's first
+    # evidence call for a question it never reported anything against.
+    state[tool_budget.STATE_KEY_GAP_REPORTED] = False
     # Deliberately NOT reset here: token_budget.STATE_KEY. It is the one
     # counter in this system that is session-scoped rather than turn-scoped,
     # and clearing it on this hook - the hook that exists to make things
@@ -272,6 +278,12 @@ None of the following are grounds to continue - call exit_loop instead:
   is never grounds for another research cycle on its own.
 - Wanting more detail, better phrasing, extra caveats, or context beyond
   what the original question actually asked for.
+- A part of the question the draft explicitly declines - it states plainly
+  that the source checked does not cover it, and names that source. That
+  part has been answered by being correctly declined, not left unaddressed:
+  the source's not having it IS the answer. A follow-up chasing the exact
+  figure just declined sends research back to a fact it has already
+  confirmed is missing, wasting a cycle on a result that cannot change.
 
 These are the only grounds to continue - if you find one, state it plainly
 as a specific follow-up sub-question for the next research cycle, and do

@@ -60,6 +60,34 @@ option, not something a counter can reach.
 
 Note this is a ceiling, not a target: a well-behaved turn never reaches it,
 and reaching it is itself a signal worth seeing in a trace.
+
+## report_gap as a second, independent stop condition
+
+The numeric ceiling above bounds a turn that searches too much. It does
+nothing for the turn measured on the 2026-08-06 decline baseline: the agent
+calls `report_gap` correctly, confirming the authoritative source does not
+have the fact, and then - nowhere near the five-call ceiling - goes and
+checks a second, unauthorised source anyway and answers or pads from it. A
+call ceiling cannot see that failure at all, because the turn was never over
+budget; it made the wrong kind of call, not too many of them.
+
+The instruction has said not to do this for a long time (step 2: "its not
+having the answer IS the answer, and searching elsewhere for a substitute
+produces a figure from somewhere that was never authoritative"), and ADR-0023
+already measured that wording losing to behaviour at scale, the same
+conclusion this module's own ceiling exists for. So `report_gap` gets the
+same treatment: once it has been called, `enforce_tool_budget` refuses every
+further evidence-gathering tool call for the rest of the turn, regardless of
+how much of the five-call ceiling is unspent. `report_gap` is not "one more
+call towards the total" - it is a second, independent gate that can close
+before the numeric one ever would.
+
+`report_gap` and `create_canvas` stay callable after this - `report_gap`
+because a multi-part question can legitimately report more than one gap, and
+`create_canvas` because a report turn that hit a gap on one section still has
+to render the sections it did answer. Both are already exempt from the
+numeric ceiling for the same reason (see OUTPUT_TOOLS below); this gate does
+not touch that exemption, it only ever refuses evidence tools.
 """
 
 from __future__ import annotations
@@ -136,6 +164,30 @@ OUTPUT_TOOLS: frozenset[str] = frozenset({"create_canvas", "report_gap"})
 # must not refill when the loop goes round again.
 STATE_KEY = "tool_calls_this_turn"
 
+# Session-state key: True once report_gap has been called during the current
+# turn. Same turn-scoping requirement as STATE_KEY above and reset alongside
+# it in critique.reset_turn_state - a flag that survived into the next turn
+# would refuse that turn's very first evidence call for a gap reported
+# against a different question entirely.
+STATE_KEY_GAP_REPORTED = "report_gap_called_this_turn"
+
+
+def _gap_refusal() -> dict[str, Any]:
+    return {
+        "error": "evidence_gathering_ended_by_report_gap",
+        "detail": (
+            "report_gap has already been called this turn. report_gap is the last "
+            "evidence-gathering action a turn takes, so no further evidence-gathering "
+            "tool can be called for this question - not this one, not a different one. "
+            "Answer now from what you have already retrieved. For the fact report_gap "
+            "recorded, name and cite the source you checked and write the prose decline "
+            "(step 3) - do not search a different source for it. For any other part of "
+            "the question, answer from what you already have. If this question asked for "
+            "a report, document or code file, you may still call create_canvas to produce "
+            "it - that formats what you have and gathers nothing new."
+        ),
+    }
+
 
 def _refusal(used: int, breakdown: dict[str, int]) -> dict[str, Any]:
     spent = ", ".join(f"{name} x{n}" for name, n in sorted(breakdown.items()))
@@ -162,10 +214,17 @@ def enforce_tool_budget(
     Returning None lets the real tool run, which is the path every
     well-behaved turn takes. Returning a dict short-circuits the call.
 
-    Tools in OUTPUT_TOOLS are exempt on both counts - they neither increment
-    the counter nor can be refused by it, because they produce rather than
-    retrieve and a spent search budget has no bearing on rendering what was
-    already found.
+    Tools in OUTPUT_TOOLS are exempt from the numeric ceiling - they neither
+    increment the counter nor can be refused by it, because they produce
+    rather than retrieve and a spent search budget has no bearing on
+    rendering what was already found.
+
+    report_gap additionally sets a second, independent gate (see this
+    module's docstring, "report_gap as a second, independent stop
+    condition"): once it has been called, every evidence-gathering tool is
+    refused for the rest of the turn regardless of the numeric ceiling. That
+    check runs before the numeric one so a turn that reported a gap early
+    cannot spend the rest of its five-call ceiling on an unauthorised source.
 
     The per-tool breakdown is still recorded, because it is the useful thing
     to see in a trace and in the refusal text - but it is the TOTAL that is
@@ -178,11 +237,26 @@ def enforce_tool_budget(
     mutating the nested dict returned by `state.get(...)` would not always be
     recorded as a change.
     """
-    # Output tools bypass the ceiling entirely - not counted, never refused.
-    # Checked before the counter is even read, so a spent budget cannot block
-    # the artefact that the turn was asked for (see OUTPUT_TOOLS above).
+    # report_gap sets the second gate and is otherwise unbounded (a
+    # multi-part question can legitimately report more than one gap) - so
+    # this branch returns before either exemption or ceiling logic runs.
+    if tool.name == "report_gap":
+        tool_context.state[STATE_KEY_GAP_REPORTED] = True
+        return None
+
+    # Output tools (create_canvas) bypass the ceiling entirely - not counted,
+    # never refused. Checked before the counter is even read, so a spent
+    # budget cannot block the artefact that the turn was asked for (see
+    # OUTPUT_TOOLS above).
     if tool.name in OUTPUT_TOOLS:
         return None
+
+    # The report_gap gate: refuses every evidence tool once report_gap has
+    # been called this turn, independent of how much numeric ceiling is left
+    # unspent - see this module's docstring for why the numeric ceiling alone
+    # cannot catch this failure shape.
+    if tool_context.state.get(STATE_KEY_GAP_REPORTED):
+        return _gap_refusal()
 
     counts = dict(tool_context.state.get(STATE_KEY) or {})
     used = sum(counts.values())

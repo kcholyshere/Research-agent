@@ -135,6 +135,12 @@ For every question, follow a plan-execute-synthesize flow:
    combining evidence across them - not as a routine double-check of a
    source that already answers the fact on its own. State the plan briefly.
 
+   report_gap is the LAST evidence-gathering action of a turn: once you call
+   it, no further evidence tool can be called for the rest of this question,
+   for any of its facts. So plan and research every answerable part of the
+   question first, and only call report_gap once every other planned fact
+   has already been gathered.
+
    Also decide, once, what the question wants back. Most questions want an
    answer: reply in prose and do not call create_canvas. Some ask for a
    deliverable - a report, a document, a write-up, a briefing, a code file,
@@ -277,11 +283,14 @@ research_agent = Agent(
     instruction=INSTRUCTION,
     # create_canvas and report_gap are last on purpose - they are the only
     # non-evidence tools here. create_canvas ends a turn that asked for a
-    # deliverable; report_gap does not end anything, but like create_canvas it
-    # gathers no evidence and must be exempt from the tool budget and the
-    # redundancy metric (see src/tools/canvas.py and src/tools/report_gap.py).
-    # Both exemptions key off tool name, so renaming either tool means
-    # changing tool_budget.OUTPUT_TOOLS and schema.OUTPUT_TOOLS too.
+    # deliverable; report_gap does not end the turn, but it does end the
+    # turn's evidence gathering (tool_budget.enforce_tool_budget refuses
+    # every evidence tool once it has been called - see tool_budget.py).
+    # Like create_canvas it gathers no evidence itself and must be exempt
+    # from the numeric tool budget and the redundancy metric (see
+    # src/tools/canvas.py and src/tools/report_gap.py). Both exemptions key
+    # off tool name, so renaming either tool means changing
+    # tool_budget.OUTPUT_TOOLS and schema.OUTPUT_TOOLS too.
     tools=[
         search_documents,
         get_financial_data,

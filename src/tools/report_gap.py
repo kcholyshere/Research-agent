@@ -40,6 +40,25 @@ For that reason it is exempt from `tool_budget.MAX_TOOL_CALLS_PER_TURN` (see
 `schema.OUTPUT_TOOLS`): a spent search budget must never be the reason the
 model cannot call this, and a gap report must never itself count as one of
 the wasteful calls the budget exists to police.
+
+## Terminal for evidence gathering (2026-08-06)
+
+The additive framing above ("does not end the turn") describes the *turn*,
+not the *research*. The measured failure this tool did not fix on its own:
+the model calls `report_gap` correctly, confirming the authoritative source
+lacks the fact, and then goes and checks a second, unauthorised source
+anyway and answers or pads from it - decline-headcount-by-country and
+decline-segment-margin both did this on the 2026-08-06 baseline. A tool that
+only records an outcome cannot itself stop what happens next.
+
+So `tool_budget.enforce_tool_budget` now treats a `report_gap` call as a
+second stop condition, independent of its numeric ceiling: once this tool
+has been called, every further evidence-gathering tool is refused for the
+rest of the turn. `report_gap` and `create_canvas` stay callable afterwards -
+this tool because a multi-part question can legitimately report more than
+one gap, `create_canvas` because a report turn that hit a gap on one section
+still has to render the sections it did answer. See `tool_budget.py`'s
+docstring for the full mechanism and refusal wording.
 """
 
 from __future__ import annotations
@@ -58,6 +77,12 @@ def report_gap(fact: str, source_checked: str) -> dict[str, Any]:
     first try - reformulate and search again on that same source first, as
     step 2 already asks; call this once you have confirmed the gap, not
     before.
+
+    This is the LAST evidence-gathering action of the turn: once you call it,
+    no further evidence-gathering tool call is permitted for this question,
+    for any of its facts, not just the one reported here. Make sure every
+    other answerable part of the question has already been researched before
+    you call this.
 
     This tool does not end the turn and does not write your answer for you.
     After calling it you still go on to step 3 and write the prose decline
@@ -88,6 +113,8 @@ def report_gap(fact: str, source_checked: str) -> dict[str, Any]:
             f"{source_checked} does not cover this, name and cite it exactly as you would "
             "any source you did find, and stop there. Do not search a different source, "
             "and do not substitute a different period, a related figure, or the closest "
-            "available number as if it answered the question."
+            "available number as if it answered the question. This was also this turn's "
+            "last evidence-gathering action - any further evidence tool call will now be "
+            "refused, so answer from what you already have for the rest of the question too."
         ),
     }
