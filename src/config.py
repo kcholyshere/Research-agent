@@ -10,6 +10,14 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # Vertex AI auth (no API keys - relies on Application Default Credentials).
 # ADK reads GOOGLE_GENAI_USE_VERTEXAI/GOOGLE_CLOUD_PROJECT/GOOGLE_CLOUD_LOCATION
 # from the environment itself; these mirrors are for our own modules.
+#
+# Deliberately not validated here (audit finding 15a): this module is
+# imported unconditionally, including by code and tests that never touch
+# Vertex, so failing at import time on a blank value would break hermetic,
+# credential-free test runs that have no reason to care. The real check
+# lives in src/services/genai_client.get_client() - the actual point a
+# genai.Client gets built - see that function's comment for why a blank
+# project is a silent misrouting risk rather than a loud one otherwise.
 GCP_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
 GCP_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
 

@@ -108,6 +108,7 @@ from typing import TypeVar
 from langfuse import Langfuse, get_client
 
 from src import config  # noqa: F401 - triggers .env load via dotenv, see agent.py's import-order note
+from src.evaluation.metrics import check_routing
 from src.evaluation.schema import EvalQuestion, EvalRun, RunRecord
 
 logger = logging.getLogger(__name__)
@@ -169,6 +170,18 @@ def push_question_set(
                 # only what was asked.
                 expected_output={
                     "expected_routes": [route.value for route in question.expected_routes],
+                    # Alternative route sets check_routing also accepts as a full
+                    # substitute for expected_routes (audit.md finding 9's third
+                    # site, missed by the first pass at this fix): without it, a
+                    # reviewer in the Langfuse UI reads this item's label as
+                    # [financial, web] only, then sees routing_correct=1.0 on a
+                    # run that took [financial, news_agent] and has no way to see
+                    # from the label alone why that scored a pass rather than a
+                    # dashboard bug. Empty list for every question but
+                    # multi-web-and-financial, so this changes nothing else.
+                    "acceptable_routes": [
+                        [route.value for route in alt] for alt in question.acceptable_routes
+                    ],
                     "expects_citation": question.expects_citation,
                     "expects_decline": question.expects_decline,
                     "must_contain": question.must_contain,
@@ -257,16 +270,36 @@ def _scores_for(record: RunRecord, question: EvalQuestion | None) -> list[tuple[
     bug so far... visible in trace structure alone, which is deterministic
     and costs nothing to assert on").
 
-    routing_correct is EXACT-SET match between routes_used and
-    expected_routes, not a subset check in either direction. The plan's own
-    framing settles this: questions are "labelled with the tool routing each
-    one should produce" (evaluation_brainstorm.md line 40) - "the routing it
-    should produce" names one specific set, not a floor. schema.py's
-    TOOL_TO_ROUTE docstring only states the over-routing half explicitly
-    ("anything it consults beyond that set is a routing error"), but
-    under-routing - never calling a source the question needed - is exactly
-    as much a defect and has to fail the same assertion, or a run that
-    silently skips a required source would score as correct.
+    routing_correct calls `metrics.check_routing` directly rather than
+    reimplementing its comparison (audit.md finding 9): that function is
+    already the authoritative scorer for the stored-JSON pipeline, and it
+    accepts an exact match against `expected_routes` OR an exact match
+    against any one of `question.acceptable_routes`'s alternative sets - a
+    question with a legitimate second route (multi-web-and-financial, the
+    only one in the set today) must score identically here and in the JSON,
+    or the Langfuse dashboard and the authoritative record disagree about the
+    same run. A prior version of this function compared
+    `set(record.routes_used) == set(question.expected_routes)` directly,
+    which is exactly `check_routing`'s `expected_routes`-only branch with none
+    of its `acceptable_routes` handling - correct for every question without
+    alternatives, and a false "routing regression" pushed to the dashboard
+    for every run that legitimately took one.
+    Importing `metrics` here is a plain intra-package import (this module and
+    `metrics.py` both live under `src/evaluation/`, and `metrics.py` pulls in
+    only stdlib plus `schema` - no ADK agent, no Vertex client, no Langfuse
+    instrumentation) - a different case from the OUTPUT_TOOLS duplication
+    schema.py documents between itself and `src/research_agent/tool_budget.py`
+    (ADR-0016's precedent for two independently-commented constants), which
+    exists specifically so the eval package can score a stored run without
+    importing the production agent package at all. Reusing `check_routing`
+    crosses no such boundary, so there is no reason to duplicate its
+    comparison here as well.
+
+    Still exact-set matching underneath, never a subset check in either
+    direction - `check_routing`'s own semantics, unchanged by this call: a
+    question is "labelled with the tool routing each one should produce"
+    (evaluation_brainstorm.md line 40), and under-routing (skipping a
+    required source) fails exactly as surely as over-routing does.
 
     redundant_calls reuses `max_tool_calls`, a field schema.py already
     designed for exactly this ("Redundancy bound... calling the right tool
@@ -289,7 +322,7 @@ def _scores_for(record: RunRecord, question: EvalQuestion | None) -> list[tuple[
         scores.append(("latency_s", record.latency_s, "NUMERIC"))
 
     if question is not None:
-        routing_correct = set(record.routes_used) == set(question.expected_routes)
+        routing_correct = check_routing(question, record).passed
         scores.append(("routing_correct", 1.0 if routing_correct else 0.0, "BOOLEAN"))
 
         redundant_calls = max(0, len(record.tools_called) - question.max_tool_calls)

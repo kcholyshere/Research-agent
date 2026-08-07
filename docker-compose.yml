@@ -11,19 +11,59 @@
 name: research-agent
 
 # The three Python services share an image and an auth story, so the common
-# setup lives here rather than three times over.
+# setup lives here rather than three times over. `image:` alongside `build:`
+# (Finding 14c) is what makes the Dockerfile's opening comment (mostly) true:
+# without it, compose's default naming would tag three separate images
+# (<project>-agent, <project>-news-agent, <project>-ui) that happen to share
+# cache layers rather than one image reused three times. With it, all three
+# services converge on one tag, research-agent-app - checked with `docker
+# compose build`: it still walks the build graph once per service (three
+# "exporting to image" steps, not one), but on an unchanged Dockerfile those
+# three are cache hits of a few hundred milliseconds each, and all three
+# re-export to the same tag rather than three different ones. So "one image,
+# three roles" is accurate about the outcome (one tag, one set of layers,
+# `docker images` shows one entry instead of three) even though compose does
+# not literally build only once.
+#
+# APP_UID/APP_GID default to the Dockerfile's own defaults (1000:1000, the
+# common first-non-root-UID case) when unset, and are only worth overriding on
+# a native Linux host whose checkout is owned by a different UID - see the
+# non-root user comment in the Dockerfile for why the mismatch matters there
+# and not under Docker Desktop. On such a host, `export APP_UID=$(id -u)
+# APP_GID=$(id -g)` (or an entry in .env) before `docker compose up --build`
+# is the whole of that override; no --build-arg flags needed by hand. Do NOT
+# run that export on macOS: Docker Desktop needs no override at all (see the
+# Dockerfile), and macOS's own `id -g` is commonly 20 ("staff"), which
+# collides with Debian's system group `dialout` at the same GID and makes
+# `groupadd` fail the build outright - verified by trying it.
 x-app: &app
-  build: .
+  image: research-agent-app
+  build:
+    context: .
+    args:
+      APP_UID: ${APP_UID:-1000}
+      APP_GID: ${APP_GID:-1000}
   env_file: [.env]
   restart: unless-stopped
 
 # Application Default Credentials. The project authenticates to Vertex with ADC
 # and no API keys, and `gcloud auth application-default login` writes a user
 # credential (an authorized_user refresh token, not a service account key) to
-# this directory - so mounting it read-only is the whole of the auth story. The
-# container runs as root, hence /root.
+# this directory - so mounting it read-only is the whole of the auth story.
+#
+# The source side (${HOME}) is compose's own substitution, read from the
+# *host* shell's environment at parse time - unrelated to the container's
+# HOME, which the Dockerfile sets to /home/app for the "app" user it now runs
+# as (Finding 13). The destination side changed to match: it used to be /root,
+# which was correct while the container ran as root, but /root is mode 700 and
+# a non-root user cannot even traverse into it to reach the credential file
+# below - that would have silently broken Vertex auth for every service, not
+# just failed on the credential file's own permissions. /home/app is the app
+# user's home (created by `useradd --create-home` in the Dockerfile), so
+# google-auth's own ADC discovery - which resolves via $HOME - finds this
+# mount without GOOGLE_APPLICATION_CREDENTIALS needing to be set explicitly.
 x-adc-mount: &adc-mount
-  - ${HOME}/.config/gcloud:/root/.config/gcloud:ro
+  - ${HOME}/.config/gcloud:/home/app/.config/gcloud:ro
 
 # The same, plus the knowledge base, for the two services that answer questions.
 # Neither is baked into the image (see the Dockerfile header). data/ is
@@ -31,8 +71,17 @@ x-adc-mount: &adc-mount
 # data/processed/artefacts; models/ is read-only because the FAISS index is only
 # ever read at runtime - rebuilding it is a host-side `python -m src.dataset`,
 # which should not be something a container can do to you.
+#
+# The gcloud line here is a second, separate copy of x-adc-mount above, not a
+# reference to it - plain YAML has no merge syntax for sequences, only for
+# mappings (`<<`), so a list anchor can't be "extended" with two more entries.
+# That duplication is exactly how the Finding 13 fix first went in wrong: this
+# line still pointed at /root after x-adc-mount above had already been moved
+# to /home/app, and agent/ui (the two services that use app-mounts) would have
+# silently kept mounting ADC to a path their own non-root user cannot reach.
+# If x-adc-mount's target ever changes again, this line has to change with it.
 x-app-mounts: &app-mounts
-  - ${HOME}/.config/gcloud:/root/.config/gcloud:ro
+  - ${HOME}/.config/gcloud:/home/app/.config/gcloud:ro
   - ./data:/app/data
   - ./models:/app/models:ro
 
@@ -53,6 +102,10 @@ services:
     # talks to the same server the containers do, which is why config.py
     # defaults MCP_FETCH_URL to localhost:8090.
     ports: ["8090:8090"]
+    # HEALTHCHECK lives in docker/mcp-fetch-bridge.Dockerfile, not here: this
+    # service has one role and one Dockerfile of its own, unlike the shared
+    # x-app image below, so baking the probe into the image is both simpler
+    # and keeps it working for a plain `docker run` outside compose too.
 
   news-agent:
     <<: *app
@@ -66,17 +119,55 @@ services:
     # callers at once - see CardHostMiddleware in src/news_service/server.py.
     ports: ["8001:8001"]
     volumes: *adc-mount
+    # Role-specific, unlike mcp-fetch's: this service shares the main
+    # Dockerfile with the agent and ui roles, which serve different ports and
+    # paths, so one baked-in HEALTHCHECK cannot fit all three CMD overrides -
+    # this lives here instead, scoped to the command this service actually
+    # runs. Probes the A2A agent card at /.well-known/agent-card.json -
+    # confirmed by curl against a running container to return 200 with no ADC/
+    # Vertex credentials present at all: `to_a2a` only builds the runner at
+    # startup, it does not authenticate until a message actually needs the
+    # model, so this is a true readiness check rather than a liveness check
+    # that a lazily-failing auth path could still pass. start_period is 30s
+    # because this role's import graph (ADK, the a2a extra, google-genai) is
+    # the heaviest of the three and a cold first boot took ~5s in testing on a
+    # warm build cache - 30s leaves real margin for a slower machine or a
+    # cold image pull without turning a slow boot into a false failure.
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8001/.well-known/agent-card.json', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
 
   agent:
     <<: *app
-    depends_on: [mcp-fetch, news-agent]
+    # Gated on readiness, not process start (Finding 13): the default
+    # `condition: service_started` only waits for the container to exist, so a
+    # first question could reach mcp-fetch or news-agent before either had
+    # bound its port, surfacing as "server unreachable" downstream even though
+    # `docker compose up` reported success. service_healthy waits for the
+    # HEALTHCHECK above (news-agent) and in mcp-fetch's own Dockerfile instead.
+    depends_on:
+      mcp-fetch:
+        condition: service_healthy
+      news-agent:
+        condition: service_healthy
     ports: ["8000:8000"]
     volumes: *app-mounts
     environment: *service-urls
 
   ui:
     <<: *app
-    depends_on: [mcp-fetch, news-agent]
+    depends_on:
+      mcp-fetch:
+        condition: service_healthy
+      news-agent:
+        condition: service_healthy
     command:
       - python
       - -m

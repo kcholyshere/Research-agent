@@ -39,9 +39,32 @@ such test to become async for no reason. Nothing in the built context is
 bound to the loop that created it - it holds an in-memory session object and
 a service backed by plain dicts - so building it under a throwaway
 `asyncio.run` and using it under a different loop is safe.
+
+## The OpenMP workaround, and why it has to be here
+
+The suite is the second entrypoint in this project to import both `faiss` and
+`torch` (via `docling`) into one process - `src/dataset.py` was the first, and
+its comment said so explicitly, because at the time the agent never imported
+torch at runtime and there was no test suite. That stopped being true the
+moment a test touching ingestion sat alongside a test touching retrieval:
+`uv run pytest` segfaulted with no Python traceback, `faiss._swigfaiss` and
+`torch._C` both in the loaded extension list, which is ADR-0006's crash
+exactly.
+
+The two environment variables below are the same pair `src/dataset.py` sets
+and are set for the same reason - see that module for the full explanation.
+They must run before any test module is imported, which is why they are at the
+top of the root conftest rather than in a fixture: pytest loads this file
+before it collects anything, and by the time a fixture runs both libraries are
+already in the process.
 """
 
 from __future__ import annotations
+
+import os
+
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import asyncio
 from collections.abc import Callable

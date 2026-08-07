@@ -50,6 +50,15 @@ def _group_into_sections(records: list[dict]) -> list[dict]:
             # never overwrite an already-known end_page with None.
             if record["page"] is not None:
                 current["end_page"] = record["page"]
+                # Symmetric guard for start_page (finding 15c): if the
+                # section's opening record(s) lacked Docling provenance,
+                # start_page was seeded as None above and would otherwise
+                # stay None forever even once a later record in the same
+                # section supplies a real page - producing a citation like
+                # "page None-42" instead of "page 42-42". Backfill it from
+                # the first record that does carry a page, same as end_page.
+                if current["start_page"] is None:
+                    current["start_page"] = record["page"]
 
     for section in sections:
         section.setdefault("end_page", section["start_page"])

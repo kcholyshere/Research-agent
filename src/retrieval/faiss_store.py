@@ -67,8 +67,31 @@ def save_index(index: FAISS) -> None:
 
     save_local() writes the .faiss and .pkl files as two separate calls; an
     interrupt between them would leave the pair desynced (one stale, one
-    fresh) with nothing to detect it. Building in a temp dir and moving the
-    finished pair in as a batch keeps the swap atomic from the caller's view.
+    fresh) with nothing to detect it. Building in a temp dir first means both
+    files are complete and mutually consistent before either os.replace()
+    below runs, and each os.replace() is individually atomic - the
+    destination path never shows a partially-written file.
+
+    That is weaker than "the swap is atomic as a pair", which this used to
+    claim and does not hold: a crash or kill between the two os.replace()
+    calls leaves whichever suffix was replaced first fresh and the other
+    stale (audit finding 14b). A directory-level swap - build the whole pair
+    under one new directory, then a single os.replace() of that directory -
+    would close the window, but the destination already holds the previous
+    pair from the last build, and os.replace() refuses to replace a
+    non-empty directory (confirmed on this platform: ENOTEMPTY). Doing this
+    properly needs an extra layer of indirection - two candidate directories
+    plus a symlink flipped atomically between them - which is a bigger
+    restructure than this reused, treated-as-proven file warrants for one
+    finding; recorded here as the fix if the window below ever bites.
+
+    If the crash lands in that window and it changes the vector COUNT,
+    load_index() below now catches it and raises loudly. It cannot catch a
+    rebuild that lands on the same chunk count with different content - every
+    id would still resolve, just to the wrong chunk text, and nothing short
+    of a content hash tying the two files together (stored alongside the
+    pickle, checked on load) would detect that. That hash is not implemented;
+    a same-count desync from an interrupted save is a live, silent risk.
     """
     config.FAISS_INDEX_DIR.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=config.FAISS_INDEX_DIR) as tmp_dir:
@@ -81,9 +104,40 @@ def save_index(index: FAISS) -> None:
 
 
 def load_index() -> FAISS:
-    return FAISS.load_local(
+    """Load the index, then check the .faiss/.pkl pair actually agree on size.
+
+    save_index() above is not atomic as a pair (see its docstring): a crash
+    between its two os.replace() calls can leave a fresh .faiss beside a
+    stale .pkl or vice versa. Verified against the installed
+    langchain_community.vectorstores.faiss.FAISS.load_local/__init__: neither
+    compares index.ntotal to len(index_to_docstore_id), so FAISS itself does
+    not catch a count mismatch here - it would instead surface later,
+    unpredictably, as a bare KeyError deep inside similarity_search if the
+    index ends up with MORE vectors than the docstore has ids, or as silently
+    fewer/no results if it has FEWER, never as a clear error at load time.
+    The check below makes that count-mismatch case loud at the one place that
+    can name it clearly, rather than leaving it as a mystery either at query
+    time or never.
+
+    It does not, and cannot cheaply, catch a rebuild that kept the same
+    chunk count but changed the content - every id would still resolve, just
+    to the wrong text. See save_index()'s docstring for why that residual
+    case is left as a named risk rather than fixed here.
+    """
+    loaded = FAISS.load_local(
         str(config.FAISS_INDEX_DIR),
         GeminiEmbeddings(),
         index_name=INDEX_NAME,
         allow_dangerous_deserialization=True,
     )
+    if loaded.index.ntotal != len(loaded.index_to_docstore_id):
+        raise ValueError(
+            f"Index/docstore size mismatch in {config.FAISS_INDEX_DIR}: "
+            f"{INDEX_NAME}.faiss has {loaded.index.ntotal} vectors but "
+            f"{INDEX_NAME}.pkl has {len(loaded.index_to_docstore_id)} ids. "
+            "This is the failure mode save_index()'s docstring names: a "
+            "crash between its two os.replace() calls left the pair "
+            "desynced. Rebuild the index (python -m src.dataset) from a "
+            "known-good corpus rather than trusting either file alone."
+        )
+    return loaded

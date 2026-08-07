@@ -21,6 +21,23 @@ RUN pip install --no-cache-dir "mcp-proxy==0.12.0" "mcp==1.23.0"
 
 EXPOSE 8090
 
+# Real readiness probe, not a placeholder. mcp-proxy serves the fetch server
+# over streamable HTTP at /mcp, and a bare GET to it - confirmed with curl
+# against a running container - returns 406 (the streamable HTTP transport
+# rejects a request with no session negotiation) rather than a connection
+# refusal, within about a second of the process being able to accept
+# connections at all. That 406 is exactly the signal this probe wants: it
+# proves mcp-proxy is up and speaking HTTP, which is all "healthy" needs to
+# mean at this layer - anything past that is a protocol-level concern for the
+# client making the actual MCP call, not for compose's readiness gate. An
+# HTTPError is therefore caught and treated as healthy; only a connection
+# failure (nothing listening yet, or the process died) exits non-zero. No
+# curl or wget in this image - the upstream mcp/fetch base has neither,
+# checked with `which` - so the probe is Python, which the base image does
+# ship (it is how mcp-server-fetch itself runs).
+HEALTHCHECK --interval=10s --timeout=5s --start-period=20s --retries=3 \
+  CMD ["python3", "-c", "import urllib.request, urllib.error, sys\ntry:\n    urllib.request.urlopen('http://localhost:8090/mcp', timeout=3)\nexcept urllib.error.HTTPError:\n    pass\nexcept Exception:\n    sys.exit(1)\n"]
+
 # Server mode: run `mcp-server-fetch` as a stdio child and expose it over
 # streamable HTTP at /mcp. --stateless because the client opens a fresh session
 # per call and keeps no server-side state between them.
