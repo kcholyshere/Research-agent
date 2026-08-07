@@ -37,6 +37,19 @@ What it deliberately proves instead:
    `research_agent`'s actual registered tool list, not a hardcoded copy of it -
    so a sixth tool added to `agent.py` without a label fails here too, the
    same staleness shape as the refusal-shape defect above.
+5. `app._ARTEFACT_MIME` is checked against `canvas.OutputFormat`'s actual
+   `Literal` args, the same fixed-copy-of-another-module's-enum shape as
+   point 4, just with a softer failure mode: a missing entry downloads with
+   the wrong MIME type (`.get(fmt, "text/plain")`) rather than rendering
+   visibly wrong, which is easy to miss in a demo.
+
+Not fixed here, reported instead: `app._HIDDEN_STEPS` (`{"exit_loop"}`) has
+the same shape again - a fixed set standing in for "critique_agent's internal
+bookkeeping tools" - but critique_agent has exactly one tool today, and there
+is no marker on a tool object this project controls that would let a test
+derive "is this tool internal bookkeeping" without hardcoding the same one
+name back (unlike points 4 and 5, which have a real enum elsewhere to check
+against).
 """
 
 from __future__ import annotations
@@ -232,3 +245,21 @@ def test_step_labels_and_colours_cover_every_registered_tool() -> None:
     missing_colours = names - app._STEP_COLOURS.keys()
     assert not missing_labels, f"tool(s) with no _STEP_LABELS entry: {sorted(missing_labels)}"
     assert not missing_colours, f"tool(s) with no _STEP_COLOURS entry: {sorted(missing_colours)}"
+
+
+# --- 5: the same staleness check for canvas's own format enum --------------
+
+
+def test_artefact_mime_covers_every_canvas_output_format() -> None:
+    """`_ARTEFACT_MIME` must cover every format `canvas.OutputFormat` declares.
+
+    Reads the `Literal`'s actual args via `typing.get_args` rather than a
+    hardcoded copy of "markdown", "html", "code", so a fourth Canvas format
+    added to `canvas.OutputFormat` without a matching MIME entry here fails
+    this test instead of quietly downloading with the wrong content type.
+    """
+    formats = set(get_args(canvas.OutputFormat))
+    assert formats, "canvas.OutputFormat declared no formats - this test's premise no longer holds"
+
+    missing = formats - app._ARTEFACT_MIME.keys()
+    assert not missing, f"canvas output format(s) with no _ARTEFACT_MIME entry: {sorted(missing)}"
