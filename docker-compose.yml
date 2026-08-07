@@ -160,6 +160,25 @@ services:
     ports: ["8000:8000"]
     volumes: *app-mounts
     environment: *service-urls
+    # Nothing depends on this service, so this probe gates no other container -
+    # it exists so `docker compose up --wait` can tell a user when the stack is
+    # actually usable. Verified from a genuinely cold start: compose reports
+    # success the moment this container STARTS, and the port is not bound for
+    # another 10-12s while the ADK/google-genai import graph loads, so a
+    # first-time user following the README's `docker compose up` and opening
+    # the page immediately gets connection-refused. That is a narrower, shorter
+    # variant of the same symptom Finding 13 was about, from the top of the
+    # dependency chain rather than the bottom, and it is closed the same way.
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/dev-ui/', timeout=3)"
+      interval: 5s
+      timeout: 5s
+      start_period: 30s
+      retries: 6
 
   ui:
     <<: *app
@@ -182,3 +201,23 @@ services:
     ports: ["8501:8501"]
     volumes: *app-mounts
     environment: *service-urls
+    # Nothing depends on this service, so this probe gates no other container -
+    # it exists so `docker compose up --wait` can tell a user when the stack is
+    # actually usable. Verified from a genuinely cold start: compose reports
+    # success the moment this container STARTS, and the port is not bound for
+    # another 10-12s while the ADK/google-genai import graph loads, so a
+    # first-time user following the README's `docker compose up` and opening
+    # the page immediately gets connection-refused. That is a narrower, shorter
+    # variant of the same symptom Finding 13 was about, from the top of the
+    # dependency chain rather than the bottom, and it is closed the same way.
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=3)"
+      interval: 5s
+      timeout: 5s
+      start_period: 30s
+      retries: 6
+

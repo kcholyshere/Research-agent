@@ -26,11 +26,10 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for how the pieces fit together, and
 ## Limitations
 - News and financial questions need their services running; the rest degrades cleanly.
 - Sometimes delegates to the News Agent when only the web is needed.
-- Repeats searches on some questions, up to six calls.
-- Sometimes answers from the web instead of declining cleanly.
-- Web citations are Vertex redirect links, not readable URLs.
-- No turn timeout outside the evaluation harness; a turn can hang.
-- A session stops answering at 200,000 cumulative tokens (`MAX_SESSION_TOKENS`); history is not trimmed, so each turn costs more than the last.
+- Repeats searches on some questions, bounded at five evidence calls a turn (ADR-0015).
+- A source mis-declared from the start is still executed - the plan gate disciplines execution, not planning judgement (ADR-0027).
+- `adk web` gets only a cycle-boundary turn deadline, so a single long cycle can still overrun it (ADR-0025).
+- A session stops answering at 200,000 cumulative tokens (`MAX_SESSION_TOKENS`, ADR-0021).
 - The critique loop nearly always stops after one cycle.
 - Single corpus, rebuilt by hand when documents change.
 
@@ -54,7 +53,7 @@ this has run will answer knowledge-base questions from an empty index.
 ## Running it with Docker
 The whole system is four services (see ADR-0020):
 ```bash
-docker compose up --build
+docker compose up --build --wait
 ```
 - <http://localhost:8501> - the Streamlit chat UI
 - <http://localhost:8000> - ADK's dev UI
