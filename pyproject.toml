@@ -46,3 +46,36 @@ dependencies = [
     # declaration records the dependency without narrowing what adk can resolve.
     "starlette>=1.3.1,<2",
 ]
+
+# Test tooling only, deliberately not in `dependencies`: none of this ships in
+# the Docker image, and `uv sync --no-dev` is what the Dockerfile's install
+# step resolves. `uv sync` on a developer machine picks the group up by
+# default, so `uv run pytest` works with no extra flag.
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2,<10",
+    # Every gate and callback in this project is async or is exercised through
+    # an async ADK path (`ToolContext` is built from an `InvocationContext`,
+    # which needs `session_service.create_session`), so an async plugin is not
+    # optional here.
+    "pytest-asyncio>=1.4.0,<2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# `src` is imported as a package from the repo root (`from src import config`),
+# and there is no installed distribution providing it - pytest's own
+# `pythonpath` is what makes that resolve without a conftest sys.path hack.
+pythonpath = ["."]
+# Strict rather than auto: an async test that silently never ran because the
+# marker was missing is the classic way a suite goes green while testing
+# nothing, and this project has already been bitten three times by checks that
+# fail silently (see CLAUDE.md on reading a turn's answer).
+asyncio_mode = "strict"
+markers = [
+    "integration: needs a live service (Vertex, the FAISS index, or a running container). Deselected by default.",
+]
+# The default run is the offline suite, so `uv run pytest` is a fast, hermetic,
+# always-runnable check. The integration tests are real and are meant to be
+# run - `uv run pytest -m integration` - but they are not what gates a commit.
+addopts = "-m 'not integration' --strict-markers"
