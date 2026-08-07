@@ -31,25 +31,48 @@ USER_ID = "streamlit-user"
 # "web_search_tool". That distinction is the same one src/evaluation/schema.py's
 # TOOL_TO_ROUTE comment exists to warn about, and getting it wrong here would
 # show raw tool names in the UI rather than fail loudly.
+#
+# declare_plan and report_gap (agent_docs/audit.md finding 12) were added
+# 2026-08-06 alongside the other five tools but never added here, so both
+# rendered as their raw Python name in grey (the _STEP_LABELS.get/_STEP_COLOURS.get
+# fallbacks below exist precisely so a missing entry degrades instead of
+# crashing, which is also why the gap went unnoticed). tests/test_ui_refusal_display.py
+# now checks coverage against research_agent's actual registered tool list
+# rather than pinning this dict's keys by hand, so a sixth tool added the same
+# way fails that test instead of waiting for a second audit pass.
 _STEP_LABELS = {
+    "declare_plan": "Declaring the research plan",
     "search_documents": "Searching the knowledge base",
     "web_search_agent": "Searching the web",
     "get_financial_data": "Fetching market data",
     "news_agent": "Talking to the News Agent",
     "create_canvas": "Building the artefact",
+    "report_gap": "Recording a coverage gap",
 }
 
 # One colour per source, so a glance at the expander shows which mix of sources
 # a turn used without reading the labels. Streamlit's markdown supports a fixed
 # set of colour names in `:colour[text]`; these are all from that set.
+#
+# declare_plan and report_gap share create_canvas's "primary" colour rather
+# than getting one each - deliberately, not for lack of a free colour name
+# (only "yellow" is unused). All three are exactly tool_budget.OUTPUT_TOOLS:
+# the tools that gather no evidence and are exempt from the numeric ceiling.
+# Grouping them under one colour keeps the visual language "one colour per
+# EVIDENCE source" true rather than diluting it with three more swatches for
+# tools that never contribute a fact - a glance at the expander should still
+# answer "which sources did this turn use", and now also "did it plan and
+# record its outcome", without the two questions competing for colours.
 _CRITIQUE_KIND = "critique"
 _REFUSED_KIND = "refused"
 _STEP_COLOURS = {
+    "declare_plan": "primary",
     "search_documents": "blue",
     "web_search_agent": "green",
     "get_financial_data": "orange",
     "news_agent": "violet",
     "create_canvas": "primary",
+    "report_gap": "primary",
     _CRITIQUE_KIND: "gray",
     _REFUSED_KIND: "red",
 }
@@ -57,6 +80,65 @@ _STEP_COLOURS = {
 # exit_loop is the critique agent's loop-termination signal, not research work -
 # it is bookkeeping the user has no use for, and it always takes ~0.0s.
 _HIDDEN_STEPS = frozenset({"exit_loop"})
+
+
+def _is_budget_refusal(payload: object) -> bool:
+    """Whether a tool response is one of tool_budget.enforce_tool_budget's own refusals.
+
+    agent_docs/audit.md finding 12: the previous check compared `payload.get
+    ("error")` against the single literal "tool_call_budget_exhausted" -
+    `_refusal`'s own string, and only that one. `tool_budget.py` has since
+    grown two more refusal builders (`_gap_refusal`, `_plan_refusal`), each
+    with its own "error" value the old check never learned, so a report_gap-
+    or declared-plan-refused call rendered as an ordinary, successful,
+    instant tool call - exactly the misleading reading the relabelling this
+    function feeds exists to prevent. Naming a third string here would just
+    reset the same trap for a fifth refusal shape, so this checks the SHAPE
+    those three builders share instead of any one of their values:
+
+        {"error": <non-empty str>, "detail": <non-empty str>}
+
+    That pair is specific to `_gap_refusal`, `_plan_refusal` and `_refusal`
+    (tool_budget.py) - nothing else in this codebase returns both keys
+    together. `get_financial_data`'s own domain error (financial_data.py)
+    also uses "error", but pairs it with "source", never "detail".
+    `search_documents`'s own domain error (document_search.py) is wrapped in
+    a LIST, not a dict, so `isinstance(payload, dict)` rules it out before
+    the key check runs at all. Verified by reading both modules, not assumed.
+
+    What this does NOT catch: `_amendment_refusal`, tool_budget.py's fourth
+    refusal builder, returns `{"status": "error", "detail": <str>}` - no
+    "error" key at all. That exact shape is ALSO what `declare_plan`'s own
+    input-validation error returns (declare_plan.py) and what `create_canvas`'s
+    own input-validation error returns (canvas.py) for a malformed request.
+    All three are indistinguishable by payload shape alone, because
+    tool_budget.py and the two tools' own validation happen to have reached
+    for the same `{"status": "error", "detail": ...}` convention
+    independently. Catching "status": "error" generically here would relabel
+    two genuine domain errors (a malformed declare_plan or create_canvas
+    call, which DID run and reported its own mistake) as a budget refusal
+    (which never ran) - a new mislabelling of exactly the kind this function
+    exists to stop, just aimed at the other two tools instead. So a plan
+    amendment tool_budget refuses is left showing as an ordinary declare_plan
+    call rather than guessed at.
+
+    The clean fix is in tool_budget.py, not here: add one shared marker key -
+    e.g. `"refused_by": "tool_budget"` - to all FOUR refusal builders
+    (`_gap_refusal`, `_plan_refusal`, `_refusal`, `_amendment_refusal`),
+    alongside their existing "error"/"status"/"detail" keys (additive, so the
+    text the model reads is unchanged). This function then collapses to
+    `payload.get("refused_by") == "tool_budget"`: it catches all four,
+    including `_amendment_refusal`, it catches a fifth builder for free with
+    no further change here, and it cannot collide with any tool's own domain
+    error because no tool outside tool_budget.py has a reason to know that
+    key exists. That is the fix this docstring's whole second half goes away
+    once it lands.
+    """
+    if not isinstance(payload, dict):
+        return False
+    error = payload.get("error")
+    detail = payload.get("detail")
+    return isinstance(error, str) and bool(error) and isinstance(detail, str) and bool(detail)
 
 
 def _close_steps(steps: list[dict]) -> None:
@@ -222,15 +304,14 @@ async def _run_turn(
                 # blocked. Relabelling it says what actually happened, and is
                 # the most useful line in the expander when a turn goes wide:
                 # it marks the exact point the agent stopped being allowed to
-                # gather more. Keyed on the error string tool_budget._refusal
-                # returns, not on a zero duration, which would also match a
-                # genuinely instant call.
+                # gather more. Detected by response SHAPE via
+                # _is_budget_refusal, not by a zero duration (which would also
+                # match a genuinely instant call) and not by any one refusal's
+                # "error" string (see that function's docstring for why, and
+                # for the one refusal shape it cannot safely catch).
                 payload = response.response
-                if (
-                    isinstance(payload, dict)
-                    and payload.get("error") == "tool_call_budget_exhausted"
-                ):
-                    step["label"] = f"{step['label']}: refused, turn budget reached"
+                if _is_budget_refusal(payload):
+                    step["label"] = f"{step['label']}: refused by the tool-call gate"
                     step["kind"] = _REFUSED_KIND
                     step["refused"] = True
 
@@ -266,7 +347,16 @@ async def _run_turn(
 
 # Filename extension -> (Streamlit code language, download MIME type). The
 # artefact's own format string drives both, so a fourth Canvas format needs one
-# entry here rather than a new branch.
+# entry here rather than a new branch. Same staleness shape as
+# _STEP_LABELS/_STEP_COLOURS above (a fixed copy of an enum that lives in
+# another module - canvas.OutputFormat), but with a softer failure: `.get(fmt,
+# "text/plain")` below means a forgotten fourth format downloads with the
+# wrong MIME type rather than crashing or rendering as raw internal text, so
+# it is easy to miss in a demo. tests/test_ui_refusal_display.py checks this
+# dict's keys against canvas.OutputFormat's actual Literal args for the same
+# reason it checks _STEP_LABELS/_STEP_COLOURS against the registered tool
+# list, rather than fixing the fallback here - a wrong-but-present MIME type
+# is a real, if minor, defect worth a failing test, not a silent default.
 _ARTEFACT_MIME = {"markdown": "text/markdown", "html": "text/html", "code": "text/plain"}
 
 
