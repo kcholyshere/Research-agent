@@ -84,7 +84,7 @@ async def test_get_financial_data_bounds_both_connect_and_read_timeout() -> None
         patch.object(financial_data, "streamablehttp_client", _fake_streamablehttp_client),
         patch.object(financial_data, "ClientSession", _FakeClientSession),
     ):
-        result = await financial_data.get_financial_data("stocks")
+        result = await financial_data.get_financial_data("the current price of Bitcoin", "stocks")
 
     # Sanity check the fake path was actually exercised end to end, so a typo
     # that made the patch a no-op does not read as a silent pass.

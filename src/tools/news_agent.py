@@ -53,6 +53,8 @@ from google.adk.agents.invocation_context import InvocationContext
 from google.adk.agents.remote_a2a_agent import RemoteA2aAgent
 from google.adk.events.event import Event
 from google.adk.tools.agent_tool import AgentTool
+
+from src.tools.fact_tag import FactTaggedAgentTool
 from google.genai import types
 
 from src import config
@@ -272,7 +274,12 @@ news_remote_agent = _ReachableRemoteA2aAgent(
     timeout=config.NEWS_AGENT_TIMEOUT_S,
 )
 
-news_agent_tool = AgentTool(agent=news_remote_agent)
+# FactTaggedAgentTool rather than AgentTool, for the same reason web_search.py
+# uses it: the declared-plan gate needs to know which declared fact a call is
+# serving and the callback context cannot tell it (see src/tools/fact_tag.py).
+# `tool.name` is untouched, so NEWS_AGENT_TOOL_NAME below still reads back
+# `news_agent`.
+news_agent_tool = FactTaggedAgentTool(agent=news_remote_agent)
 
 # The name research_agent will actually see, and therefore the name that appears
 # in an event's `call.name`. Read off the constructed tool rather than written as

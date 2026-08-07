@@ -168,6 +168,15 @@ def reset_turn_state(callback_context: CallbackContext) -> None:
     # reason this line lives on the same hook as that one rather than on
     # something that only fires once per session.
     state[tool_budget.STATE_KEY_DECLARED_SOURCES] = []
+    # The fact-level half of the same plan, and the record of which fact each
+    # evidence call served (2026-08-07, audit findings 3 and 4). Both are
+    # turn-scoped for exactly the reason the line above is: a fact plan
+    # surviving into the next turn would gate that turn's calls against the
+    # previous question's facts, and every one of them would be refused as
+    # not-in-the-plan. The call record surviving would be worse still - it
+    # would lock sources against facts the new question never declared.
+    state[tool_budget.STATE_KEY_DECLARED_FACTS] = {}
+    state[tool_budget.STATE_KEY_FACT_CALLS] = {}
     # Deliberately NOT reset here: token_budget.STATE_KEY. It is the one
     # counter in this system that is session-scoped rather than turn-scoped,
     # and clearing it on this hook - the hook that exists to make things

@@ -59,7 +59,7 @@ def _search_blocking(query: str) -> list[dict]:
     return [{"text": doc.page_content, **doc.metadata} for doc in docs]
 
 
-async def search_documents(query: str) -> list[dict]:
+async def search_documents(fact: str, query: str) -> list[dict]:
     """Search the private knowledge base for passages relevant to the query.
 
     The knowledge base holds one corpus: the International Finance Corporation
@@ -82,6 +82,9 @@ async def search_documents(query: str) -> list[dict]:
     subject tells you nothing - decide from this description instead.
 
     Args:
+        fact: The fact from your declared plan (declare_plan) that this call
+            is gathering, copied exactly as you wrote it there. The declared
+            source for that fact must be this tool, or the call is refused.
         query: A natural-language question or search phrase.
 
     Returns:

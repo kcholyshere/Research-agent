@@ -19,6 +19,7 @@ from google.genai import types as genai_types
 from langfuse import get_client, propagate_attributes
 
 from src import config
+from src.research_agent import tool_budget
 from src.research_agent.agent import research_agent, root_agent  # instruments ADK on import, see agent.py
 from src.research_agent.critique import CRITIQUE_AGENT_NAME
 
@@ -85,60 +86,24 @@ _HIDDEN_STEPS = frozenset({"exit_loop"})
 def _is_budget_refusal(payload: object) -> bool:
     """Whether a tool response is one of tool_budget.enforce_tool_budget's own refusals.
 
-    agent_docs/audit.md finding 12: the previous check compared `payload.get
-    ("error")` against the single literal "tool_call_budget_exhausted" -
-    `_refusal`'s own string, and only that one. `tool_budget.py` has since
-    grown two more refusal builders (`_gap_refusal`, `_plan_refusal`), each
-    with its own "error" value the old check never learned, so a report_gap-
-    or declared-plan-refused call rendered as an ordinary, successful,
-    instant tool call - exactly the misleading reading the relabelling this
-    function feeds exists to prevent. Naming a third string here would just
-    reset the same trap for a fifth refusal shape, so this checks the SHAPE
-    those three builders share instead of any one of their values:
+    agent_docs/audit.md finding 12: the check here used to compare
+    `payload.get("error")` against the single literal
+    "tool_call_budget_exhausted" - `_refusal`'s own string, and only that
+    one. Two more refusal builders had been added the same day, each with its
+    own "error" value this never learned, so a report_gap- or plan-refused
+    call rendered as an ordinary, successful, instant tool call. Naming the
+    missing strings would have reset the same trap for whoever adds a fifth.
 
-        {"error": <non-empty str>, "detail": <non-empty str>}
-
-    That pair is specific to `_gap_refusal`, `_plan_refusal` and `_refusal`
-    (tool_budget.py) - nothing else in this codebase returns both keys
-    together. `get_financial_data`'s own domain error (financial_data.py)
-    also uses "error", but pairs it with "source", never "detail".
-    `search_documents`'s own domain error (document_search.py) is wrapped in
-    a LIST, not a dict, so `isinstance(payload, dict)` rules it out before
-    the key check runs at all. Verified by reading both modules, not assumed.
-
-    What this does NOT catch: `_amendment_refusal`, tool_budget.py's fourth
-    refusal builder, returns `{"status": "error", "detail": <str>}` - no
-    "error" key at all. That exact shape is ALSO what `declare_plan`'s own
-    input-validation error returns (declare_plan.py) and what `create_canvas`'s
-    own input-validation error returns (canvas.py) for a malformed request.
-    All three are indistinguishable by payload shape alone, because
-    tool_budget.py and the two tools' own validation happen to have reached
-    for the same `{"status": "error", "detail": ...}` convention
-    independently. Catching "status": "error" generically here would relabel
-    two genuine domain errors (a malformed declare_plan or create_canvas
-    call, which DID run and reported its own mistake) as a budget refusal
-    (which never ran) - a new mislabelling of exactly the kind this function
-    exists to stop, just aimed at the other two tools instead. So a plan
-    amendment tool_budget refuses is left showing as an ordinary declare_plan
-    call rather than guessed at.
-
-    The clean fix is in tool_budget.py, not here: add one shared marker key -
-    e.g. `"refused_by": "tool_budget"` - to all FOUR refusal builders
-    (`_gap_refusal`, `_plan_refusal`, `_refusal`, `_amendment_refusal`),
-    alongside their existing "error"/"status"/"detail" keys (additive, so the
-    text the model reads is unchanged). This function then collapses to
-    `payload.get("refused_by") == "tool_budget"`: it catches all four,
-    including `_amendment_refusal`, it catches a fifth builder for free with
-    no further change here, and it cannot collide with any tool's own domain
-    error because no tool outside tool_budget.py has a reason to know that
-    key exists. That is the fix this docstring's whole second half goes away
-    once it lands.
+    So this matches a marker key that every refusal in `tool_budget.py`
+    carries and nothing else does, rather than any of their values. It picks
+    up a new refusal builder for free, and it cannot collide with a tool's
+    own domain error: `get_financial_data` and `search_documents` both return
+    an "error" of their own, and `declare_plan` and `create_canvas` both
+    return `{"status": "error", "detail": ...}` on a malformed call - which
+    is byte-for-byte what `_amendment_refusal` returns too. No payload shape
+    can separate those; only a marker can, which is why the marker exists.
     """
-    if not isinstance(payload, dict):
-        return False
-    error = payload.get("error")
-    detail = payload.get("detail")
-    return isinstance(error, str) and bool(error) and isinstance(detail, str) and bool(detail)
+    return isinstance(payload, dict) and payload.get(tool_budget.REFUSAL_MARKER_KEY) == tool_budget.REFUSAL_MARKER
 
 
 def _close_steps(steps: list[dict]) -> None:

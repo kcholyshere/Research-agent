@@ -118,6 +118,47 @@ against no plan at all, and every evidence tool behaves exactly as it did
 before this gate existed. That is deliberate (see `declare_plan.py`) and its
 cost is real - skipping the declaration is a complete escape from the gate -
 so declaration uptake has to be read off every sweep, not assumed.
+
+## The gate became fact-level (2026-08-07)
+
+As first built, the third gate did less than ADR-0024 said it did. The 2026
+-08-06 audit, findings 3 and 4, found two holes, and both are closed here.
+
+`record_declared_plan` stored `sorted(set(sources))` and discarded `facts`
+entirely, so the gate could only ask "is this tool named anywhere in the
+plan". On any question with more than one fact that is nearly no constraint:
+a plan declaring `get_financial_data` for the BTC price and `web_search_agent`
+for background on an ETF approval let the price be answered from the web, and
+the gate saw a declared tool and allowed it. Every declared tool was legal for
+every fact.
+
+The fix could not be to read the missing signal, because it does not exist -
+`before_tool_callback` receives `(tool, args, tool_context)` and nothing in
+any of them says which fact a call is serving (see `src/tools/fact_tag.py`
+for what was checked in the installed ADK and why). So the binding is created
+instead: every evidence tool now takes a `fact` argument naming the declared
+fact it is gathering, and this module checks that fact's declared source
+against the tool being called. `report_gap(fact, source_checked)` already
+worked this way, so the convention is the project's own rather than new.
+
+The second hole was the amendment lock. It computed the sources being DROPPED
+and refused only those, so the model could keep an already-called source and
+ADD another - and `_amendment_refusal`'s own text told it to. That is exactly
+the "the right source came back empty, so try a different one" fallback step
+2 of the INSTRUCTION forbids, laundered through a legal-looking amendment.
+With fact-level state the lock can be precise instead of merely tight: an
+amendment may add entirely new facts with any source, and may still re-plan
+any fact that has not been executed yet, but a fact whose declared source has
+actually run is fixed and can be neither re-pointed nor given a second
+source. The remedy for that case is `report_gap`, which is what the refusal
+now says.
+
+What is still NOT enforced, stated because ADR-0024's original text
+overstating this is itself an audit finding: this disciplines execution, not
+planning judgement. A fact whose source is mis-declared from the outset and
+then dutifully executed passes every gate here, because nothing in this
+module knows which source SHOULD have been authoritative. That is routing's
+remaining ceiling and no gate can reach it.
 """
 
 from __future__ import annotations
@@ -186,10 +227,15 @@ MAX_TOOL_CALLS_PER_TURN = 5
 #
 # declare_plan added 2026-08-06: it gathers nothing either, for the same
 # reason create_canvas and report_gap don't count against the ceiling - see
-# this module's docstring, "declare_plan as a third, independent gate". NOTE:
-# schema.py's own OUTPUT_TOOLS is owned by the evaluation code, not this
-# change, and has not been updated here - it needs "declare_plan" added to it
-# too, or check_redundancy will fail every question that declares a plan.
+# this module's docstring, "declare_plan as a third, independent gate".
+#
+# What breaks if this and schema.py's copy drift apart is asymmetric, and
+# worth knowing before editing either. A tool added to schema.py only is
+# exempt from the redundancy metric but still counted against
+# MAX_TOOL_CALLS_PER_TURN, so a well-behaved turn is refused one call early.
+# A tool added here only is exempt from the ceiling but still lands in
+# tools_called, so every turn using it reads as a redundancy regression -
+# which is the false signal ADR-0016 was written about.
 OUTPUT_TOOLS: frozenset[str] = frozenset({"create_canvas", "report_gap", "declare_plan"})
 
 # Session-state key holding {tool_name: calls_so_far} for the current turn.
@@ -220,9 +266,68 @@ STATE_KEY_GAP_REPORTED = "report_gap_called_this_turn"
 # in critique.reset_turn_state.
 STATE_KEY_DECLARED_SOURCES = "declared_plan_sources_this_turn"
 
+# Session-state key holding this turn's plan at FACT level: a mapping of
+# normalised fact text to the sorted list of tool names declared authoritative
+# for it. Added 2026-08-07 for audit finding 3, which found the flat source
+# set above enforces something weaker than ADR-0024 claimed - with two facts
+# and two sources, every declared tool was legal for every fact, so a price
+# declared to get_financial_data could be answered from web_search_agent and
+# the gate saw nothing wrong.
+#
+# STATE_KEY_DECLARED_SOURCES is kept alongside it rather than replaced. It is
+# still what decides the cheap "this tool is in no part of the plan at all"
+# refusal, it is what makes the gate fail open when no plan exists, and its
+# absence is the condition every other consumer already reads.
+STATE_KEY_DECLARED_FACTS = "declared_plan_facts_this_turn"
+
+# Session-state key holding {normalised fact: sorted list of tool names
+# actually called for it} this turn. This is what makes the amendment lock
+# precise: audit finding 4 found the old lock refused only DROPPING an
+# already-called source, so the model could keep it and ADD another, which is
+# exactly the substitute-another-source fallback step 2 of the instruction
+# forbids - and _amendment_refusal's own text spelled the move out. Knowing
+# which fact each call served is what lets an amendment add genuinely new
+# facts freely while refusing any change to a fact whose source has run.
+STATE_KEY_FACT_CALLS = "declared_plan_fact_calls_this_turn"
+
+# The argument every evidence tool now carries, naming which declared fact
+# the call is serving. Imported by nothing here on purpose - the two plain
+# function tools spell it in their signatures and src/tools/fact_tag.py puts
+# it into the two AgentTool declarations, so this is the reader's copy.
+FACT_ARG = "fact"
+
+# Every refusal this module returns carries this key. Added 2026-08-07 for
+# audit finding 12: src/ui/app.py used to relabel refused tool calls by
+# matching one specific `error` value, so the two shapes added after it were
+# rendered as successful instant calls - a blocked web search showing as
+# "Searching the web for 0.0s" in green. Re-enumerating the error values
+# there would have reset the same trap for whoever adds a fifth.
+#
+# A marker key rather than a uniform response shape, because the four
+# refusals are not interchangeable to the MODEL: three are tool errors it
+# should act on ("error"/"detail") and _amendment_refusal is a rejected
+# declare_plan call, which must keep declare_plan's own {"status": "error"}
+# contract or the model reads it as a different kind of failure. The marker
+# is additive to both shapes and invisible in neither.
+REFUSAL_MARKER_KEY = "refused_by"
+REFUSAL_MARKER = "tool_budget"
+
+
+def _normalise_fact(fact: str) -> str:
+    """Fold a fact string to the form the gate matches on.
+
+    Case and whitespace only - nothing fuzzier. A model that paraphrases its
+    own declared fact gets a refusal naming the declared facts verbatim,
+    which it can correct in one call; fuzzy matching would instead bind the
+    call to whichever fact scored highest and enforce the wrong source
+    silently, which is the failure this whole gate exists to stop.
+    """
+    return " ".join(fact.casefold().split())
+
 
 def _gap_refusal() -> dict[str, Any]:
     return {
+        REFUSAL_MARKER_KEY: REFUSAL_MARKER,
         "error": "evidence_gathering_ended_by_report_gap",
         "detail": (
             "report_gap has already been called this turn. report_gap is the last "
@@ -238,18 +343,29 @@ def _gap_refusal() -> dict[str, Any]:
     }
 
 
-def _amendment_refusal(locked: list[str]) -> dict[str, Any]:
-    locked_text = ", ".join(locked)
+def _amendment_refusal(locked: dict[str, list[str]]) -> dict[str, Any]:
+    """Refuse an amendment that re-plans a fact whose declared source has run.
+
+    `locked` maps each such fact to the tool name(s) already called for it.
+    The wording has to keep the model from reading this as "declare_plan is
+    broken": the amendment path is legitimate and stays open for every fact
+    that has not been executed yet, and for facts it has not named before.
+    """
+    parts = [f"{fact!r} (already served by {', '.join(tools)})" for fact, tools in sorted(locked.items())]
+    locked_text = "; ".join(parts)
     return {
+        REFUSAL_MARKER_KEY: REFUSAL_MARKER,
         "status": "error",
         "detail": (
-            f"This plan was not recorded: {locked_text} {'was' if len(locked) == 1 else 'were'} "
-            "declared as a source and has already been called this turn, and an amendment "
-            "cannot drop a source once it has actually run. Declaring the wrong source before "
-            f"calling it is a mis-plan and can be corrected; {locked_text} coming back without "
-            "the fact is a gap, not a mis-plan - call report_gap for it instead of re-declaring "
-            f"away from it. Keep {locked_text} in `sources` and call declare_plan again, or "
-            "call report_gap now."
+            f"This plan was not recorded. It changes the source for {len(locked)} fact(s) whose "
+            f"declared source has already been called this turn: {locked_text}. Once a fact's "
+            "declared source has actually run, that pairing is fixed - it can be neither dropped "
+            "nor added to. Declaring the wrong source BEFORE calling it is a mis-plan and can "
+            "still be corrected freely, and you may still add entirely new facts with any source. "
+            "But a source that came back without the fact is a gap, not a mis-plan: call "
+            "report_gap with that fact and that source instead of re-planning around it. To "
+            "amend, re-send this plan with each fact above keeping exactly the source that "
+            "already ran, or call report_gap now."
         ),
     }
 
@@ -257,6 +373,7 @@ def _amendment_refusal(locked: list[str]) -> dict[str, Any]:
 def _plan_refusal(tool_name: str, declared: list[str]) -> dict[str, Any]:
     declared_text = ", ".join(declared)
     return {
+        REFUSAL_MARKER_KEY: REFUSAL_MARKER,
         "error": "tool_not_in_declared_plan",
         "detail": (
             f"{tool_name} was not declared as a source in your plan (declare_plan), so this "
@@ -271,9 +388,58 @@ def _plan_refusal(tool_name: str, declared: list[str]) -> dict[str, Any]:
     }
 
 
+def _fact_missing_refusal(tool_name: str, declared_facts: list[str]) -> dict[str, Any]:
+    """Refuse a call whose `fact` names nothing in the declared plan.
+
+    Covers both an absent argument and one that does not match. Listing the
+    declared facts verbatim is the whole remedy: the model wrote them, so
+    seeing them back is enough to copy one exactly, and that is cheaper than
+    any matching heuristic that could bind the call to the wrong fact.
+    """
+    facts_text = "; ".join(repr(fact) for fact in declared_facts)
+    return {
+        REFUSAL_MARKER_KEY: REFUSAL_MARKER,
+        "error": "fact_not_in_declared_plan",
+        "detail": (
+            f"This call to {tool_name} was refused because its `{FACT_ARG}` argument does not "
+            f"match any fact in the plan you declared this turn. The facts you declared are: "
+            f"{facts_text}. Call again with `{FACT_ARG}` copied exactly from that list. If this "
+            "call is for something you did not plan for, that is a new fact - call declare_plan "
+            "again to add it, with the source that is authoritative for it, and then make this "
+            "call."
+        ),
+    }
+
+
+def _fact_source_refusal(tool_name: str, fact: str, declared_sources: list[str]) -> dict[str, Any]:
+    """Refuse a call to a tool that is not the declared source FOR THIS FACT.
+
+    This is the refusal audit finding 3 exists for: the tool may well be
+    declared somewhere in the plan, just not for the fact it is being called
+    with, and the flat source set could not see the difference.
+    """
+    sources_text = ", ".join(declared_sources)
+    return {
+        REFUSAL_MARKER_KEY: REFUSAL_MARKER,
+        "error": "tool_not_the_declared_source_for_this_fact",
+        "detail": (
+            f"This call to {tool_name} was refused. Your plan declared {sources_text} as the "
+            f"authoritative source for {fact!r}, not {tool_name}. {tool_name} may be declared "
+            "for a different fact in the same plan, but a source is authoritative per fact, not "
+            f"for the whole question. Call {sources_text} for this fact instead. If "
+            f"{sources_text} has already been called for it and did not contain the fact, that "
+            "is the gap: call report_gap with the fact and that source, then write the prose "
+            "decline - do not substitute a different source. If your plan genuinely named the "
+            f"wrong source for {fact!r} and you have not yet called it, call declare_plan again "
+            "to amend the plan before trying this tool."
+        ),
+    }
+
+
 def _refusal(used: int, breakdown: dict[str, int]) -> dict[str, Any]:
     spent = ", ".join(f"{name} x{n}" for name, n in sorted(breakdown.items()))
     return {
+        REFUSAL_MARKER_KEY: REFUSAL_MARKER,
         "error": "tool_call_budget_exhausted",
         "detail": (
             f"You have used all {used} evidence-gathering tool calls available for this "
@@ -337,15 +503,27 @@ def enforce_tool_budget(
     # record_declared_plan (called from agent.py's after_tool_callback) never
     # sees this attempt because there is no tool_response for it.
     if tool.name == "declare_plan":
-        prior = tool_context.state.get(STATE_KEY_DECLARED_SOURCES) or []
-        if prior:
-            counts = tool_context.state.get(STATE_KEY) or {}
-            already_called = {name for name in prior if counts.get(name, 0) > 0}
+        executed = tool_context.state.get(STATE_KEY_FACT_CALLS) or {}
+        if executed:
+            new_facts = args.get("facts")
             new_sources = args.get("sources")
-            if isinstance(new_sources, list):
-                dropped = sorted(already_called - set(new_sources))
-                if dropped:
-                    return _amendment_refusal(dropped)
+            if isinstance(new_facts, list) and isinstance(new_sources, list):
+                # Only compare facts that have actually been served. A fact
+                # still unexecuted may be re-planned freely (the mis-plan
+                # correction step 2 of the INSTRUCTION explicitly sanctions),
+                # and a fact absent from `executed` entirely is a new one,
+                # which an amendment is always allowed to add.
+                proposed: dict[str, set[str]] = {}
+                for fact, source in zip(new_facts, new_sources):
+                    if isinstance(fact, str) and isinstance(source, str):
+                        proposed.setdefault(_normalise_fact(fact), set()).add(source)
+                locked = {
+                    fact: sorted(called)
+                    for fact, called in executed.items()
+                    if proposed.get(fact, set()) != set(called)
+                }
+                if locked:
+                    return _amendment_refusal(locked)
         return None
 
     # report_gap sets the second gate and is otherwise unbounded (a
@@ -381,12 +559,45 @@ def enforce_tool_budget(
     if declared and tool.name not in declared:
         return _plan_refusal(tool.name, declared)
 
+    # The fact-level half of the same gate (audit finding 3). Runs only when a
+    # plan exists, so the fail-open property above is unchanged: a turn that
+    # never declared is never asked which fact it is serving.
+    #
+    # Order matters. The source-set check above answers "is this tool in the
+    # plan at all", which is the cheaper and more obvious mistake, and its
+    # refusal names the whole declared set. Only once the tool is somewhere in
+    # the plan is it worth telling the model it is in the wrong PART of it -
+    # the two refusals say different things and swapping them would answer a
+    # question the model was not asking.
+    declared_facts: dict[str, dict[str, Any]] = tool_context.state.get(STATE_KEY_DECLARED_FACTS) or {}
+    if declared_facts:
+        fact = args.get(FACT_ARG)
+        entry = declared_facts.get(_normalise_fact(fact)) if isinstance(fact, str) else None
+        if not entry:
+            return _fact_missing_refusal(
+                tool.name, [e["text"] for e in declared_facts.values()]
+            )
+        if tool.name not in entry["sources"]:
+            return _fact_source_refusal(tool.name, entry["text"], entry["sources"])
+
     counts = dict(tool_context.state.get(STATE_KEY) or {})
     used = sum(counts.values())
     if used >= MAX_TOOL_CALLS_PER_TURN:
         return _refusal(used, counts)
     counts[tool.name] = counts.get(tool.name, 0) + 1
     tool_context.state[STATE_KEY] = counts
+
+    # Record which fact this call served, for the amendment lock above. Only
+    # ALLOWED calls are recorded, and only past the ceiling check, so a
+    # refused call never locks a fact's source - a fact whose only attempt was
+    # refused is still freely re-plannable, which is right: nothing was
+    # actually consulted for it.
+    if declared_facts:
+        fact_calls = {name: list(tools) for name, tools in (tool_context.state.get(STATE_KEY_FACT_CALLS) or {}).items()}
+        served = fact_calls.setdefault(_normalise_fact(args[FACT_ARG]), [])
+        if tool.name not in served:
+            served.append(tool.name)
+        tool_context.state[STATE_KEY_FACT_CALLS] = fact_calls
     return None
 
 
@@ -412,6 +623,32 @@ def record_declared_plan(tool_context: ToolContext, tool_response: dict[str, Any
     if not isinstance(tool_response, dict) or tool_response.get("status") != "ok":
         return
     sources = tool_response.get("sources")
-    if not isinstance(sources, list):
+    facts = tool_response.get("facts")
+    if not isinstance(sources, list) or not isinstance(facts, list):
         return
     tool_context.state[STATE_KEY_DECLARED_SOURCES] = sorted({s for s in sources if isinstance(s, str)})
+
+    # The fact-level plan (audit finding 3). `facts` and `sources` are
+    # parallel lists that declare_plan has already validated as equal length,
+    # so zip cannot silently truncate a real plan here - but it is read
+    # defensively anyway, because this runs on whatever the tool returned and
+    # a malformed plan must leave the gate coherent rather than half-written.
+    #
+    # A fact is allowed to name more than one source. declare_plan's own
+    # contract is one source per fact, but a model can legitimately list the
+    # same fact twice with different sources when a fact genuinely needs
+    # combining evidence (step 1 of the INSTRUCTION sanctions exactly that),
+    # and collapsing those to one would refuse the second call for a plan the
+    # tool itself accepted.
+    # Each entry keeps the fact's ORIGINAL text alongside its sources. The
+    # key has to be the normalised form so a call can match it, but a refusal
+    # has to quote the model its own words back - echoing "btc price" at a
+    # model that wrote "BTC price" invites it to "fix" the casing instead of
+    # copying the fact.
+    fact_plan: dict[str, dict[str, Any]] = {}
+    for fact, source in zip(facts, sources):
+        if isinstance(fact, str) and isinstance(source, str):
+            entry = fact_plan.setdefault(_normalise_fact(fact), {"text": fact, "sources": []})
+            if source not in entry["sources"]:
+                entry["sources"].append(source)
+    tool_context.state[STATE_KEY_DECLARED_FACTS] = fact_plan

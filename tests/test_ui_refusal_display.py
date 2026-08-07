@@ -81,7 +81,16 @@ from src.ui import app
 # this file's docstring and `app._is_budget_refusal`'s own docstring for why
 # that shape cannot be caught without a tool_budget.py change, and update
 # both docstrings to match.
-_KNOWN_REFUSAL_BUILDERS = frozenset({"_gap_refusal", "_plan_refusal", "_refusal", "_amendment_refusal"})
+_KNOWN_REFUSAL_BUILDERS = frozenset(
+    {
+        "_gap_refusal",
+        "_plan_refusal",
+        "_refusal",
+        "_amendment_refusal",
+        "_fact_missing_refusal",
+        "_fact_source_refusal",
+    }
+)
 
 
 def test_tool_budget_refusal_builders_are_pinned() -> None:
@@ -115,21 +124,26 @@ def test_numeric_ceiling_refusal_is_recognised() -> None:
     )
 
 
-def test_amendment_refusal_is_a_known_uncaught_gap() -> None:
-    """The one shape `_is_budget_refusal` cannot safely catch, pinned on purpose.
+def test_amendment_refusal_is_recognised_too() -> None:
+    """The shape no payload inspection could ever have caught.
 
-    `_amendment_refusal` returns `{"status": "error", "detail": ...}` - no
-    "error" key at all - which is the exact same shape as `declare_plan`'s and
-    `create_canvas`'s own input-validation errors (see the two tests below).
-    Catching "status": "error" generically would mislabel those two as budget
-    refusals, which is the mislabelling this whole fix exists to prevent, just
-    aimed at a different pair of tools. So this is left uncaught rather than
-    guessed at - see `app._is_budget_refusal`'s docstring for the tool_budget.py
-    change (a shared marker key on all four builders) that would close this
-    cleanly. If that change lands, this assertion should flip to `assert
-    app._is_budget_refusal(...)` and the docstring above should be trimmed.
+    `_amendment_refusal` returns `{"status": "error", "detail": ...}`, which
+    is byte-for-byte what `declare_plan`'s and `create_canvas`'s own
+    input-validation errors return (see the tests below). While
+    `_is_budget_refusal` matched on payload shape, catching this one would
+    have meant mislabelling those two genuine domain errors as budget
+    refusals - the same mislabelling this fix exists to prevent, aimed at a
+    different pair of tools - so it was deliberately left uncaught. The
+    marker key added to every builder in tool_budget.py is what closed it,
+    and this assertion flipping from `not` to plain is the signal that it
+    landed.
     """
-    assert not app._is_budget_refusal(tool_budget._amendment_refusal(["search_documents"]))
+    refusal = tool_budget._amendment_refusal({"ifc's fy24 net income": ["search_documents"]})
+    assert app._is_budget_refusal(refusal)
+    # The model-facing contract is unchanged: declare_plan's caller still
+    # reads {"status": "error", "detail": ...}. The marker is additive.
+    assert refusal["status"] == "error"
+    assert refusal["detail"]
 
 
 # --- 3: real domain errors and real ordinary results, not stand-ins ---------
@@ -185,7 +199,7 @@ async def test_financial_data_own_domain_error_is_not_mislabelled() -> None:
     An unknown category is rejected before any MCP network call, so this is
     safe to call directly rather than needing a live mcp-fetch service.
     """
-    result = await get_financial_data("not-a-real-category")
+    result = await get_financial_data("the current price of Bitcoin", "not-a-real-category")
     assert "error" in result
     assert "detail" not in result
     assert not app._is_budget_refusal(result)
