@@ -202,3 +202,68 @@ def test_section_with_no_provenance_anywhere_stays_symmetric() -> None:
 
     assert sections[0]["start_page"] is None
     assert sections[0]["end_page"] is None
+
+
+# --- Oversized tables are split by row, keeping every part self-describing ---
+
+_TABLE_HEADER = "| Member | Amount paid |"
+_TABLE_SEPARATOR = "|--------|-------------|"
+
+
+def _wide_table(rows: int, row_width: int = 200) -> str:
+    body = [f"| {'Country' + str(i):<{row_width}} | {i * 111:<20} |" for i in range(rows)]
+    return "\n".join([_TABLE_HEADER, _TABLE_SEPARATOR, *body])
+
+
+def test_a_table_that_fits_is_not_split() -> None:
+    """The original design decision still holds wherever it can."""
+    from src.ingestion.chunk import _split_table_text
+
+    text = _wide_table(3)
+    assert _split_table_text(text, 6000) == [text]
+
+
+def test_every_part_of_a_split_table_repeats_the_header() -> None:
+    """This is what makes splitting better than truncating rather than worse.
+
+    A part carrying bare `| value | value |` rows with no column names is less
+    retrievable than the truncated original, not more - so the header block is
+    the whole point of splitting by row instead of by character.
+    """
+    from src.ingestion.chunk import _split_table_text
+
+    parts = _split_table_text(_wide_table(120), 6000)
+
+    assert len(parts) > 1, "a 120-row wide table should not fit in 6000 characters"
+    for part in parts:
+        assert part.startswith(_TABLE_HEADER), "a part without column names is barely retrievable"
+        assert _TABLE_SEPARATOR in part
+
+
+def test_splitting_loses_no_rows_and_duplicates_none() -> None:
+    from src.ingestion.chunk import _split_table_text
+
+    original = _wide_table(120)
+    parts = _split_table_text(original, 6000)
+
+    body = [line for line in original.split("\n")[2:]]
+    recovered = [line for part in parts for line in part.split("\n")[2:]]
+    assert recovered == body, "row order and count must survive the split exactly"
+
+
+def test_no_row_is_ever_cut_in_half() -> None:
+    """A malformed row would be worse than an oversized part, so the split never cuts one."""
+    from src.ingestion.chunk import _split_table_text
+
+    for part in _split_table_text(_wide_table(120), 6000):
+        for line in part.split("\n"):
+            assert line.startswith("|") and line.endswith("|"), f"cut mid-row: {line!r}"
+
+
+def test_text_with_no_separator_row_still_degrades_rather_than_raising() -> None:
+    """Docling occasionally emits a block that is not a markdown table at all."""
+    from src.ingestion.chunk import _split_table_text
+
+    parts = _split_table_text("just a long run of prose " * 500, 6000)
+    assert len(parts) > 1
+    assert "".join(parts) == "just a long run of prose " * 500
