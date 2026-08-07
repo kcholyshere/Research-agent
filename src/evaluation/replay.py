@@ -82,6 +82,31 @@ that flag, and the loop would run to `max_iterations` on every replayed turn
 regardless of what the critique agent actually decided - a much worse
 failure than the noisy fixture entries excluding it avoids.
 
+`schema.py`'s `OUTPUT_TOOLS` (`create_canvas`, `report_gap`, `declare_plan`)
+is excluded for a different reason, found by the 2026-08-07 audit (finding
+6). `report_gap` and `declare_plan` are pure local functions with no
+external I/O at all. `create_canvas` does write an artefact to disk, but
+nothing about ANY of the three varies with the live world the way a web
+search or a market price does, so recording and replaying them buys nothing
+- they are not what "pins the world" refers to, and the assertions that read
+create_canvas's output (artefact/format/language) read it from the tool's
+function-response payload either way, live or replayed, so a cached artefact
+would only break those assertions, never fix a flaky one. Worse, patching
+`declare_plan` and `report_gap` at all was actively harmful: none of the 15
+fixture files recorded before ADR-0023/0024 existed contain an entry for
+either, so a replay run's very first tool call (`declare_plan`, now that
+every turn opens with one) hit `_FixtureStore.handle` with zero recorded
+entries for that tool name and raised `FixtureMissError` immediately -
+`run_eval.py --mode replay` failed on every volatile question before a
+single evidence tool ever ran. Importing `schema.NON_EVIDENCE_TOOLS`
+(`CONTROL_TOOLS | OUTPUT_TOOLS`) rather than `CONTROL_TOOLS` alone fixes this
+the same way `exit_loop` was already fixed: these three tools now fall
+through to the real function unconditionally, in every mode, exactly like
+`exit_loop` does - `declare_plan` and `report_gap` write real session state
+`enforce_tool_budget` depends on, and a cached replay of either would be the
+same class of bug the `exit_loop` case above describes, one level up: the
+turn's gating state would silently stop matching what the model just did.
+
 ## Fixture file format
 
 A single JSON array of `{"tool": str, "args": {...}, "response": ...}"`
@@ -93,10 +118,53 @@ one new question's fixtures does not clobber every other question's.
 
 Argument normalisation for the lookup key is `json.dumps(args,
 sort_keys=True)` - recursive by construction, so nested dict argument values
-are order-independent too, not just the top level. Every recorded entry is a
-single-use slot: once served it is marked consumed, so a repeated call gets
-the next recorded response rather than replaying the first one forever, and
-recorded order is preserved throughout.
+are order-independent too, not just the top level - with one deliberate
+exception: `fact` (ADR-0027) is stripped before the key is built. See
+"`fact` is excluded from the lookup key" below for why. Every recorded entry
+is a single-use slot: once served it is marked consumed, so a repeated call
+gets the next recorded response rather than replaying the first one forever,
+and recorded order is preserved throughout.
+
+## `fact` is excluded from the lookup key (2026-08-07)
+
+Every evidence tool call now carries a `fact` argument (ADR-0027,
+`src/tools/fact_tag.py`), addressed to `tool_budget.enforce_tool_budget`'s
+gate, not to the tool itself: `search_documents` and `get_financial_data`
+both take `fact` as a parameter and neither reads it anywhere in their real
+logic (verified by reading both - `search_documents` builds its FAISS query
+from `query` alone, `get_financial_data` picks its Yahoo Finance URL from
+`category` alone). It is exactly the kind of thing this module's own fallback
+rule already exists to see past: the planner's phrasing of a fact is
+free-formed prose, generated fresh on every run, so it varies between the
+recording run and any later replay run exactly the way a `search_documents`
+`query` already does - measured directly against this repo's own fixtures,
+`get_financial_data` calls before ADR-0027 recorded a small, closed
+vocabulary for `category` ("crypto", "currencies", "stocks") that DOES repeat
+identically across runs and therefore exact-matched.
+
+Leaving `fact` in the key does not reopen `FixtureMissError` - the same-tool
+fallback ignores the whole arg key already, so a call whose `fact` text
+differs still gets served, just via the fallback path rather than an exact
+match. But it silently degrades every `get_financial_data` and
+`search_documents` call whose OTHER arguments would otherwise have matched
+exactly (the `category` case above) into an inexact match, for a value the
+real tool never consults - trading a true "this call's real inputs recur" for
+a false "this call's real inputs merely resemble a recorded one" on every
+single financial-data lookup, purely because a prose label attached for the
+gate's benefit happened to be worded slightly differently between recording
+and replay.
+
+So `_normalise_args` drops `fact` before hashing, on both sides of the
+comparison (the recorded slot's key, built once at store construction, and
+the live call's key, built per lookup) - the tool's OWN inputs decide whether
+two calls are the same call; the fact label attached for an unrelated gate
+does not get a vote. This is deliberately narrower than "ignore any argument
+that looks free-text": `query` stays in the key precisely because it is the
+tool's real input and varying it IS a different call, even if the fallback
+usually absorbs the miss anyway. The one thing this cannot do is restore an
+exact match for `search_documents`, whose `query` remains free text
+regardless of `fact` - only `get_financial_data`'s small, closed `category`
+vocabulary benefits in practice.
 
 ## Lookup: exact first, then same-tool - and why the fallback is not cheating
 
@@ -198,7 +266,7 @@ from typing import Any, Literal
 from google.adk.agents import BaseAgent, LlmAgent
 from google.adk.tools.agent_tool import AgentTool
 
-from src.evaluation.schema import CONTROL_TOOLS
+from src.evaluation.schema import NON_EVIDENCE_TOOLS
 
 FixtureMode = Literal["live", "record", "replay"]
 
@@ -243,6 +311,17 @@ class FixtureSession:
     inexact_matches: list[str] = field(default_factory=list)
 
 
+# The one argument this module deliberately drops before building a lookup
+# key - see the module docstring, "`fact` is excluded from the lookup key".
+# A local copy of the string rather than an import from src.tools.fact_tag or
+# src.research_agent.tool_budget, matching this project's own precedent:
+# tool_budget.py already keeps its own copy of the same literal rather than
+# importing fact_tag's, specifically so each consumer stays decoupled from
+# the others' module (that file's own comment: "Imported by nothing here on
+# purpose... this is the reader's copy").
+_FACT_ARG = "fact"
+
+
 def _normalise_args(args: dict[str, Any]) -> str:
     """Canonical string key for a call's arguments.
 
@@ -251,8 +330,17 @@ def _normalise_args(args: dict[str, Any]) -> str:
     guarantee argument order is stable across otherwise-identical calls.
     `default=str` is a defensive fallback only - every tool here is called
     with plain JSON-safe arguments (strings), so it should never trigger.
+
+    `fact` is dropped first: it is model-generated prose addressed to
+    tool_budget's gate, not one of the tool's real inputs (neither
+    search_documents nor get_financial_data reads it), and it varies between
+    a recording run and a replay run the same way a free-text search query
+    does - see the module docstring for the measured case this was costing
+    (get_financial_data's small, closed `category` vocabulary used to
+    exact-match before ADR-0027 added `fact` to every call).
     """
-    return json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
+    filtered = {key: value for key, value in args.items() if key != _FACT_ARG}
+    return json.dumps(filtered, sort_keys=True, ensure_ascii=False, default=str)
 
 
 def _load_fixture_file(path: Path) -> list[dict[str, Any]]:
@@ -484,12 +572,20 @@ def _patch_tools(agent: BaseAgent) -> list[Callable[[], None]]:
                 restorers.append(functools.partial(setattr, tool, "run_async", original_run_async))
             elif callable(tool):
                 name = getattr(tool, "__name__", None)
-                # See module docstring "What deliberately is NOT patched":
+                # See module docstring "What deliberately is NOT patched".
                 # exit_loop's real side effect on the live ToolContext must
                 # keep running every time, in every mode - a cached replay of
                 # its return value would never set actions.escalate, and the
                 # loop would silently stop honouring the critique agent.
-                if name is None or name in CONTROL_TOOLS:
+                # create_canvas/report_gap/declare_plan (schema.OUTPUT_TOOLS)
+                # are excluded for a related but distinct reason: they are
+                # pure local functions with no external I/O and nothing to
+                # record, and patching them at all is what made every
+                # pre-ADR-0023/0024 fixture immediately fixture-incomplete in
+                # replay mode (audit finding 6) - declare_plan's first call
+                # each turn had no recorded entry and aborted the run before
+                # any evidence tool ran.
+                if name is None or name in NON_EVIDENCE_TOOLS:
                     continue
                 original = tool
                 tools[index] = _make_function_wrapper(name, original)
