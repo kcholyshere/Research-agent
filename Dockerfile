@@ -18,9 +18,11 @@ WORKDIR /app
 # Dependencies before source, so editing src/ does not invalidate the layer that
 # resolves and installs ~180 packages. --frozen fails the build if uv.lock and
 # pyproject.toml have drifted apart rather than silently re-resolving, which is
-# the property that makes the image reproducible.
+# the property that makes the image reproducible. --no-dev drops the dev
+# dependency group (ADR-0026): uv installs default groups unless told not to,
+# and pytest has no business in a shipped image.
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen
+RUN uv sync --frozen --no-dev
 
 COPY src/ src/
 

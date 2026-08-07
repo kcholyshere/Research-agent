@@ -24,6 +24,7 @@ models/
 agent_docs/
 references/
 scripts/
+tests/
 *.md
 Dockerfile
 docker-compose.yml

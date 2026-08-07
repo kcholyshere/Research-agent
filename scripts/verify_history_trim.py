@@ -1,10 +1,13 @@
 """Manual verification for src/research_agent/history_trim.py (the ADR-0021
 follow-up: trim research_agent's resent history to the last N turns).
 
-Not a pytest suite, same reason scripts/verify_agent.py and
-scripts/verify_turn_timeout.py aren't (no tests/ directory - see
-verify_agent.py's docstring). Five things this script has to actually show,
-not just claim:
+Deliberately still a script and not a test, now that `tests/` exists: every
+check below needs live Vertex, and the module even calls
+`genai_client.get_client()` at import time, so it cannot be collected offline
+at all. What could usefully move into `tests/` is narrower than what this
+covers - `_opens_a_turn` and `trim_history` against hand-built
+`types.Content` lists - and that is not what this script is for. Five things
+it has to actually show, not just claim:
 
 1. The real llm_request.contents structure across a multi-turn session, and
    that the trim keeps whole turns (question, every tool call/response,

@@ -126,6 +126,17 @@ The harness scores routing, redundancy, citation, decline, content, artefact and
 wasted-cycle assertions deterministically, with no LLM judge - see ADR-0011 for
 why. Results and their interpretation live in `EVALUATION.md`.
 
+## Tests
+```bash
+uv run pytest                 # offline, hermetic, no Vertex/index/containers
+uv run pytest -m integration  # the live ones, needs Vertex and the compose stack
+```
+`tests/` holds one regression test per finding in the 2026-08-06 codebase audit,
+each written from that finding's own failure scenario. It covers deterministic
+things only - the tool gates, the bounds, the eval instrument. Whether the agent
+routes, declines or answers *well* is not a test question here and is measured
+by the evaluation harness below instead; see ADR-0026.
+
 ## Layout
 ```
 src/
@@ -152,6 +163,9 @@ src/
 ├── research_agent/history_trim.py <- keeps a turn from re-sending the whole chat
 ├── evaluation/                <- question set, runner, metrics, replay layer
 └── ui/app.py                  <- Streamlit chat UI over root_agent
+
+tests/                         <- audit regression suite, one test per finding
+scripts/                       <- manual verification, for what is not assertable
 ```
 
 Project tracking lives in `agent_docs/`: `TODOS.md` for the live checklist and

@@ -1,9 +1,11 @@
 """Manual verification script for the phase 1 + phase 2 + phase 4 agent flow.
 
-Not a pytest suite: an LLM's exact tool choice is too non-deterministic to
-assert on reliably, and this project has no tests/ directory yet (see
-CLAUDE.md - the capstone's focus is agent architecture, not RAG/eval
-engineering). Instead this drives the same InMemoryRunner path app.py uses
+Deliberately still a script and not a test, now that `tests/` exists: an
+LLM's exact tool choice is too non-deterministic to assert on reliably, so
+there is no assertion this could make that would not eventually flake.
+Measuring that behaviour is `src/evaluation/`'s job, over a question set and
+a scored sweep; this is the human eyeball in between. Instead this drives the
+same InMemoryRunner path app.py uses
 over a small, deliberately varied set of questions, and prints which tool(s)
 got called alongside each answer so a human can eyeball routing correctness.
 Closes three open TODOS.md items in one pass: two-tool flow verification,
