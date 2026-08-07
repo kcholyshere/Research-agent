@@ -11,7 +11,8 @@ before any run executes, turns that into one readable failure instead of many
 confusing ones.
 
 Deliberately scoped to what the SELECTED questions need, not "both services,
-always": `EvalQuestion.expected_routes` is already-loaded data by the time a
+always": `EvalQuestion.expected_routes` (and `acceptable_routes`, its
+alternative sets - see `needed_services`) is already-loaded data by the time a
 sweep starts (see run_eval.load_questions), so mapping FINANCIAL ->
 `mcp-fetch` and NEWS_AGENT -> `news-agent` costs nothing extra to compute and
 means a `--tags kb` smoke run is never blocked by a `news-agent` it will never
@@ -77,13 +78,33 @@ def needed_services(questions: list[EvalQuestion]) -> list[str]:
 
     Cheap: EvalQuestion.expected_routes is already-loaded data, not something
     that needs a live call to determine.
+
+    Unions `expected_routes` with EVERY alternative set in `acceptable_routes`
+    (audit.md finding 9), not `expected_routes` alone. `acceptable_routes`
+    holds whole alternative route sets that `metrics.check_routing` accepts as
+    equally correct substitutes (schema.py's own framing), and this function
+    runs before a single question has actually been asked - there is no way
+    to know in advance which of several equally-correct routes a live planner
+    will pick for a given run. "Might reach" is therefore the right union, not
+    an intersection or `expected_routes` alone: checking only the declared
+    routes leaves exactly the gap the audit measured on
+    multi-web-and-financial (`expected_routes: [financial, web]`,
+    `acceptable_routes: [[financial, news_agent]]`) - a sweep with mcp-fetch
+    up and news-agent down would report "reachable" from `expected_routes`
+    alone, then silently degrade on every run where the live planner takes the
+    news_agent alternative, which is precisely the failure this preflight
+    exists to catch before any run starts. The cost of the wider union is
+    just checking one extra service on the rare question that declares
+    alternatives at all (one question in the set today) - cheap next to a
+    280-run sweep degrading silently.
     """
     services: set[str] = set()
     for question in questions:
-        for route in question.expected_routes:
-            service = _ROUTE_TO_SERVICE.get(route)
-            if service is not None:
-                services.add(service)
+        for route_set in (question.expected_routes, *question.acceptable_routes):
+            for route in route_set:
+                service = _ROUTE_TO_SERVICE.get(route)
+                if service is not None:
+                    services.add(service)
     return [s for s in _SERVICE_ORDER if s in services]
 
 

@@ -38,6 +38,23 @@ from mcp.client.streamable_http import streamablehttp_client
 
 from src import config
 
+# streamablehttp_client is @deprecated in the installed mcp==1.28.1 in favour
+# of streamable_http_client, but that replacement (streamable_http.py:600-681)
+# dropped the timeout, sse_read_timeout, headers and auth parameters entirely
+# - StreamableHTTPTransport.__init__ now warns and ignores them if passed. The
+# only way to bound its timeouts is to hand it a pre-built httpx.AsyncClient
+# via http_client=, and the one helper that builds one with MCP's own
+# defaults (create_mcp_http_client) lives in mcp.shared._httpx_utils - an
+# underscored module, not re-exported from mcp or mcp.client. Migrating would
+# mean either importing that private module or hand-rolling
+# httpx.AsyncClient(follow_redirects=True, timeout=...) ourselves and
+# re-deriving the MCP defaults (follow_redirects, the 30s/300s split) that the
+# deprecated wrapper currently tracks for us. That is a real migration, not a
+# rename, so it is deferred rather than done under this fix - the deprecated
+# call still works today (mcp.client.streamable_http.streamable_http_client
+# is a thin wrapper the deprecated function delegates to internally) and only
+# emits a DeprecationWarning.
+
 # The phase 3 requirement's predefined sources - the only pages this tool
 # can ever fetch.
 _SOURCES = {
@@ -101,9 +118,25 @@ async def get_financial_data(category: str) -> dict:
     # the equivalent phase 5 client had to give up when it moved to
     # RemoteA2aAgent (see src/tools/news_agent.py) - worth keeping where the
     # tool still owns its own transport.
+    # timeout bounds the connect/write/pool legs of the httpx client (the
+    # normal request/response hop); sse_read_timeout bounds how long a single
+    # SSE read may block waiting on the next event. Verified against the
+    # installed mcp==1.28.1 (mcp/client/streamable_http.py): the deprecated
+    # streamablehttp_client defaults sse_read_timeout to 60*5=300s when it is
+    # not passed explicitly, which is exactly the gap audit.md finding 7
+    # flagged - the call used to pass only timeout=, so a wedged upstream
+    # fetch (server accepts the connection, then hangs on Yahoo) blocked for
+    # 300s while config.MCP_FETCH_TIMEOUT_S's comment claimed 30s covered the
+    # whole hop. Passing both from the same constant makes that comment true.
+    # What this still does NOT bound: TURN_TIMEOUT_S cannot help either way,
+    # because enforce_turn_deadline only runs between tool cycles and cannot
+    # interrupt a hop already in flight (turn_deadline.py) - this timeout is
+    # the only thing standing between a wedged mcp-fetch and a 5-minute hang.
     try:
         async with streamablehttp_client(
-            config.MCP_FETCH_URL, timeout=config.MCP_FETCH_TIMEOUT_S
+            config.MCP_FETCH_URL,
+            timeout=config.MCP_FETCH_TIMEOUT_S,
+            sse_read_timeout=config.MCP_FETCH_TIMEOUT_S,
         ) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()

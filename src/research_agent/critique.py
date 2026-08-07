@@ -34,15 +34,17 @@ ADR-0010 for the full reasoning):
    `exit_loop` only ever sets that flag; it is not a judgement call the
    agent talks itself out of making.
 
-On top of the model-level defence, one case is short-circuited in plain code
-rather than left to the model at all: a single-fact financial lookup
-(`get_financial_data` was the only tool the cycle used) has nothing to
-critique, and a request-level `critique_budget` of 0 or already-spent must
-skip the critique LLM call entirely, not just be told to approve quickly -
-"the model chose to approve fast" is not the same guarantee as "no LLM call
-happened here". Both checks live in a `before_agent_callback`, which is
-deterministic Python, precisely because the whole point is that this
-decision must not be a model judgement.
+On top of the model-level defence, three cases are short-circuited in plain
+code rather than left to the model at all: a single-fact financial lookup
+(`get_financial_data` was the only evidence tool the cycle used) has nothing
+to critique, a request-level `critique_budget` of 0 or already-spent must
+skip the critique LLM call entirely, and a turn whose whole-turn deadline
+(`turn_deadline.py`) has already passed must not pay for a refinement
+judgement it has no time left to act on. All three checks live in
+`_skip_critique_llm_call`, a `before_agent_callback`, which is deterministic
+Python, precisely because the whole point is that none of these three
+decisions may be a model judgement - "the model chose to approve fast" is not
+the same guarantee as "no LLM call happened here".
 
 A separate correctness point, easy to miss: session state outlives a single
 turn - `scripts/verify_agent.py` and the Streamlit UI both reuse one session
@@ -63,7 +65,7 @@ from google.adk.tools import ToolContext
 from google.genai import types
 
 from src import config
-from src.research_agent import token_budget, tool_budget
+from src.research_agent import token_budget, tool_budget, turn_deadline
 from src.services import genai_client
 
 CRITIQUE_AGENT_NAME = "critique_agent"
@@ -193,6 +195,44 @@ def _tools_used_this_cycle(callback_context: CallbackContext) -> set[str]:
     return tool_names
 
 
+# Non-evidence tools subtracted from a cycle's tool set before the
+# financial-only comparison in _skip_critique_llm_call, below.
+#
+# Deliberately derived from tool_budget.OUTPUT_TOOLS rather than a second,
+# hand-written list: this whole fix exists because declare_plan became a
+# mandatory tool on every turn (2026-08-06, agent.py's INSTRUCTION step 1)
+# and the exact-equality check below (`_tools_used_this_cycle(...) ==
+# {"get_financial_data"}`) was never updated to know that - a financial-only
+# cycle now always also calls declare_plan, the equality stopped holding, and
+# the deterministic skip this module was specifically built to guarantee (see
+# the module docstring, and ADR-0010) silently became unreachable. See
+# agent_docs/audit.md, Finding 8.
+#
+# Deriving from OUTPUT_TOOLS rather than duplicating a third list means a
+# FUTURE mandatory non-evidence tool is absorbed automatically the moment it
+# is added there for the tool-call ceiling's sake (tool_budget.py) - which it
+# must be, or the ceiling breaks the same way declare_plan broke this check -
+# rather than needing a second, easily-forgotten edit here. It is not
+# schema.py's own OUTPUT_TOOLS: that copy is owned by the evaluation code and
+# deliberately kept independent so scoring a stored run never has to import
+# the agent package (see schema.py's comment on OUTPUT_TOOLS) - a concern
+# that does not apply here, since critique.py already imports tool_budget for
+# its state keys.
+#
+# create_canvas is carved back OUT of that derived set, on purpose: it is
+# exempt from the tool-call ceiling for a completely different reason (it
+# retrieves nothing, see tool_budget.py) but it is not bookkeeping - it
+# renders the actual deliverable, and ADR-0016 requires the critic to review
+# that rendered artefact on a Canvas turn. Subtracting it here would let a
+# turn that rendered a whole report from a single financial figure skip
+# critique entirely, which is exactly the review ADR-0016 added. So the
+# default assumption below is "nothing to critique", not "safe to skip" - any
+# future non-evidence tool that, like create_canvas, produces content for the
+# critique to review needs the same explicit carve-out, or it will silently
+# defeat this check the same way declare_plan defeated the old one.
+_TOOLS_WITH_NOTHING_TO_CRITIQUE: frozenset[str] = tool_budget.OUTPUT_TOOLS - {"create_canvas"}
+
+
 def _skip_critique_llm_call(
     callback_context: CallbackContext,
 ) -> types.Content | None:
@@ -207,28 +247,77 @@ def _skip_critique_llm_call(
     makes this an actual short-circuit rather than a slower way to reach the
     same LLM call.
 
-    Two independent reasons to skip, checked every cycle:
+    Three independent reasons to skip, checked every cycle, in this order:
+    - The turn's whole-turn deadline (turn_deadline.stamp_turn_deadline, the
+      same clock research_agent's own before_agent_callback enforces) has
+      already passed. Checked first, and with its own message rather than
+      turn_deadline.enforce_turn_deadline's Content reused verbatim, because
+      that message says "no answer was produced this turn" - true there,
+      because it fires before that cycle's LLM call ever ran, but false here:
+      by the time critique_agent's callback runs, research_agent has already
+      written a real draft_answer this cycle. What is being skipped is one
+      refinement pass, not the turn's only answer - and letting critique run
+      anyway would be actively worse than skipping it: a genuine follow-up
+      would send the loop back to research_agent, whose OWN deadline gate
+      would then fire on the very next cycle and overwrite this cycle's
+      perfectly good draft_answer with ITS "no answer was produced" message,
+      turning a real answer into a reported timeout for no benefit to the
+      user. Skipping here is not a judgement that the draft is complete (the
+      model never looked) - it is the same "termination is the default
+      outcome" property the rest of this module is built around, applied to
+      the one case where continuing is strictly worse than stopping. See
+      agent_docs/audit.md, Finding 11b, and turn_deadline.py's module
+      docstring for the full reasoning on the shared clock.
     - The per-request budget (session state "critique_budget", defaulting to
       config.DEFAULT_CRITIQUE_BUDGET when the request didn't set one) is 0
       or has already been spent by an earlier cycle's real critique call.
       This is what makes a budget of 0 reproduce the pre-phase-4 single-cycle
       behaviour exactly: the very first check on the very first cycle finds
       0 >= 0 and escalates before anything resembling a critique runs.
-    - The just-completed research cycle's only tool call was
+    - The just-completed research cycle's only EVIDENCE tool call was
       get_financial_data - a single live-price lookup has no citation to
       omit and no sub-question left to ask, so critiquing it is pure
       overhead on a path this project already measured close to its latency
-      target.
+      target. Compared after subtracting _TOOLS_WITH_NOTHING_TO_CRITIQUE (see
+      its own comment, immediately above) so a mandatory bookkeeping call
+      like declare_plan cannot defeat this the way it used to.
+
+    Returning this event, authored by critique_agent (ADK sets `author=
+    self.name` on a before_agent_callback's returned Content - see
+    turn_deadline.py's module docstring for where that is verified), never
+    touches research_agent's own final-response event for this cycle. Every
+    consumer that follows CLAUDE.md's "Reading a turn's answer" rule matches
+    on `event.author == research_agent.name`, so this event - like the
+    budget-exhausted and financial-only skip messages that already existed
+    before this deadline check - is simply invisible to that rule, not a
+    second candidate answer it could be confused with.
     """
     # original_query/critique_iterations_used are already turn-fresh by the
     # time this runs - reset_turn_state (the loop's own before_agent_callback)
     # sets them before research_agent's first cycle of this turn.
     state = callback_context.state
+
+    if turn_deadline.deadline_exceeded(callback_context):
+        callback_context.actions.escalate = True
+        return types.Content(
+            role="model",
+            parts=[
+                types.Part(
+                    text=(
+                        "Skipping critique: this turn's time budget is already spent. "
+                        "Ending the loop with the answer already produced this cycle "
+                        "rather than spending more time on a refinement pass."
+                    )
+                )
+            ],
+        )
+
     budget = state.get("critique_budget", config.DEFAULT_CRITIQUE_BUDGET)
     spent = state.get("critique_iterations_used", 0)
     budget_exhausted = spent >= budget
 
-    financial_only = _tools_used_this_cycle(callback_context) == {"get_financial_data"}
+    cycle_tools = _tools_used_this_cycle(callback_context) - _TOOLS_WITH_NOTHING_TO_CRITIQUE
+    financial_only = cycle_tools == {"get_financial_data"}
 
     if budget_exhausted or financial_only:
         callback_context.actions.escalate = True

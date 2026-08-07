@@ -20,6 +20,12 @@ from docling_core.types.doc.document import DoclingDocument, TableItem
 
 from src import config
 
+# Hoisted to a module-level constant (rather than built inline inside
+# parse_pdf as before) so _cache_meta reads the exact same options object
+# that the converter is given - the two cannot drift apart the way a
+# separately-constructed PdfPipelineOptions() in each place could.
+PDF_PIPELINE_OPTIONS = PdfPipelineOptions()
+
 
 def _cache_paths(pdf_path: Path) -> tuple[Path, Path]:
     json_path = config.INTERIM_DIR / f"{pdf_path.stem}.docling.json"
@@ -27,12 +33,38 @@ def _cache_paths(pdf_path: Path) -> tuple[Path, Path]:
 
 
 def _cache_meta(pdf_path: Path) -> dict:
-    return {"pdf_sha1": hashlib.sha1(pdf_path.read_bytes()).hexdigest()}
+    """Cache-invalidation key for the parsed-document JSON (finding 15b).
+
+    Previously keyed on the PDF's sha1 alone, so flipping do_table_structure
+    or do_ocr on PDF_PIPELINE_OPTIONS above for a local experiment - without
+    touching the PDF - would silently serve back a .docling.json parsed
+    under the *old* settings. Table structure detection in particular
+    changes what extract_table_records sees (table.export_to_markdown
+    depends on it being on), so a stale cache there is not just a dev
+    inconvenience, it's a wrong parse being reused unnoticed.
+
+    Deliberately naming do_table_structure and do_ocr explicitly rather than
+    hashing PdfPipelineOptions().model_dump() wholesale: a full dump also
+    captures dozens of unrelated nested settings (OCR engine internals,
+    picture-classification model revisions, accelerator thread counts) that
+    can change between docling versions with no change to this file, which
+    would spuriously invalidate the cache - and re-parsing this ~150-page
+    PDF is slow enough that that would be its own hazard. The trade-off:
+    this key is stable across docling upgrades but only tracks the two
+    fields actually named as mutable here; if PDF_PIPELINE_OPTIONS above
+    ever gains a third field someone actually toggles, it needs adding here
+    too - it will not be caught automatically.
+    """
+    return {
+        "pdf_sha1": hashlib.sha1(pdf_path.read_bytes()).hexdigest(),
+        "do_table_structure": PDF_PIPELINE_OPTIONS.do_table_structure,
+        "do_ocr": PDF_PIPELINE_OPTIONS.do_ocr,
+    }
 
 
 def parse_pdf(pdf_path: Path) -> DoclingDocument:
     converter = DocumentConverter(
-        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=PdfPipelineOptions())}
+        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=PDF_PIPELINE_OPTIONS)}
     )
     document = converter.convert(pdf_path).document
 

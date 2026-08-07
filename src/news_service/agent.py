@@ -33,6 +33,26 @@ from google.genai import types
 
 from src import config
 
+# genai_client lives under src/services, which is otherwise this project's
+# main-agent service layer, and this module runs in its own process
+# (server.py, reached only over A2A/HTTP - see module docstring above). That
+# is a real process boundary but not a real package boundary: this file
+# already imports src.config (the line above), so the news service is
+# already coupled to the shared src namespace rather than to a package of
+# its own. genai_client adds nothing beyond that - it is a small module (one
+# constant used below, plus a get_client() this agent never calls) with no
+# side effects at import time: get_client() is lru_cache-decorated but never
+# invoked at module scope, so importing this module makes no network call
+# and needs no Application Default Credentials (verified by reading
+# genai_client.py itself, not by inference - see
+# tests/test_model_call_bounds.py, which imports this module offline and
+# would fail its own setup if that stopped being true). Importing the
+# constant is therefore judged appropriate: the alternative, duplicating
+# 120_000 as a second literal in this file, would recreate exactly the drift
+# this finding is about - two numbers that are supposed to be the same
+# bound, free to go out of sync the next time one of them changes.
+from src.services import genai_client
+
 NEWS_AGENT_NAME = "news_agent"
 
 # See web_search.py's measured comparison (thinking_budget=512 vs Gemini's
@@ -49,6 +69,33 @@ _GENERATE_CONTENT_CONFIG = types.GenerateContentConfig(
     # model can in principle hit a decoding loop, so it is not assumed to
     # be specific to those two.
     frequency_penalty=0.4,
+    # ADR-0013 bounded "every agent model call" at 120s via
+    # genai_client.MODEL_CALL_TIMEOUT_MS, and this agent was the fourth
+    # model-calling agent, added after that rule and missed by it (see
+    # audit.md finding 11): research_agent, critique_agent and
+    # web_search_agent all carry this same http_options, this one did not.
+    # ADK builds its own genai.Client per agent and sets no timeout of its
+    # own (see that constant's docstring), so without this the model call
+    # backing this agent has no ceiling at all.
+    #
+    # This bound and the client-side one in src/tools/news_agent.py (the
+    # `timeout=config.NEWS_AGENT_TIMEOUT_S` constructor field on
+    # _ReachableRemoteA2aAgent, a RemoteA2aAgent subclass - not a client
+    # object; exactly 20.0s) look like duplicates but cover different
+    # things, in different units:
+    # - MODEL_CALL_TIMEOUT_MS (here, milliseconds) bounds what THIS SERVER
+    #   process spends waiting on Vertex for one model call.
+    # - NEWS_AGENT_TIMEOUT_S (news_agent.py, seconds) bounds what the CALLER
+    #   (research_agent's process, over A2A/HTTP) spends waiting on this
+    #   service as a whole.
+    # Before this line existed, a stalled Vertex call in this process had no
+    # ceiling of its own: the caller's 20s timeout only made research_agent
+    # give up and move on - it could not, and still cannot, reach across the
+    # process boundary to cancel the abandoned model call still running here.
+    # Two bounds are needed for exactly that reason: the caller's bound
+    # protects the caller's turn, this one protects this service's own
+    # resources, and only this one can.
+    http_options=types.HttpOptions(timeout=genai_client.MODEL_CALL_TIMEOUT_MS),
     thinking_config=types.ThinkingConfig(thinking_budget=_THINKING_BUDGET),
 )
 

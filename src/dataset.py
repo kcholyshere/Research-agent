@@ -22,9 +22,12 @@ import os
 # traceback, since it's a native crash below the interpreter. Forcing both
 # runtimes to a single thread means neither ever enters a parallel region, so
 # there is no worker pool to corrupt; two OpenMP runtimes can then coexist
-# (just not concurrently execute) in one process. This is the only entrypoint
-# that imports both libraries in one process (the agent never imports torch
-# at runtime), so both workarounds are scoped here rather than set globally.
+# (just not concurrently execute) in one process. The agent never imports
+# torch at runtime, so this stays scoped to the entrypoints that do rather
+# than being set globally - and there are now two of them: this module, and
+# `tests/conftest.py`, once the suite grew a test touching ingestion
+# alongside one touching retrieval. That second one was found the way this
+# one was, by the suite segfaulting with no Python traceback.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 

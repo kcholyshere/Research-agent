@@ -33,8 +33,52 @@ HTTP_TIMEOUT_MS = 120_000
 MODEL_CALL_TIMEOUT_MS = 120_000
 
 
+# Audit finding 15a: config.GCP_PROJECT has no default and no validation at
+# the point it is read (src/config.py), and that is deliberate - config.py is
+# imported unconditionally by modules that never touch Vertex, and the whole
+# offline test suite (tests/conftest.py's ToolContext fixtures included)
+# imports project modules with no credentials present. A hard failure at
+# config-import time would break collecting that suite on any machine or CI
+# box without a .env, for tests that never need Vertex at all.
+#
+# This function is the real gate instead: it is the one place a genai.Client
+# actually gets constructed for our own code (embedder.py's embed calls,
+# langfuse_sync.py), so the check below only runs for callers who are about
+# to make a real Vertex call, and only then. Verified against the installed
+# google-genai (_api_client.py): BaseApiClient reads env_project =
+# os.environ.get('GOOGLE_CLOUD_PROJECT'), then self.project = project or
+# env_project, and if that is still falsy, load_auth() resolves a project
+# from Application Default Credentials instead of raising - so a blank
+# GOOGLE_CLOUD_PROJECT does not fail, it silently sends every call to
+# whichever project ADC defaults to. That is the exact misdiagnosis ADR-0004
+# spent real time on: a 404 that reads as "model retired from the catalogue"
+# when the actual cause was "wrong project". The check below turns a blank
+# project into a named, loud error before genai.Client is ever built, instead
+# of a working client pointed at the wrong place.
+#
+# Residual gap, not closed by this check: ADK's own agent model calls do not
+# go through this function at all (see MODEL_CALL_TIMEOUT_MS above) - ADK
+# builds its own genai.Client internally and reads GOOGLE_CLOUD_PROJECT from
+# the environment directly. So a blank project still lets a turn's LLM calls
+# through to ADC's default project even after this fix; this only gates the
+# calls that route through get_client() (embeddings today).
+#
+# lru_cache does not cache a raised exception - only a successful return - so
+# fixing the environment and retrying (e.g. between test cases, or after
+# editing .env) is not blocked by an earlier failed call.
 @lru_cache(maxsize=1)
 def get_client() -> genai.Client:
+    if not config.GCP_PROJECT:
+        raise RuntimeError(
+            "GOOGLE_CLOUD_PROJECT is not set (src.config.GCP_PROJECT, read "
+            "from the environment/.env by src/config.py, is empty). Without "
+            "it, google.genai.Client falls back to Application Default "
+            "Credentials' own default project instead of failing - every "
+            "Vertex call would silently go to whichever project ADC "
+            "defaults to, not the one you intended. Set GOOGLE_CLOUD_PROJECT "
+            "in your .env file (see .env.example) or the environment before "
+            "calling get_client()."
+        )
     return genai.Client(
         vertexai=True,
         project=config.GCP_PROJECT,

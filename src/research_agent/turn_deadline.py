@@ -5,7 +5,7 @@ research/critique cycles) is allowed to run, so `adk run`, `adk web` and the
 Streamlit UI can all block indefinitely on a turn that keeps finding a reason
 to go around the loop again.
 
-Two callbacks, wired in agent.py, do this together:
+Three callbacks, built on one shared clock read, do this together:
 
 - `stamp_turn_deadline` runs once per turn, on `root_agent` (the LoopAgent)'s
   own `before_agent_callback`, alongside `critique.reset_turn_state` - the
@@ -15,47 +15,68 @@ Two callbacks, wired in agent.py, do this together:
   comparing invocation ids by hand (see critique.reset_turn_state's own
   docstring). It records session-relative state, not the wall clock, i.e. how
   many seconds this turn has left, not deadline = now + budget - see the
-  module-level note on _REMAINING_KEY for why that distinction matters here.
+  module-level note on _DEADLINE_KEY for why that distinction matters here.
 - `enforce_turn_deadline` runs on `research_agent`'s before_agent_callback,
   which fires at the START of every cycle (the first, and any refinement
   cycle a critique pass earns). If the turn's time is already up, it sets
   the same escalate action `critique.exit_loop` sets - so the LoopAgent stops
   after this cycle without running critique_agent again - and returns a plain
   Content saying so, rather than research_agent's usual answer.
+- `deadline_exceeded`, the plain boolean check the two callbacks above are
+  both built on, is also called directly from `critique.py`'s
+  `_skip_critique_llm_call` - not wired here as a callback of its own,
+  because critique_agent needs the same clock read but cannot reuse
+  `enforce_turn_deadline`'s Content verbatim (see critique.py for why: that
+  message says "no answer was produced this turn", which is only true before
+  a cycle's LLM call has run, and by the time critique_agent's callback runs
+  research_agent has already written a real one). Until 2026-08-07,
+  critique_agent sat entirely outside this bound: a research cycle that
+  overran to the full TURN_TIMEOUT_S was followed by a critique call bounded
+  only by MODEL_CALL_TIMEOUT_MS, making the real worst case for a turn
+  TURN_TIMEOUT_S plus one research cycle plus one full critique call - see
+  agent_docs/audit.md, Finding 11b.
 
 What this does and does not bound, honestly:
 
-- It is COARSE: the check only runs between cycles, so it can refuse to START
-  a second or third cycle once the turn has overrun, but it cannot interrupt
-  a cycle already in progress - a single very slow cycle 1 sails through
-  untouched no matter how long it takes. That gap is real and is not this
-  module's to close: MODEL_CALL_TIMEOUT_MS bounds one model call, and a cycle
-  can make several (research_agent's own turns, plus a nested one inside
-  web_search_tool's AgentTool) - see agent.py's report for which entrypoints
-  additionally get the Streamlit-only `asyncio.wait_for` that DOES cut a
-  single cycle off, and which do not.
+- It is COARSE, on both sides of the loop: `enforce_turn_deadline` only runs
+  between research cycles, and critique's own check only runs before its one
+  model call starts - neither can interrupt a call already in flight. A
+  single very slow research cycle sails through untouched no matter how long
+  it takes, and once critique_agent's model call has actually started (i.e.
+  `deadline_exceeded` read False the moment it was checked), nothing in this
+  module bounds that call either - MODEL_CALL_TIMEOUT_MS is the only ceiling
+  on it from that point. That gap is real and is not this module's to close:
+  a research cycle in particular can make several model calls (research_agent's
+  own turn, plus a nested one inside web_search_tool's AgentTool), and
+  MODEL_CALL_TIMEOUT_MS only ever bounds one of them at a time - see agent.py's
+  report for which entrypoints additionally get the Streamlit-only
+  `asyncio.wait_for` that DOES cut a single cycle off, and which do not.
 - It IS still worth having on every entrypoint that reaches agent.py,
   `adk run`/`adk web` included, because it is the only bound in this project
   that fires on the SUM of cycles rather than on any one hop, and it is a
-  small, additive callback rather than a rewrite of anything that already
-  works.
+  small, additive check - now shared by both sub-agents of the loop - rather
+  than a rewrite of anything that already works.
 
-Why the returned Content is safe to treat as research_agent's answer, given
-CLAUDE.md's rule against trusting session.state["draft_answer"]: that rule
-exists because draft_answer can hold planning narration rather than a real
-answer, and nothing here reads it. ADK marks a before_agent_callback's
-returned Content as an ordinary event authored by the agent whose callback
-returned it (verified against the installed google-adk 2.5.0,
-base_agent.py's `_handle_before_agent_callback` - `Event(author=self.name,
-content=before_agent_callback_content, ...)`), with no function call and no
-partial flag, so `event.is_final_response()` is True for it exactly the same
-way it is for a normal answer. Every existing consumer already matches on
-`event.author == research_agent.name and event.is_final_response()` (the
-Streamlit UI, the eval harness) - so this event is picked up by that same
-rule with no special-casing, and it is honest about what happened rather than
-a smuggled-in partial answer: it says plainly that the turn ran out of time
-and produced nothing this cycle, never a synthesized answer built from
-whatever happened to be gathered so far.
+Why `enforce_turn_deadline`'s returned Content is safe to treat as
+research_agent's answer, given CLAUDE.md's rule against trusting
+session.state["draft_answer"]: that rule exists because draft_answer can hold
+planning narration rather than a real answer, and nothing here reads it. ADK
+marks a before_agent_callback's returned Content as an ordinary event
+authored by the agent whose callback returned it (verified against the
+installed google-adk 2.5.0, base_agent.py's `_handle_before_agent_callback` -
+`Event(author=self.name, content=before_agent_callback_content, ...)`), with
+no function call and no partial flag, so `event.is_final_response()` is True
+for it exactly the same way it is for a normal answer. Every existing
+consumer already matches on `event.author == research_agent.name and
+event.is_final_response()` (the Streamlit UI, the eval harness) - so this
+event is picked up by that same rule with no special-casing, and it is honest
+about what happened rather than a smuggled-in partial answer: it says plainly
+that the turn ran out of time and produced nothing this cycle, never a
+synthesized answer built from whatever happened to be gathered so far.
+critique.py's own deadline message follows the same principle but is authored
+by critique_agent instead, so it never competes with research_agent's event
+under that same matching rule at all - see critique.py's docstring for why
+that message also has to say something different from this one.
 """
 
 import time
@@ -80,21 +101,33 @@ def stamp_turn_deadline(callback_context: CallbackContext) -> None:
     callback_context.state[_DEADLINE_KEY] = time.monotonic() + config.TURN_TIMEOUT_S
 
 
+def deadline_exceeded(callback_context: CallbackContext) -> bool:
+    """True once this turn's stamped deadline (see stamp_turn_deadline) has passed.
+
+    The one clock read both `enforce_turn_deadline` below and
+    `critique._skip_critique_llm_call` are built on - see the module
+    docstring for why critique_agent needs this same read but not
+    `enforce_turn_deadline`'s own Content.
+
+    A missing deadline (the key absent from state) reads as "not yet due"
+    rather than "already due": the only way it can be missing is
+    stamp_turn_deadline not having run, and refusing to serve a turn because
+    of an initialisation gap this module can't diagnose would be a worse
+    failure than the coarse bound this module intentionally already is.
+    """
+    deadline = callback_context.state.get(_DEADLINE_KEY)
+    return deadline is not None and time.monotonic() >= deadline
+
+
 def enforce_turn_deadline(callback_context: CallbackContext) -> types.Content | None:
     """Refuse to start another research cycle once the turn's time is up.
 
     Returns None (proceed as normal) on every cycle until the deadline has
     passed, then returns Content and sets `escalate` on the one cycle that
     finds it has - the same two-part shape critique._skip_critique_llm_call
-    uses to short-circuit deterministically. A missing deadline (the key
-    absent from state) is treated as "not yet due" rather than "already
-    due": the only way it can be missing is stamp_turn_deadline not having
-    run, and refusing to serve a turn because of an initialisation gap this
-    module can't diagnose would be a worse failure than the coarse bound
-    this module intentionally already is.
+    uses to short-circuit deterministically.
     """
-    deadline = callback_context.state.get(_DEADLINE_KEY)
-    if deadline is None or time.monotonic() < deadline:
+    if not deadline_exceeded(callback_context):
         return None
 
     callback_context.actions.escalate = True
