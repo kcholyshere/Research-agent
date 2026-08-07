@@ -58,15 +58,28 @@ later call replaces the plan `enforce_tool_budget` checks calls against.
 What stops that turning into "the declared source came back empty, so
 re-declare a different one and carry on" - exactly the fallback step 2
 forbids - is enforced in `tool_budget.enforce_tool_budget`, not here: once a
-declared source has actually been called this turn, it is locked. A later
-`declare_plan` call may add new facts and sources freely, and may still
-harmlessly re-list an already-called source, but it may not drop one that has
-already run. Dropping a locked source is refused with a structured error
-naming the source and pointing at `report_gap` - the tool that exists
-specifically for "the right source came back empty" - instead of letting the
-amendment stand in for it. So the only sources that can ever be
-re-planned away from are ones that have not yet been tried, which is exactly
-the "planned the wrong one" case and not the "came back empty" case.
+fact's declared source has actually been called this turn, that PAIRING is
+locked. A later `declare_plan` call may add entirely new facts with any
+source, and may still re-point any fact it has not yet acted on, but for a
+fact whose source has run it must re-send exactly that fact and exactly that
+source. Neither dropping it nor adding a second source alongside it is
+accepted.
+
+The "adding" half of that rule was missing until 2026-08-07, and its absence
+was audit finding 4. The lock computed only which sources were being DROPPED
+and refused those, so the model could keep `search_documents` and add
+`web_search_agent` beside it - nothing dropped, amendment recorded, web
+search runs. `_amendment_refusal`'s own text was even telling it to, since it
+said to keep the locked source and call `declare_plan` again. What made the
+precise rule possible is that the gate now knows which fact each call served
+(see below), so it can distinguish "a new fact needs a new source", which is
+legitimate, from "this fact needs a second source now that the first came
+back empty", which is the fallback dressed as a plan.
+
+Locking is per fact rather than per turn on purpose. A turn that has executed
+one fact must still be able to plan the next one freely; a lock scoped to the
+turn would have refused that too, and would have been tight rather than
+correct.
 
 ## Source names must match the tools the executor actually calls, not their
 ## variable names in the INSTRUCTION prose
@@ -87,6 +100,24 @@ both record having hit already. Use exactly these four names in `sources`:
 Any other value is refused with a structured error naming the valid four, so
 a wrong name is a correctable mistake rather than a plan that silently can
 never be matched.
+
+Note what a refused declaration costs, because it is this gate's largest
+escape hatch and audit.md:163 found the INSTRUCTION walking straight into it.
+A rejected call writes nothing, so the turn proceeds with no plan recorded
+and every evidence tool ungated - indistinguishable from a turn that never
+declared. The INSTRUCTION used to name the web tool `web_search_tool`
+throughout, which is the Python variable name and not a value this tool
+accepts, while never stating the four that are; it now names all four
+explicitly.
+
+## Facts are matched, so the model has to quote itself
+
+Declaring the plan is only half of it. Each evidence tool also takes a `fact`
+argument, and the gate matches it against the facts declared here to find
+that fact's authoritative source. Matching is on case and whitespace only -
+a paraphrase is refused with the declared facts quoted back, rather than
+bound to whichever fact looks closest. Guessing would enforce the wrong
+source silently, which is the failure this gate exists to prevent.
 """
 
 from __future__ import annotations
@@ -114,14 +145,19 @@ def declare_plan(facts: list[str], sources: list[str]) -> dict[str, Any]:
     lists of the SAME length: the Nth source is the tool authoritative for
     the Nth fact.
 
-    Only a tool named in `sources` can be called for the rest of this turn -
-    an evidence tool you did not declare will be refused. If you realise a
-    fact needs a different source than you first declared, call this again
-    with the corrected plan, but only before you have actually called the
-    source you first declared for that fact: once a declared source has been
-    called, it is locked and cannot be dropped by re-declaring - if it came
-    back without the fact, call report_gap for it instead, the same as if
-    you had never called this tool at all.
+    Each source is authoritative for ITS fact, not for the whole question.
+    Every evidence tool takes a `fact` argument as well as its own: pass the
+    fact from this plan, copied exactly, and the tool you call must be the
+    source you declared for that fact. Calling a tool with a fact you gave to
+    a different source is refused even though that tool appears in this plan.
+
+    If you realise a fact needs a different source than you first declared,
+    call this again with the corrected plan - but only before you have
+    actually called the source you first declared for that fact. Once a
+    fact's declared source has been called, that pairing is fixed: you may
+    neither drop it nor add a second source beside it. If it came back
+    without the fact, call report_gap for it instead. Adding new facts, and
+    re-pointing facts you have not yet acted on, stay available.
 
     Args:
         facts: The distinct facts this question needs, in plain terms - e.g.

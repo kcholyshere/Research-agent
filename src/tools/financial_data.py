@@ -91,13 +91,16 @@ def _unreachable(url: str, exc: BaseException) -> dict:
     }
 
 
-async def get_financial_data(category: str) -> dict:
+async def get_financial_data(fact: str, category: str) -> dict:
     """Fetch the latest market data for one financial category from Yahoo Finance.
 
     Use this - not web search - for any question about current prices or
     movements of stocks, cryptocurrencies, or currency exchange rates.
 
     Args:
+        fact: The fact from your declared plan (declare_plan) that this call
+            is gathering, copied exactly as you wrote it there. The declared
+            source for that fact must be this tool, or the call is refused.
         category: One of "stocks" (most-active US stocks), "crypto"
             (cryptocurrencies), or "currencies" (foreign exchange rates).
 

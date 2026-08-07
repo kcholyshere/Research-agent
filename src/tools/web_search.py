@@ -26,6 +26,7 @@ from google.genai import types
 from src import config
 from src.research_agent import token_budget
 from src.services import genai_client
+from src.tools.fact_tag import FactTaggedAgentTool
 
 # Bounds each redirect-resolution request (see _resolve_redirect below). Lives
 # in config alongside MCP_FETCH_TIMEOUT_S/NEWS_AGENT_TIMEOUT_S because it is
@@ -316,4 +317,10 @@ phrase.""",
     after_agent_callback=_append_grounding_sources,
 )
 
-web_search_tool = AgentTool(agent=_web_search_agent)
+# FactTaggedAgentTool rather than AgentTool: the declared-plan gate has to
+# know which declared fact a call is serving, and nothing in
+# before_tool_callback carries that (see src/tools/fact_tag.py). The subclass
+# adds a required `fact` argument to the declaration and strips it again
+# before the sub-agent runs, so the wrapped agent's prompt is unchanged and
+# `tool.name` stays `web_search_agent`.
+web_search_tool = FactTaggedAgentTool(agent=_web_search_agent)

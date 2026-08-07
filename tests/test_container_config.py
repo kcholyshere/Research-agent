@@ -192,3 +192,22 @@ class TestDockerfileDropsRoot:
         assert last_user_index < min(entrypoint_indices), (
             "USER instruction must come before CMD/ENTRYPOINT, not after"
         )
+
+
+def test_the_user_facing_services_have_readiness_probes() -> None:
+    """`docker compose up --wait` has to mean the stack is actually usable.
+
+    Nothing depends on `agent` or `ui`, so these probes gate no other
+    container and the health-check test above would not have caught their
+    absence. They earn their place from a measured cold start: compose
+    reports success the moment these containers start, and their ports are
+    not bound for another 10-12 seconds while the ADK and google-genai import
+    graph loads. A first-time user following the README gets
+    connection-refused in that window - the same symptom as finding 13, from
+    the top of the dependency chain rather than the bottom.
+    """
+    compose = _load_compose()
+    for name in ("agent", "ui"):
+        healthcheck = compose["services"][name].get("healthcheck")
+        assert healthcheck, f"{name} has no readiness probe, so `up --wait` returns before it serves"
+        assert healthcheck.get("test") not in (None, ["NONE"]), f"{name}'s probe is disabled"

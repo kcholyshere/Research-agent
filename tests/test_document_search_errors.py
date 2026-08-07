@@ -115,7 +115,9 @@ async def test_missing_index_degrades_with_the_build_command(tmp_path, monkeypat
     """The audit's exact live scenario: no FAISS files on disk at all."""
     monkeypatch.setattr(config, "FAISS_INDEX_DIR", tmp_path / "does-not-exist")
 
-    result = await document_search.search_documents("What was FY2024 net income?")
+    result = await document_search.search_documents(
+        "IFC's FY24 net income", "What was FY2024 net income?"
+    )
 
     assert isinstance(result, list) and len(result) == 1, f"expected a single-item list, got {result!r}"
     assert "error" in result[0], f"expected an 'error' key, got {result[0]!r}"
@@ -145,7 +147,9 @@ async def test_transient_failure_degrades_without_suggesting_a_rebuild(tmp_path,
 
     monkeypatch.setattr(GeminiEmbeddings, "embed_query", _simulated_vertex_429)
 
-    result = await document_search.search_documents("What was FY2024 net income?")
+    result = await document_search.search_documents(
+        "IFC's FY24 net income", "What was FY2024 net income?"
+    )
 
     assert isinstance(result, list) and len(result) == 1, f"expected a single-item list, got {result!r}"
     assert "error" in result[0], f"expected an 'error' key, got {result[0]!r}"
@@ -178,7 +182,9 @@ async def test_corrupt_index_is_not_mistaken_for_a_missing_one(tmp_path, monkeyp
     (tmp_path / f"{faiss_store.INDEX_NAME}.faiss").write_bytes(b"not a real faiss index")
     (tmp_path / f"{faiss_store.INDEX_NAME}.pkl").write_bytes(b"not a real pickle either")
 
-    result = await document_search.search_documents("What was FY2024 net income?")
+    result = await document_search.search_documents(
+        "IFC's FY24 net income", "What was FY2024 net income?"
+    )
 
     assert isinstance(result, list) and len(result) == 1, f"expected a single-item list, got {result!r}"
     assert "error" in result[0], f"expected an 'error' key, got {result[0]!r}"

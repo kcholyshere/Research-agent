@@ -37,6 +37,22 @@ PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
 
+# Largest table chunk, in characters, before it is split into several
+# (src/ingestion/chunk.py). Tables were kept whole until 2026-08-07 on the
+# reasoning that a table is already a coherent unit, which is true of meaning
+# and false of embeddings: the audit's finding 10 measured 14 table chunks
+# over 8,000 characters and the largest at 31,590, against an embedding input
+# limit around 2,048 tokens. The docstore keeps the full text either way, so
+# nothing was ever answered wrongly - the tail of an oversized table simply
+# became unfindable by similarity search, silently.
+#
+# 6,000 rather than a token count because no offline tokeniser for
+# gemini-embedding-001 is available to measure against, so this is set
+# conservatively and then VERIFIED empirically: `python -m src.dataset` prints
+# a truncation report, and that report reading zero is the check that this
+# number is low enough. Raise it only against that report, never by argument.
+TABLE_CHUNK_MAX_CHARS = 6000
+
 # Vector store (phase 1 requirement: FAISS, in-memory document search)
 FAISS_INDEX_DIR = PROJECT_ROOT / "models" / "faiss"
 

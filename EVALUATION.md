@@ -470,3 +470,30 @@ This is the agent being wasteful rather than the label being wrong: `kb-cur-defi
 `critique_calibration` fails 0 of 4, exactly as `loop-half-absent` predicted when it was added: the critic exits at cycle 1 because the draft explicitly declines the absent half, which the critic's own rules correctly treat as addressed. The assertion's premise - that a good critic keeps searching for an absent fact - is now in tension with the decided design, in which a correctly declined fact is answered rather than missing. The field needs redefining or retiring; it is not measuring what it was added to measure.
 
 Over-searching a correctly declared single source is untouched, as ADR-0024 said it would be. That remains ADR-0015's territory and ADR-0015's stated limit.
+
+## 2026-08-07 - the audit sweep: the fact-level plan gate, measured
+288 runs, 36 questions, 2 arms, 4 reps, live mode. The first sweep after clearing the 2026-08-06 codebase audit (ADR-0026, ADR-0027).
+
+Hypothesis stated before the run: routing holds at or above 92%, redundancy stays flat near 61% because the gate constrains which tool rather than how many times, decline holds at or above 68%, declaration uptake stays at 100% now the naming trap is closed, and the new `fact` argument produces near-zero refusals.
+
+| metric | 2026-08-06 | this sweep | denominator |
+|---|---|---|---|
+| routing | 92% | **93%** | 268/288 |
+| redundancy | 61% | 61% | 177/288 |
+| decline | 68% | 68% | 27/40 |
+| content | - | 90% | 123/136 |
+
+Every prediction held. Hard pass is 76% at budget 0 and 78% at budget 1, against 78% and 75% on 2026-08-06 - the arms flipped and the spread is inside run-to-run variance. Do not compare either figure to the 83-84% recorded on 2026-08-03; `EVALUATION.md`'s own note on that sweep explains why the instrument changed underneath it.
+
+### The number worth reading first: zero
+Across 288 runs there was not one gate refusal. No `fact_not_in_declared_plan`, no `tool_not_the_declared_source_for_this_fact`, no rejected declaration. That was the real risk in ADR-0027 and the reason the sweep was run before merging: a required argument the model has to populate by quoting its own earlier output back verbatim is exactly the kind of mechanism that works in a smoke test and falls over at scale. It did not. The model declares a plan, then quotes each fact back exactly, on every turn.
+
+Read that carefully, though, because it cuts both ways. Zero refusals also means the gate refused nothing, so this sweep provides no positive evidence that the fact-level check would catch a real mis-binding - only that it costs nothing when the model behaves. The routing gain from 92% to 93% is one percentage point on 288 runs and is not, on its own, evidence of anything.
+
+### Redundancy is exactly where it was, as predicted
+61%, unmoved. This was the explicit prediction rather than a disappointment: the gate constrains WHICH tool serves a fact, and redundancy is about HOW MANY times. `loop-half-absent`, `decline-segment-margin` and `decline-auditor-fee` each spend six calls on 8 of 8 runs - five allowed plus one refused by the numeric ceiling. Nothing in ADR-0027 touches that, and the open TODO naming declaration granularity as the cause still stands.
+
+The 111 redundancy failures dominate the regression list and are the single largest lever left on the hard pass rate. They are not new.
+
+### What this does not tell us
+The sweep cannot distinguish "the fact gate is correct" from "the fact gate is inert", because the model never triggered it. Deciding between those needs an adversarial question - one whose correct plan names two sources for two facts and where answering one from the other is tempting - and the question set has no such case by construction. That is worth adding before the mechanism is credited with anything.

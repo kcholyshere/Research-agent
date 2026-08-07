@@ -19,6 +19,7 @@ from google.genai import types as genai_types
 from langfuse import get_client, propagate_attributes
 
 from src import config
+from src.research_agent import tool_budget
 from src.research_agent.agent import research_agent, root_agent  # instruments ADK on import, see agent.py
 from src.research_agent.critique import CRITIQUE_AGENT_NAME
 
@@ -31,25 +32,48 @@ USER_ID = "streamlit-user"
 # "web_search_tool". That distinction is the same one src/evaluation/schema.py's
 # TOOL_TO_ROUTE comment exists to warn about, and getting it wrong here would
 # show raw tool names in the UI rather than fail loudly.
+#
+# declare_plan and report_gap (agent_docs/audit.md finding 12) were added
+# 2026-08-06 alongside the other five tools but never added here, so both
+# rendered as their raw Python name in grey (the _STEP_LABELS.get/_STEP_COLOURS.get
+# fallbacks below exist precisely so a missing entry degrades instead of
+# crashing, which is also why the gap went unnoticed). tests/test_ui_refusal_display.py
+# now checks coverage against research_agent's actual registered tool list
+# rather than pinning this dict's keys by hand, so a sixth tool added the same
+# way fails that test instead of waiting for a second audit pass.
 _STEP_LABELS = {
+    "declare_plan": "Declaring the research plan",
     "search_documents": "Searching the knowledge base",
     "web_search_agent": "Searching the web",
     "get_financial_data": "Fetching market data",
     "news_agent": "Talking to the News Agent",
     "create_canvas": "Building the artefact",
+    "report_gap": "Recording a coverage gap",
 }
 
 # One colour per source, so a glance at the expander shows which mix of sources
 # a turn used without reading the labels. Streamlit's markdown supports a fixed
 # set of colour names in `:colour[text]`; these are all from that set.
+#
+# declare_plan and report_gap share create_canvas's "primary" colour rather
+# than getting one each - deliberately, not for lack of a free colour name
+# (only "yellow" is unused). All three are exactly tool_budget.OUTPUT_TOOLS:
+# the tools that gather no evidence and are exempt from the numeric ceiling.
+# Grouping them under one colour keeps the visual language "one colour per
+# EVIDENCE source" true rather than diluting it with three more swatches for
+# tools that never contribute a fact - a glance at the expander should still
+# answer "which sources did this turn use", and now also "did it plan and
+# record its outcome", without the two questions competing for colours.
 _CRITIQUE_KIND = "critique"
 _REFUSED_KIND = "refused"
 _STEP_COLOURS = {
+    "declare_plan": "primary",
     "search_documents": "blue",
     "web_search_agent": "green",
     "get_financial_data": "orange",
     "news_agent": "violet",
     "create_canvas": "primary",
+    "report_gap": "primary",
     _CRITIQUE_KIND: "gray",
     _REFUSED_KIND: "red",
 }
@@ -57,6 +81,29 @@ _STEP_COLOURS = {
 # exit_loop is the critique agent's loop-termination signal, not research work -
 # it is bookkeeping the user has no use for, and it always takes ~0.0s.
 _HIDDEN_STEPS = frozenset({"exit_loop"})
+
+
+def _is_budget_refusal(payload: object) -> bool:
+    """Whether a tool response is one of tool_budget.enforce_tool_budget's own refusals.
+
+    agent_docs/audit.md finding 12: the check here used to compare
+    `payload.get("error")` against the single literal
+    "tool_call_budget_exhausted" - `_refusal`'s own string, and only that
+    one. Two more refusal builders had been added the same day, each with its
+    own "error" value this never learned, so a report_gap- or plan-refused
+    call rendered as an ordinary, successful, instant tool call. Naming the
+    missing strings would have reset the same trap for whoever adds a fifth.
+
+    So this matches a marker key that every refusal in `tool_budget.py`
+    carries and nothing else does, rather than any of their values. It picks
+    up a new refusal builder for free, and it cannot collide with a tool's
+    own domain error: `get_financial_data` and `search_documents` both return
+    an "error" of their own, and `declare_plan` and `create_canvas` both
+    return `{"status": "error", "detail": ...}` on a malformed call - which
+    is byte-for-byte what `_amendment_refusal` returns too. No payload shape
+    can separate those; only a marker can, which is why the marker exists.
+    """
+    return isinstance(payload, dict) and payload.get(tool_budget.REFUSAL_MARKER_KEY) == tool_budget.REFUSAL_MARKER
 
 
 def _close_steps(steps: list[dict]) -> None:
@@ -222,15 +269,14 @@ async def _run_turn(
                 # blocked. Relabelling it says what actually happened, and is
                 # the most useful line in the expander when a turn goes wide:
                 # it marks the exact point the agent stopped being allowed to
-                # gather more. Keyed on the error string tool_budget._refusal
-                # returns, not on a zero duration, which would also match a
-                # genuinely instant call.
+                # gather more. Detected by response SHAPE via
+                # _is_budget_refusal, not by a zero duration (which would also
+                # match a genuinely instant call) and not by any one refusal's
+                # "error" string (see that function's docstring for why, and
+                # for the one refusal shape it cannot safely catch).
                 payload = response.response
-                if (
-                    isinstance(payload, dict)
-                    and payload.get("error") == "tool_call_budget_exhausted"
-                ):
-                    step["label"] = f"{step['label']}: refused, turn budget reached"
+                if _is_budget_refusal(payload):
+                    step["label"] = f"{step['label']}: refused by the tool-call gate"
                     step["kind"] = _REFUSED_KIND
                     step["refused"] = True
 
@@ -266,7 +312,16 @@ async def _run_turn(
 
 # Filename extension -> (Streamlit code language, download MIME type). The
 # artefact's own format string drives both, so a fourth Canvas format needs one
-# entry here rather than a new branch.
+# entry here rather than a new branch. Same staleness shape as
+# _STEP_LABELS/_STEP_COLOURS above (a fixed copy of an enum that lives in
+# another module - canvas.OutputFormat), but with a softer failure: `.get(fmt,
+# "text/plain")` below means a forgotten fourth format downloads with the
+# wrong MIME type rather than crashing or rendering as raw internal text, so
+# it is easy to miss in a demo. tests/test_ui_refusal_display.py checks this
+# dict's keys against canvas.OutputFormat's actual Literal args for the same
+# reason it checks _STEP_LABELS/_STEP_COLOURS against the registered tool
+# list, rather than fixing the fallback here - a wrong-but-present MIME type
+# is a real, if minor, defect worth a failing test, not a silent default.
 _ARTEFACT_MIME = {"markdown": "text/markdown", "html": "text/html", "code": "text/plain"}
 
 
