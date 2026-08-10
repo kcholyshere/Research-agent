@@ -45,6 +45,7 @@ from google.adk.agents import Agent
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
+from google.adk.tools.tool_context import ToolContext
 from google.genai import types
 
 from src import config
@@ -62,6 +63,12 @@ _TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 # function-response parts on. Named once, here, because a mismatch between
 # the two would silently drop every citation rather than fail.
 _SEARCH_TOOL_NAME = "tavily_search"
+
+# Searches one `web_search_agent` call may make before the ceiling below
+# refuses further ones. 2, because the sub-agent's instruction asks for one
+# search plus at most one reformulation - so this bounds exactly the
+# behaviour already asked for rather than inventing a new allowance.
+_MAX_SEARCHES_PER_CALL = 2
 
 
 async def tavily_search(query: str) -> dict:
@@ -157,6 +164,55 @@ async def tavily_search(query: str) -> dict:
     return {"results": results}
 
 
+def _enforce_search_ceiling(
+    tool: object, args: dict, tool_context: ToolContext
+) -> dict | None:
+    """Cap how many searches one `web_search_agent` call may make.
+
+    Grounding needed no such bound: the searching happened inside Gemini's own
+    grounded call, so `research_agent`'s per-turn ceiling (ADR-0015) over
+    `web_search_agent` bounded it transitively. A function tool moves the loop
+    into this sub-agent, where nothing was watching it - the instruction asks
+    for one search and a retry at most, and this project's own position
+    (ADR-0009, ADR-0015) is that a prompt cannot bound a worst case. Each
+    extra call is also a Tavily credit against a 1,000/month free tier, and
+    `TURN_TIMEOUT_S` cannot interrupt a cycle already running.
+
+    Counted from the sub-agent's own session events rather than from a state
+    counter, which needs no reset hook to be correct: `AgentTool.run_async`
+    builds a FRESH `InMemorySessionService` session per call (verified by
+    reading the installed google-adk 2.5.0), so these events are this call's
+    and no earlier one's. A state counter would instead be copied in from the
+    parent session and flow back out on every state delta, quietly turning a
+    per-call bound into a per-turn one.
+
+    Refuses with a structured response rather than raising, matching every
+    other refusal in this project: the sub-agent is told to answer from what
+    it already has, which is a worse answer than a further search might have
+    given but a much better one than a dead turn.
+    """
+    if getattr(tool, "name", None) != _SEARCH_TOOL_NAME:
+        return None
+
+    already_made = sum(
+        1
+        for event in (getattr(tool_context.session, "events", None) or [])
+        if event.content and event.content.parts
+        for part in event.content.parts
+        if getattr(part, "function_response", None) is not None
+        and part.function_response.name == _SEARCH_TOOL_NAME
+    )
+    if already_made < _MAX_SEARCHES_PER_CALL:
+        return None
+    return {
+        "error": (
+            f"Search limit reached: {_MAX_SEARCHES_PER_CALL} searches have already been "
+            "made for this request. Answer from the results you already have, or say "
+            "plainly that they do not contain what was asked for."
+        )
+    }
+
+
 def _domain_of(url: str) -> str:
     """The bare domain of a URL, for the human-readable half of a citation.
 
@@ -219,14 +275,32 @@ def _append_search_sources(callback_context: CallbackContext) -> types.Content |
     for event in events:
         if not (event.content and event.content.parts):
             continue
+
+        # Text is taken only from events that carry NO function call and no
+        # function response. Under grounding this distinction did not exist -
+        # there was one model turn, so joining every text part was the same
+        # thing. With a function tool there are two model turns, and the
+        # first one commonly carries narration ("I'll search for that.")
+        # alongside its function_call part. Joining that in would prefix the
+        # narration to the answer the root agent receives, silently and only
+        # on the turns where the model happened to narrate. This is the same
+        # shape of mistake as reading a turn's answer off the wrong event
+        # (see CLAUDE.md), so it is excluded structurally rather than trusted
+        # not to happen.
+        is_tool_traffic = False
         for part in event.content.parts:
             response = getattr(part, "function_response", None)
-            if response is not None and response.name == _SEARCH_TOOL_NAME:
-                for item in (response.response or {}).get("results", []):
-                    url = item.get("url")
-                    if url:
-                        sources.setdefault((_domain_of(url), url), None)
-        if event.author == _WEB_SEARCH_AGENT_NAME:
+            if response is not None:
+                is_tool_traffic = True
+                if response.name == _SEARCH_TOOL_NAME:
+                    for item in (response.response or {}).get("results", []):
+                        url = item.get("url")
+                        if url:
+                            sources.setdefault((_domain_of(url), url), None)
+            elif getattr(part, "function_call", None) is not None:
+                is_tool_traffic = True
+
+        if event.author == _WEB_SEARCH_AGENT_NAME and not is_tool_traffic:
             answer_parts.append("".join(part.text or "" for part in event.content.parts))
 
     answer = "".join(answer_parts).strip()
@@ -366,6 +440,9 @@ State each fact once; never repeat a sentence or phrase.""",
         _apply_thinking_budget,
     ],
     after_model_callback=token_budget.accumulate_token_usage,
+    # The code-level bound on this sub-agent's own search loop, which the
+    # root agent's per-turn ceiling cannot see into - see the callback.
+    before_tool_callback=_enforce_search_ceiling,
     after_agent_callback=_append_search_sources,
 )
 

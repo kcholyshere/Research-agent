@@ -213,6 +213,11 @@ async def test_successful_search_sends_the_key_and_keeps_three_fields(api_key: s
     ]
 
 
+class _FakeTool:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
 def _event(author: str, parts: list[types.Part]) -> Any:
     """A minimal stand-in for an ADK `Event` - the callback reads only these three attributes."""
 
@@ -268,6 +273,87 @@ def test_sources_block_is_built_from_the_tool_response() -> None:
         "- worldbank.org (https://www.worldbank.org/leadership)\n"
         "- en.wikipedia.org (https://en.wikipedia.org/wiki/World_Bank_Group)"
     )
+
+
+def test_narration_alongside_a_tool_call_is_not_part_of_the_answer() -> None:
+    """The two-model-turn hazard the provider swap introduced.
+
+    Grounding gave this sub-agent one model turn, so joining every text part
+    was harmless. A function tool gives it two, and the first commonly carries
+    narration next to its `function_call`. Joining that in would prefix "I'll
+    search for that." to the answer the root agent receives - silently, and
+    only on turns where the model happened to narrate, which is exactly why a
+    passing live probe is not evidence here.
+    """
+    events = [
+        _event(
+            web_search._WEB_SEARCH_AGENT_NAME,
+            [
+                types.Part(text="I'll search for that."),
+                types.Part(
+                    function_call=types.FunctionCall(name="tavily_search", args={"query": "q"})
+                ),
+            ],
+        ),
+        _event(
+            web_search._WEB_SEARCH_AGENT_NAME,
+            [
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        name="tavily_search",
+                        response={"results": [{"url": "https://example.org/a"}]},
+                    )
+                )
+            ],
+        ),
+        _event(web_search._WEB_SEARCH_AGENT_NAME, [types.Part(text="The answer is 42.")]),
+    ]
+
+    content = web_search._append_search_sources(_FakeCallbackContext(events))
+
+    assert content is not None
+    assert content.parts[0].text == "The answer is 42.\n\nSources:\n- example.org (https://example.org/a)"
+
+
+def test_search_ceiling_allows_a_retry_then_refuses() -> None:
+    """The sub-agent's own search loop is bounded in code, not only by its prompt.
+
+    `research_agent`'s per-turn ceiling counts `web_search_agent` calls and
+    cannot see inside one, so without this the number of Tavily credits a
+    single call may spend is whatever the instruction persuades the model to
+    do (ADR-0009/ADR-0015 on why that is not a bound).
+    """
+    tool = _FakeTool("tavily_search")
+
+    def _context_with(searches: int) -> _FakeCallbackContext:
+        return _FakeCallbackContext(
+            [
+                _event(
+                    web_search._WEB_SEARCH_AGENT_NAME,
+                    [
+                        types.Part(
+                            function_response=types.FunctionResponse(
+                                name="tavily_search", response={"results": []}
+                            )
+                        )
+                    ],
+                )
+                for _ in range(searches)
+            ]
+        )
+
+    assert web_search._enforce_search_ceiling(tool, {}, _context_with(0)) is None
+    assert web_search._enforce_search_ceiling(tool, {}, _context_with(1)) is None
+
+    refused = web_search._enforce_search_ceiling(tool, {}, _context_with(2))
+    assert refused is not None
+    assert "Search limit reached" in refused["error"]
+
+
+def test_search_ceiling_ignores_other_tools() -> None:
+    """A ceiling keyed on the wrong name would refuse calls it was never meant to see."""
+    context = _FakeCallbackContext([])
+    assert web_search._enforce_search_ceiling(_FakeTool("create_canvas"), {}, context) is None
 
 
 def test_a_failed_search_appends_no_sources() -> None:
