@@ -63,8 +63,9 @@ def test_needed_services_includes_acceptable_route_alternatives() -> None:
     """preflight must see news-agent as needed, not just mcp-fetch.
 
     `expected_routes` alone ([financial, web]) only ever implies mcp-fetch -
-    `web` has no compose service (google_search needs nothing this preflight
-    tracks). Before the fix, a sweep scoped to just this question would
+    `web` has no compose service (the web route reaches a third-party search
+    API directly, so there is nothing here for this preflight to track).
+    Before the fix, a sweep scoped to just this question would
     therefore never check news-agent at all, even though `acceptable_routes`
     names [financial, news_agent] as an equally correct route the live
     planner actually takes (EVALUATION.md: 8 of 8 runs). That is finding 9's

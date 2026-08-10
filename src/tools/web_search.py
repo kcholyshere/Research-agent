@@ -1,26 +1,51 @@
 """Web Search Tool - the phase 2 key design task.
 
-Wraps ADK's built-in `google_search` grounding tool (Vertex AI) rather than a
-custom function tool against a third-party search API. Reasoning: ADK does
-not allow built-in tools to be combined with plain function tools on the same
-agent, so `google_search` has to live on its own small agent; that sub-agent
-is then exposed to the root agent as a callable tool via `AgentTool`, sitting
-alongside `search_documents` in the root agent's tool list. This needed no
-new API key/config (Vertex AI is already wired up for phase 1) at the cost of
-this one extra indirection layer - the trade-off was chosen for speed and to
-avoid provisioning a third-party search API key under time pressure; revisit
-if we need more control over the search provider or result format later.
+Searches the public internet through **Tavily**, a named third-party search
+API, called directly over HTTPS by `tavily_search` below (ADR-0028). Until
+2026-08-10 this instead wrapped Gemini's built-in `google_search` grounding,
+which made real searches but was a substitution of the provider the brief's
+tool list names; the swap is a provider change, and everything around it -
+the tool's name, its place in the declared-plan gate, the deterministic
+"Sources:" block it returns - is deliberately unchanged.
+
+## Why this is still a sub-agent behind an AgentTool
+
+The original reason was a constraint that no longer applies: ADK does not let
+a built-in tool like `google_search` share an agent with plain function tools,
+so grounding had to live on its own agent, exposed to the root agent through
+`AgentTool`. `tavily_search` is an ordinary function and could sit directly in
+`research_agent.tools`. The indirection is kept anyway, for reasons that
+outlive the grounding:
+
+- **It bounds what enters `research_agent`'s context.** A raw Tavily response
+  is five results of title/URL/snippet prose. Flat on the root agent, that
+  whole blob would land in the transcript and then be re-sent on every
+  subsequent turn (see `src/research_agent/history_trim.py`). The sub-agent
+  reads it once, in its own throwaway session, and passes up only the facts
+  plus the source list - which is what `MAX_SESSION_TOKENS` and
+  `MAX_HISTORY_TURNS` are both there to protect.
+- **It owns the per-request thinking budget** (`_apply_thinking_budget`) and
+  its own token accounting, neither of which has anywhere to live on a plain
+  function.
+- **The tool's name is load-bearing.** `AgentTool` names itself after the
+  agent it wraps, so this stays `web_search_agent` - the exact string used by
+  `schema.TOOL_TO_ROUTE`, `declare_plan.EVIDENCE_TOOL_NAMES`, the root
+  agent's INSTRUCTION, the Streamlit UI's labels, and the evaluation's stored
+  replay fixtures.
+
+The cost of keeping it: a web turn now pays two model calls inside this
+sub-agent (one to issue the search, one to summarise the results) where
+grounding paid one. See ADR-0028's consequences.
 """
 
-import asyncio
+from urllib.parse import urlparse
 
 import httpx
 from google.adk.agents import Agent
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
-from google.adk.tools import google_search
-from google.adk.tools.agent_tool import AgentTool
+from google.adk.tools.tool_context import ToolContext
 from google.genai import types
 
 from src import config
@@ -28,127 +53,212 @@ from src.research_agent import token_budget
 from src.services import genai_client
 from src.tools.fact_tag import FactTaggedAgentTool
 
-# Bounds each redirect-resolution request (see _resolve_redirect below). Lives
-# in config alongside MCP_FETCH_TIMEOUT_S/NEWS_AGENT_TIMEOUT_S because it is
-# the same kind of knob: a bound on a non-Vertex HTTP hop that this agent must
-# degrade around rather than hang on.
-_REDIRECT_RESOLVE_TIMEOUT_S = config.REDIRECT_RESOLVE_TIMEOUT_S
+# Tavily's documented search endpoint. A module constant rather than a config
+# knob because, unlike MCP_FETCH_URL/NEWS_AGENT_URL, this addresses a public
+# third-party service and there is no deployment in which it differs - the
+# same reason financial_data.py keeps its three Yahoo Finance URLs locally.
+_TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 
-# Resolved redirect -> destination URL, for the process lifetime. The same
-# source is commonly cited by several grounding chunks across turns, and a
-# resolution that succeeded once will not change, so paying the network hop
-# again is pure waste. A FAILED resolution is deliberately NOT cached (see
-# _resolve_redirect) so a transient timeout gets a fresh attempt next time
-# rather than permanently degrading that source for the rest of the process.
-_RESOLVED_URL_CACHE: dict[str, str] = {}
+# The tool name the sub-agent calls and `_append_search_sources` matches
+# function-response parts on. Named once, here, because a mismatch between
+# the two would silently drop every citation rather than fail.
+_SEARCH_TOOL_NAME = "tavily_search"
+
+# Searches one `web_search_agent` call may make before the ceiling below
+# refuses further ones. 2, because the sub-agent's instruction asks for one
+# search plus at most one reformulation - so this bounds exactly the
+# behaviour already asked for rather than inventing a new allowance.
+_MAX_SEARCHES_PER_CALL = 2
 
 
-async def _resolve_redirect(client: httpx.AsyncClient, uri: str) -> str:
-    """Resolve one opaque vertexaisearch grounding redirect to its real destination.
+async def tavily_search(query: str) -> dict:
+    """Search the public internet for a query and return the top results.
 
-    Verified empirically against a live grounding URL (see module-level
-    comment above `_REDIRECT_RESOLVE_TIMEOUT_S`): a HEAD request is honoured
-    by the redirector and lands on the true destination (e.g.
-    worldbank.org/.../ajay-banga) in ~0.3s with no body downloaded, so HEAD
-    is the primary path. GET is a fallback for any redirect chain that
-    refuses HEAD (405/501), and is streamed rather than awaited-to-body so
-    the fallback never pays for a page download either - only the response
-    headers (the resolved `.url`) are read before the stream is closed.
+    Args:
+        query: What to search for, as a natural-language question or phrase.
 
-    Never raises: any transport error, timeout, or non-2xx HEAD response
-    falls back to the original opaque `uri`, either directly or via the GET
-    retry below. A degraded citation (still a working, if ugly, link) beats
-    a dropped one, and both beat failing the turn.
-
-    The GET retry is deliberately NOT reached on `httpx.TimeoutException`.
-    That exception is a subclass of `httpx.HTTPError`, so an earlier version
-    of this function caught it too broadly - a HEAD that stalled and timed
-    out at `_REDIRECT_RESOLVE_TIMEOUT_S` fell through to a GET that then
-    paid the same timeout a second time, doubling the worst case for a host
-    that was never going to answer either verb (measured: ~6.1s against a
-    real stalling host). A stall is a property of the HOST, not the verb -
-    retrying a request that already timed out with a different method buys
-    nothing. So a HEAD timeout now returns the raw `uri` immediately.
-
-    The retry is kept for the other `httpx.HTTPError` cases - a non-2xx HEAD
-    status (405/501, a host that rejects HEAD specifically but may well
-    serve GET) and other FAST transport errors (e.g. a refused connection,
-    a protocol error) - because those fail quickly rather than stalling, so
-    a second attempt is worth its cost and can recover a source HEAD alone
-    would have lost.
-
-    Worst-case bound per URI, with this split: a HEAD timeout returns
-    immediately at ~1 x `_REDIRECT_RESOLVE_TIMEOUT_S`. A HEAD that fails
-    FAST (non-2xx or a quick transport error) and is then followed by a GET
-    that itself times out is bounded at ~1 x `_REDIRECT_RESOLVE_TIMEOUT_S`
-    plus the HEAD's (small) fast-failure time - not 2x. The only path that
-    can still approach 2x is a HEAD that fails via a non-timeout transport
-    error just before its own timeout would otherwise have fired; that
-    requires the transport to actively error out late rather than merely
-    stall, which is a narrower condition than the stalled-host case this
-    change targets.
+    Returns:
+        The ranked results, each with its title, URL, and a snippet of the
+        page's content, or an error message if the search could not be made.
     """
-    if uri in _RESOLVED_URL_CACHE:
-        return _RESOLVED_URL_CACHE[uri]
+    # A blank key is a configuration problem, not a search failure, and it is
+    # worth saying so distinctly: the sub-agent can then report "web search is
+    # not configured" instead of the planner concluding the internet had
+    # nothing on the topic. Same reasoning as document_search.py's three
+    # distinct diagnostics for a missing index versus an embedding failure.
+    if not config.TAVILY_API_KEY:
+        return {
+            "error": (
+                "Web search is not configured: TAVILY_API_KEY is unset. No search "
+                "was made, so this is not evidence that nothing was found."
+            )
+        }
 
+    payload = {
+        "query": query,
+        "max_results": config.TAVILY_MAX_RESULTS,
+        # "basic" costs 1 API credit against the free tier's 1,000/month;
+        # "advanced" costs 2 and mainly buys longer extracted content, which
+        # this sub-agent then summarises away anyway.
+        "search_depth": "basic",
+    }
+
+    # Every failure below becomes a structured error dict rather than an
+    # exception, matching get_financial_data and search_documents: a turn that
+    # loses one source should say so and carry on, not die. A single
+    # httpx.Timeout value binds all four legs - connect, read, write, pool -
+    # so a provider that accepts the connection and then wedges is bounded by
+    # the same number as one that never answers at all. financial_data.py's
+    # 300s hang (audit finding 7) was exactly the case where only one leg had
+    # been bound, which is why this is spelled out rather than assumed.
     try:
-        response = await client.head(uri, follow_redirects=True)
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(config.TAVILY_SEARCH_TIMEOUT_S)
+        ) as client:
+            response = await client.post(
+                _TAVILY_SEARCH_URL,
+                json=payload,
+                headers={"Authorization": f"Bearer {config.TAVILY_API_KEY}"},
+            )
     except httpx.TimeoutException:
-        return uri  # The host stalled - a GET would just stall the same way.
-    except httpx.HTTPError:
-        pass  # A fast, non-timeout failure - worth a GET retry below.
-    else:
-        if response.status_code < 400:
-            resolved = str(response.url)
-            _RESOLVED_URL_CACHE[uri] = resolved
-            return resolved
-        # Non-2xx HEAD (e.g. 405) - fall through to the GET retry below.
+        return {
+            "error": (
+                f"Web search timed out after {config.TAVILY_SEARCH_TIMEOUT_S}s. "
+                "No results were retrieved."
+            )
+        }
+    except httpx.HTTPError as exc:
+        return {"error": f"Web search could not reach the search provider: {exc}."}
+
+    if response.status_code >= 400:
+        # The body is truncated for the same reason financial_data.py truncates
+        # its MCP error text: an upstream error page can be arbitrarily long,
+        # and it is going into a model's context.
+        return {
+            "error": (
+                f"Web search failed with HTTP {response.status_code}: "
+                f"{response.text[:300]}"
+            )
+        }
 
     try:
-        async with client.stream("GET", uri, follow_redirects=True) as response:
-            resolved = str(response.url)
-    except httpx.HTTPError:
-        return uri  # Both attempts failed - the raw redirect is still a valid link.
+        body = response.json()
+    except ValueError:
+        return {"error": "Web search returned a response that was not valid JSON."}
 
-    _RESOLVED_URL_CACHE[uri] = resolved
-    return resolved
+    # Only the three fields the sub-agent and the citation callback actually
+    # use are kept. The full response also carries per-result scores, ids,
+    # favicons and optional raw page content; forwarding those would put
+    # tokens into the sub-agent's prompt that nothing downstream reads.
+    results = [
+        {
+            "title": item.get("title", ""),
+            "url": item.get("url", ""),
+            "content": item.get("content", ""),
+        }
+        for item in body.get("results", [])
+        if item.get("url")
+    ]
+    if not results:
+        return {"error": f"Web search for {query!r} returned no results."}
+    return {"results": results}
 
 
-async def _append_grounding_sources(callback_context: CallbackContext) -> types.Content | None:
-    """Append the grounding sources to this sub-agent's answer text.
+def _enforce_search_ceiling(
+    tool: object, args: dict, tool_context: ToolContext
+) -> dict | None:
+    """Cap how many searches one `web_search_agent` call may make.
 
-    This exists because of a measured, non-obvious defect: the agent was
-    instructed to attribute every fact to its source URL and never did, in
-    any trace, ever. The instruction was not being ignored - Gemini's
-    `google_search` grounding does not put URLs in the model's TEXT at all.
-    They arrive as structured `grounding_metadata.grounding_chunks`, and
-    `AgentTool` passes only the sub-agent's text up to the caller, so the
-    research agent never received a URL it could have cited. That is also
-    where "(Google Search)" came from: told to cite a source and handed none,
-    the model named the tool.
+    Grounding needed no such bound: the searching happened inside Gemini's own
+    grounded call, so `research_agent`'s per-turn ceiling (ADR-0015) over
+    `web_search_agent` bounded it transitively. A function tool moves the loop
+    into this sub-agent, where nothing was watching it - the instruction asks
+    for one search and a retry at most, and this project's own position
+    (ADR-0009, ADR-0015) is that a prompt cannot bound a worst case. Each
+    extra call is also a Tavily credit against a 1,000/month free tier, and
+    `TURN_TIMEOUT_S` cannot interrupt a cycle already running.
 
-    So attribution has to be repaired here, at the boundary where the URLs
-    still exist, rather than by asking either agent more firmly.
+    Counted from the sub-agent's own session events rather than from a state
+    counter, which needs no reset hook to be correct: `AgentTool.run_async`
+    builds a FRESH `InMemorySessionService` session per call (verified by
+    reading the installed google-adk 2.5.0), so these events are this call's
+    and no earlier one's. A state counter would instead be copied in from the
+    parent session and flow back out on every state delta, quietly turning a
+    per-call bound into a per-turn one.
 
-    Both the domain and the URL are emitted ("worldbank.org (https://...)").
-    The domain alone is not a URL and so cannot satisfy a strict attribution
-    check, so the pair was always required - but the URL half used to be the
-    raw grounding URI, an opaque vertexaisearch redirect that told a human
-    reader nothing and, per src/evaluation/metrics.py's
-    `_URL_WORD_RE`/`_prose_word_count` comment, bloated answers badly (one
-    redirect is a ~200-character "word"; one decline answer was roughly half
-    URL by word count). This now resolves each redirect to its real
-    destination (`_resolve_redirect` above) before emitting it, concurrently
-    across a turn's distinct URIs via `asyncio.gather` - this callback is in
-    the hot path of every web-search answer, so resolving one-by-one would
-    multiply, not just add, latency.
+    Refuses with a structured response rather than raising, matching every
+    other refusal in this project: the sub-agent is told to answer from what
+    it already has, which is a worse answer than a further search might have
+    given but a much better one than a dead turn.
+    """
+    if getattr(tool, "name", None) != _SEARCH_TOOL_NAME:
+        return None
 
-    This callback is `async def` deliberately, to do that resolution without
-    blocking the event loop: confirmed against the installed google-adk
-    2.5.0 by reading base_agent.py's `_handle_after_agent_callback` (not
-    docs) - it calls the callback, checks `inspect.isawaitable(...)` on the
-    result, and awaits it if so, so an async `after_agent_callback` is
-    natively supported, no thread pool needed.
+    already_made = sum(
+        1
+        for event in (getattr(tool_context.session, "events", None) or [])
+        if event.content and event.content.parts
+        for part in event.content.parts
+        if getattr(part, "function_response", None) is not None
+        and part.function_response.name == _SEARCH_TOOL_NAME
+    )
+    if already_made < _MAX_SEARCHES_PER_CALL:
+        return None
+    return {
+        "error": (
+            f"Search limit reached: {_MAX_SEARCHES_PER_CALL} searches have already been "
+            "made for this request. Answer from the results you already have, or say "
+            "plainly that they do not contain what was asked for."
+        )
+    }
+
+
+def _domain_of(url: str) -> str:
+    """The bare domain of a URL, for the human-readable half of a citation.
+
+    `www.` is stripped because it is noise in a citation and would make the
+    same publisher look like two sources in the dedupe below. A URL that will
+    not parse falls back to itself rather than raising - a citation with an
+    ugly label still points somewhere checkable.
+    """
+    host = urlparse(url).netloc
+    return host[4:] if host.startswith("www.") else (host or url)
+
+
+def _append_search_sources(callback_context: CallbackContext) -> types.Content | None:
+    """Append the search sources to this sub-agent's answer text.
+
+    This exists because of a measured, non-obvious defect that predates the
+    Tavily swap: the agent was instructed to attribute every fact to its
+    source URL and never did, in any trace, ever. Under `google_search`
+    grounding the instruction was not being ignored - Gemini simply never puts
+    source URLs in the model's TEXT, only in structured
+    `grounding_metadata`, and `AgentTool` passes just the text up to the
+    caller. That is also where "(Google Search)" came from: told to cite a
+    source and handed none, the model named the tool.
+
+    Tavily does hand the model real URLs in the tool result, so it *could* now
+    cite them itself. Attribution is still repaired here rather than asked
+    for, deliberately: a model that is asked to reproduce URLs sometimes
+    reproduces them wrongly, and an invented or mangled citation is worse than
+    the tool-name citation this callback was written to eliminate. Emitting
+    the source list from the tool's own response is exact by construction.
+
+    Both halves are emitted ("worldbank.org (https://...)"): the domain alone
+    is not a URL and so cannot satisfy a strict attribution check, and the URL
+    alone reads badly. This is the shape `src/research_agent/agent.py`'s
+    INSTRUCTION promises the planner ("its result ends with a 'Sources:' list
+    of domains and URLs") and that `src/evaluation/metrics.py` was tuned
+    against, so it is kept exactly.
+
+    The redirect-resolution machinery this callback used to carry is gone with
+    the grounding that needed it: Tavily returns real destination URLs, so
+    there is nothing opaque left to resolve.
+
+    Reading the sub-agent's own function-response events is safe here because
+    `AgentTool.run_async` creates a FRESH in-memory session per call (verified
+    by reading the installed google-adk 2.5.0's `agent_tool.py`, not docs), so
+    these events belong to this search and no earlier one.
 
     Returning Content rather than mutating in place because that is what ADK
     honours here, and it carries the ORIGINAL answer text forward with the
@@ -157,42 +267,50 @@ async def _append_grounding_sources(callback_context: CallbackContext) -> types.
     """
     events = getattr(callback_context.session, "events", None) or []
 
-    # Dedupe on (domain, uri) while preserving order. Grounding commonly cites
-    # the same domain for several chunks, and a repeated source list would
-    # feed the very repetition the generation config exists to bound.
+    # Dedupe on (domain, url) while preserving order. Several results commonly
+    # share a publisher, and a repeated source list would feed the very
+    # repetition the generation config exists to bound.
     sources: dict[tuple[str, str], None] = {}
     answer_parts: list[str] = []
     for event in events:
-        if event.author != _WEB_SEARCH_AGENT_NAME:
+        if not (event.content and event.content.parts):
             continue
-        if event.content and event.content.parts:
+
+        # Text is taken only from events that carry NO function call and no
+        # function response. Under grounding this distinction did not exist -
+        # there was one model turn, so joining every text part was the same
+        # thing. With a function tool there are two model turns, and the
+        # first one commonly carries narration ("I'll search for that.")
+        # alongside its function_call part. Joining that in would prefix the
+        # narration to the answer the root agent receives, silently and only
+        # on the turns where the model happened to narrate. This is the same
+        # shape of mistake as reading a turn's answer off the wrong event
+        # (see CLAUDE.md), so it is excluded structurally rather than trusted
+        # not to happen.
+        is_tool_traffic = False
+        for part in event.content.parts:
+            response = getattr(part, "function_response", None)
+            if response is not None:
+                is_tool_traffic = True
+                if response.name == _SEARCH_TOOL_NAME:
+                    for item in (response.response or {}).get("results", []):
+                        url = item.get("url")
+                        if url:
+                            sources.setdefault((_domain_of(url), url), None)
+            elif getattr(part, "function_call", None) is not None:
+                is_tool_traffic = True
+
+        if event.author == _WEB_SEARCH_AGENT_NAME and not is_tool_traffic:
             answer_parts.append("".join(part.text or "" for part in event.content.parts))
-        metadata = getattr(event, "grounding_metadata", None)
-        for chunk in (getattr(metadata, "grounding_chunks", None) or []) if metadata else []:
-            web = getattr(chunk, "web", None)
-            if web and web.uri:
-                sources.setdefault((web.title or "source", web.uri), None)
 
     answer = "".join(answer_parts).strip()
     if not sources or not answer:
-        # No grounding (the model answered from its own knowledge) or no text
-        # to attach to. Returning None leaves the turn exactly as it was -
-        # inventing a source here would be worse than having none.
+        # The search failed or returned nothing, or there is no text to attach
+        # to. Returning None leaves the turn exactly as it was - inventing a
+        # source here would be worse than having none.
         return None
 
-    # One shared client for every distinct URI in this turn, resolved
-    # concurrently rather than in a loop - see the docstring above on why
-    # this callback is async and why one-by-one resolution is not
-    # acceptable in this hot path.
-    async with httpx.AsyncClient(timeout=_REDIRECT_RESOLVE_TIMEOUT_S) as client:
-        resolved_uris = await asyncio.gather(
-            *(_resolve_redirect(client, uri) for _, uri in sources)
-        )
-
-    lines = "\n".join(
-        f"- {domain} ({resolved})"
-        for (domain, _), resolved in zip(sources, resolved_uris)
-    )
+    lines = "\n".join(f"- {domain} ({url})" for domain, url in sources)
     return types.Content(
         role="model",
         parts=[types.Part(text=f"{answer}\n\nSources:\n{lines}")],
@@ -208,10 +326,13 @@ async def _append_grounding_sources(callback_context: CallbackContext) -> types.
 # GenerateContentConfig instances entirely. A direct Vertex probe (n=6)
 # measured this sub-agent at a median 19.95s/3,310 thinking tokens with no
 # budget set (Gemini's "automatic" thinking); pinning thinking_budget=512
-# measured 9.46s for the same probe - google_search grounding needs little
-# deliberation, so most of that thinking time was overhead, not reasoning
-# that changed the answer. The value here is the static default/fallback;
-# _apply_thinking_budget below lets a single request override it.
+# measured 9.46s for the same probe - a web lookup needs little deliberation,
+# so most of that thinking time was overhead, not reasoning that changed the
+# answer. Those numbers were measured on the google_search grounding path
+# this module has since replaced (ADR-0028), so treat them as the reason the
+# budget is pinned low rather than as current latency figures. The value here
+# is the static default/fallback; _apply_thinking_budget below lets a single
+# request override it.
 _GENERATE_CONTENT_CONFIG = types.GenerateContentConfig(
     max_output_tokens=4096,
     frequency_penalty=0.4,
@@ -275,6 +396,10 @@ def _apply_thinking_budget(
     session before running it (google/adk/tools/agent_tool.py, state_dict
     passed to session_service.create_session), so this callback's
     callback_context.state sees the same key without any extra plumbing.
+
+    Note that this now applies to BOTH of the sub-agent's model calls (the one
+    that issues the search and the one that summarises its results), where
+    under grounding there was only one - see this module's docstring.
     """
     budget = callback_context.state.get(
         _THINKING_BUDGET_STATE_KEY, config.DEFAULT_WEB_SEARCH_THINKING_BUDGET
@@ -286,17 +411,18 @@ def _apply_thinking_budget(
 _web_search_agent = Agent(
     name=_WEB_SEARCH_AGENT_NAME,
     model=config.GEMINI_MODEL,
-    description="Searches the public internet for information via Google Search.",
-    # No longer asks the model to attribute facts to URLs: it cannot, since
-    # google_search grounding never puts them in its text (see
-    # _append_grounding_sources). Asking for something the model has no way to
-    # supply is what produced the invented "(Google Search)" citation, so the
-    # instruction now asks only for the facts and the callback supplies the
-    # sources from grounding_metadata.
-    instruction="""Answer the given query using Google Search. Report back the
-relevant facts you find. State each fact once; never repeat a sentence or
-phrase.""",
-    tools=[google_search],
+    description="Searches the public internet for information via the Tavily Search API.",
+    # Does not ask the model to attribute facts to URLs even though the Tavily
+    # results now contain them: _append_search_sources emits the source list
+    # from the tool's own response, which is exact, where a model reproducing
+    # URLs by hand is not. See that callback's docstring.
+    instruction="""Answer the given query using the tavily_search tool. Search
+once; only search again with a different phrasing if the first results do not
+contain what was asked for. Report back the relevant facts you find, using only
+what the results say. If the tool returns an error, say plainly that the web
+search failed and what it said - do not answer from your own knowledge instead.
+State each fact once; never repeat a sentence or phrase.""",
+    tools=[tavily_search],
     generate_content_config=_GENERATE_CONTENT_CONFIG,
     # Two before-model callbacks, run in order: the budget check first, so a
     # session that is already over its ceiling is refused without the second
@@ -314,7 +440,10 @@ phrase.""",
         _apply_thinking_budget,
     ],
     after_model_callback=token_budget.accumulate_token_usage,
-    after_agent_callback=_append_grounding_sources,
+    # The code-level bound on this sub-agent's own search loop, which the
+    # root agent's per-turn ceiling cannot see into - see the callback.
+    before_tool_callback=_enforce_search_ceiling,
+    after_agent_callback=_append_search_sources,
 )
 
 # FactTaggedAgentTool rather than AgentTool: the declared-plan gate has to

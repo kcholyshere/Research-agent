@@ -55,8 +55,10 @@ class RouteTarget(str, Enum):
 
 # The agent's tool names are an implementation detail of src/tools/; the
 # dataset is written in terms of routing targets so that renaming a tool, or
-# swapping google_search for Tavily (a live TODO), does not invalidate a
-# stored dataset or run. Kept here rather than in the runner because both the
+# changing the provider behind one, does not invalidate a stored dataset or
+# run. That paid off directly: ADR-0028 swapped the web route's provider from
+# google_search grounding to Tavily and no stored dataset or run needed
+# touching. Kept here rather than in the runner because both the
 # runner and the metrics need it and neither should own it.
 TOOL_TO_ROUTE: dict[str, RouteTarget] = {
     "search_documents": RouteTarget.KNOWLEDGE_BASE,

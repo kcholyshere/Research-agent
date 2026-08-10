@@ -40,6 +40,11 @@ uv sync
 cp .env.example .env   # project: gd-gcp-internship-ds
 gcloud auth application-default login
 ```
+Then put a Tavily API key in `.env` as `TAVILY_API_KEY` - free at
+<https://app.tavily.com>, 1,000 credits/month, no card. It is the only API key
+here; everything Google is reached through Application Default Credentials, and
+Tavily is not a Google service (ADR-0028). Without it the web search route
+returns a "not configured" error and everything else still works.
 
 Build the index (once, and again whenever `data/raw/` changes):
 ```bash
@@ -61,7 +66,9 @@ docker compose up --build --wait
   service name and you can reach on those ports for debugging
 
 Your `~/.config/gcloud` is mounted read-only for Application Default
-Credentials, so no key material goes into the image or into `docker-compose.yml`.
+Credentials, and `TAVILY_API_KEY` reaches the containers from your gitignored
+`.env` via compose's `env_file`, so no key material goes into the image or into
+`docker-compose.yml`.
 
 ## Running it locally
 Start the two services the agent depends on, then the agent itself. Both are
@@ -147,7 +154,7 @@ src/
 ├── retrieval/faiss_store.py   <- FAISS HNSW build/load (from Finrag)
 ├── services/genai_client.py   <- shared Vertex AI client (from Finrag)
 ├── tools/document_search.py   <- Document Search Tool, FAISS
-├── tools/web_search.py        <- Web Search Tool, google_search sub-agent
+├── tools/web_search.py        <- Web Search Tool, Tavily via a sub-agent
 ├── tools/financial_data.py    <- Financial Data Tool over MCP
 ├── tools/news_agent.py        <- A2A client for the News Agent
 ├── tools/canvas.py            <- Canvas: renders research into an artefact

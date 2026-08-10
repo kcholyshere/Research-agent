@@ -2,6 +2,15 @@
 Version-controlled record of what each evaluation run showed. Design rationale is
 ADR-0011 (what the pipeline measures) and ADR-0012 (how a sweep is scheduled).
 
+## Read this before quoting a web-route number
+Every figure below was measured while the web route went through Gemini's
+`google_search` grounding. On 2026-08-10 that provider was replaced by the
+Tavily Search API (ADR-0028), which changes what a web search returns, how its
+citations are shaped, and how many model calls a web turn costs. Nothing here
+is retracted - it is an accurate record of the system as it then was - but no
+web-route latency, redundancy or citation number below describes the current
+system, and only a fresh sweep would make one current again.
+
 ## Latest baseline - 2026-08-03
 248 runs, live, concurrency 4. `20260803T092025Z_live_reps4_budgets0-1.json`.
 Three same-question sweeps, all scored with the corrected metrics (ADR-0013):
