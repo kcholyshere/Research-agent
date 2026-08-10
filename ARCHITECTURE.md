@@ -24,7 +24,7 @@ flowchart TD
     subgraph Evidence["Evidence tools - answer 'what is true'"]
         DocTool["Document Search Tool"]
         FinTool["Financial Data Tool"]
-        WebTool["Web Search Tool<br/>(sub-agent + google_search)"]
+        WebTool["Web Search Tool<br/>(sub-agent + Tavily)"]
         NewsTool["News Agent Tool<br/>(A2A client)"]
     end
 
@@ -46,6 +46,7 @@ flowchart TD
         Vertex["Vertex AI<br/>(chat + embedding models)"]
         MCP["MCP fetch server<br/>(own service, streamable HTTP)"]
         Yahoo["Yahoo Finance<br/>(3 hardcoded pages)"]
+        Tavily["Tavily Search API<br/>(api.tavily.com)"]
         GSearch["Google Search grounding"]
         NewsSvc["News Agent service<br/>(own process, A2A + agent card)"]
     end
@@ -63,7 +64,7 @@ flowchart TD
 
     Agent --> DocTool --> Index
     Agent --> FinTool --> MCP --> Yahoo
-    Agent --> WebTool --> GSearch
+    Agent --> WebTool --> Tavily
     Agent --> NewsTool --> NewsSvc --> GSearch
     Agent --> Plan
     Agent --> Gap

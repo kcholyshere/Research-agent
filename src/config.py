@@ -176,13 +176,33 @@ MCP_FETCH_TIMEOUT_S = 30.0
 # pathological run on the user's behalf.
 TURN_TIMEOUT_S = 240.0
 
-# Bounds a single grounding-redirect resolution in src/tools/web_search.py.
-# Gemini's google_search returns opaque vertexaisearch redirect links rather
-# than destination URLs, and the sub-agent's after_agent_callback resolves
-# them so a citation is checkable by a reader. That resolution sits in the hot
-# path of every web-search answer, so it must degrade to the raw link rather
-# than stall the turn. Measured against live grounding redirects (2026-08-06):
-# HEAD resolves in 0.3-0.4s, so 3s is generous headroom while capping what one
-# stuck host can cost. Resolutions run concurrently, so a turn pays the slowest
-# single source, not the sum.
-REDIRECT_RESOLVE_TIMEOUT_S = 3.0
+# Tavily, the phase 2 web search provider (src/tools/web_search.py, ADR-0028).
+# The one API key in a project that otherwise authenticates everything through
+# Application Default Credentials - Tavily is not a Google service, so ADC has
+# nothing to offer it. Read here rather than at the call site so a blank value
+# is a tool-level "not configured" error rather than an exception, and so the
+# key never has to be spelled twice.
+#
+# Deliberately NOT validated at import time, for the same reason GCP_PROJECT
+# above is not: this module is imported by tests and by code paths that never
+# search the web, and failing here would break hermetic offline runs. The real
+# check is in web_search.tavily_search, at the point a search is actually
+# about to be made.
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+
+# Bounds the whole Tavily hop, for the same reason NEWS_AGENT_TIMEOUT_S and
+# MCP_FETCH_TIMEOUT_S bound theirs: it is not a Vertex call, so none of
+# genai_client's model-call timeouts apply to it. This one sits in the hot
+# path of every web-search answer, so it has to degrade to a structured error
+# rather than stall the turn. 15s against a documented typical response of
+# 1-3s for a basic search: generous enough that a slow-but-working search
+# still returns, tight enough that a wedged provider costs a fraction of
+# TURN_TIMEOUT_S rather than most of it.
+TAVILY_SEARCH_TIMEOUT_S = 15.0
+
+# Results requested per search. Tavily's own default is 5 and its maximum 20.
+# Kept at 5 because these results are fed to a summarising sub-agent whose
+# output then enters research_agent's context: more results is more input
+# tokens on every web turn (MAX_SESSION_TOKENS) for diminishing marginal
+# coverage, since the provider ranks by relevance.
+TAVILY_MAX_RESULTS = 5

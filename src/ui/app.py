@@ -416,8 +416,10 @@ with st.expander("Advanced configuration", expanded=False):
     # applies (src/tools/web_search.py). Measured (n=6, direct Vertex probe):
     # unset ("automatic" thinking) put the web search sub-agent at a median
     # 19.95s/3,310 thinking tokens per call; 512 measured 9.46s for the same
-    # probe - google_search grounding needs little deliberation, so most of
-    # that thinking time was overhead the answer didn't need.
+    # probe - a web lookup needs little deliberation, so most of that thinking
+    # time was overhead the answer didn't need. Measured on the google_search
+    # grounding path the sub-agent used before ADR-0028, so read those numbers
+    # as why the budget is pinned low, not as current latency.
     _web_search_thinking_levels = {"Off": 0, "Low": 256, "Medium": 512, "High": 1024}
     # Falls back to "Medium" rather than raising if DEFAULT_WEB_SEARCH_THINKING_BUDGET
     # is ever set to a value outside these four levels (e.g. -1, Gemini's own
@@ -440,8 +442,8 @@ with st.expander("Advanced configuration", expanded=False):
             "How much the web search sub-agent is allowed to 'think' before "
             "answering. Off disables thinking entirely; higher levels let it "
             "reason more before replying, at the cost of extra latency per "
-            "web search call. Google Search grounding needs little "
-            "deliberation, so Medium is a reasonable default."
+            "web search call. A web lookup needs little deliberation, so "
+            "Medium is a reasonable default."
         ),
     )
     web_search_thinking_budget = _web_search_thinking_levels[_web_search_thinking_label]
