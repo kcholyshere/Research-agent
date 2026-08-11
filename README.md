@@ -26,10 +26,10 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for how the pieces fit together, and
 ## Limitations
 - News and financial questions need their services running; the rest degrades cleanly.
 - Sometimes delegates to the News Agent when only the web is needed.
-- Repeats searches on some questions, bounded at five evidence calls a turn (ADR-0015).
-- A source mis-declared from the start is still executed - the plan gate disciplines execution, not planning judgement (ADR-0027).
-- `adk web` gets only a cycle-boundary turn deadline, so a single long cycle can still overrun it (ADR-0025).
-- A session stops answering at 200,000 cumulative tokens (`MAX_SESSION_TOKENS`, ADR-0021).
+- Repeats searches on some questions, bounded at five evidence calls a turn.
+- A source mis-declared from the start is still executed - the plan gate disciplines execution, not planning judgement.
+- `adk web` gets only a cycle-boundary turn deadline, so a single long cycle can still overrun it.
+- A session stops answering at 200,000 cumulative tokens (`MAX_SESSION_TOKENS`).
 - The critique loop nearly always stops after one cycle.
 - Single corpus, rebuilt by hand when documents change.
 
@@ -43,8 +43,8 @@ gcloud auth application-default login
 Then put a Tavily API key in `.env` as `TAVILY_API_KEY` - free at
 <https://app.tavily.com>, 1,000 credits/month, no card. It is the only API key
 here; everything Google is reached through Application Default Credentials, and
-Tavily is not a Google service (ADR-0028). Without it the web search route
-returns a "not configured" error and everything else still works.
+Tavily is not a Google service. Without it the web search route returns a
+"not configured" error and everything else still works.
 
 Build the index (once, and again whenever `data/raw/` changes):
 ```bash
@@ -56,7 +56,7 @@ compose bind-mounts `data/` and `models/` instead, so a container started before
 this has run will answer knowledge-base questions from an empty index.
 
 ## Running it with Docker
-The whole system is four services (see ADR-0020):
+The whole system is four services:
 ```bash
 docker compose up --build --wait
 ```
@@ -90,7 +90,8 @@ curl -s http://localhost:8001/.well-known/agent-card.json | python -m json.tool
 The RPC address in that card is derived from the `Host` header you reached it
 on, so the same service tells this shell `localhost:8001` and tells the agent
 container `news-agent:8001` - a local checkout and a container get an address
-that works for each. See ADR-0022 for why, and for where that stops being safe.
+that works for each. That does mean trusting a client-supplied header, which is
+right for a local network and would not be for a public deployment.
 
 Then start the agent, whichever way suits:
 ```bash
@@ -114,9 +115,8 @@ Write me a short markdown report on IFC's FY24 net income and total assets.
 ```
 
 ## Evaluation
-The harness runs from the local checkout, and since ADR-0020 the financial
-questions go through the `mcp-fetch` service - so start it first or every
-financial question fails:
+The harness runs from the local checkout, and the financial questions go through
+the `mcp-fetch` service - so start it first or every financial question fails:
 ```bash
 docker compose up -d mcp-fetch news-agent
 ```
@@ -129,8 +129,8 @@ uv run python -m src.evaluation.run_eval \
     --questions kb-net-income,canvas-kb-report --reps 1 --mode live --budgets 0
 ```
 The harness scores routing, redundancy, citation, decline, content, artefact and
-wasted-cycle assertions deterministically, with no LLM judge - see ADR-0011 for
-why. Results and their interpretation live in `EVALUATION.md`.
+wasted-cycle assertions deterministically, with no LLM judge, so a score means the
+same thing across runs and two sweeps can be compared directly. Results and their interpretation live in `EVALUATION.md`.
 
 ## Tests
 ```bash
@@ -141,7 +141,7 @@ uv run pytest -m integration  # the live ones, needs Vertex and the compose stac
 each written from that finding's own failure scenario. It covers deterministic
 things only - the tool gates, the bounds, the eval instrument. Whether the agent
 routes, declines or answers *well* is not a test question here and is measured
-by the evaluation harness below instead; see ADR-0026.
+by the evaluation harness below instead.
 
 ## Layout
 ```
