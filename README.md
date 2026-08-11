@@ -90,8 +90,7 @@ curl -s http://localhost:8001/.well-known/agent-card.json | python -m json.tool
 The RPC address in that card is derived from the `Host` header you reached it
 on, so the same service tells this shell `localhost:8001` and tells the agent
 container `news-agent:8001` - a local checkout and a container get an address
-that works for each. That does mean trusting a client-supplied header, which is
-right for a local network and would not be for a public deployment.
+that works for each.
 
 Then start the agent, whichever way suits:
 ```bash
@@ -129,8 +128,8 @@ uv run python -m src.evaluation.run_eval \
     --questions kb-net-income,canvas-kb-report --reps 1 --mode live --budgets 0
 ```
 The harness scores routing, redundancy, citation, decline, content, artefact and
-wasted-cycle assertions deterministically, with no LLM judge, so a score means the
-same thing across runs and two sweeps can be compared directly. Results and their interpretation live in `EVALUATION.md`.
+wasted-cycle assertions deterministically, with no LLM judge. Results and their
+interpretation live in `EVALUATION.md`.
 
 ## Tests
 ```bash
